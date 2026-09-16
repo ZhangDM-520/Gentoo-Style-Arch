@@ -26,6 +26,39 @@ credentials, downloaded sources, or generated build output to this journal.
   Do not publish package-local wildcard ignore files that can hide recipe
   changes.
 
+## 2026-09-16 — GLib PGO reconfigure probe failure
+
+- **Symptom**: after GLib's PGO training pass, the final Meson reconfigure
+  failed with `Could not determine size of size_t`.
+- **Cause**: Meson retained phase-1 `-fprofile-generate` in cached linker
+  arguments while the recipe added `-fprofile-use` to compiler arguments.
+  Meson's temporary `-Werror` probes then emitted `-Wmissing-profile` for
+  untrained probe files and were reported as failed type-detection checks.
+- **Fix**: the GLib recipe now replaces compiler and linker argument caches
+  together and adds `-Wno-error=missing-profile` only to the profile-use
+  transition.
+- **Validation**: a fake-Meson recipe fixture reproduces the stale-cache
+  failure and passes after the fix; a real temporary Meson project confirms
+  the four option sets are replaced and compiles successfully.
+- **Rule**: treat Meson PGO transitions as a cache migration, not an
+  environment-variable update; clear both compile/link instrumentation and
+  tolerate missing profiles in configure probes.
+
+## 2026-09-16 — Full PKGBUILD optimization audit
+
+- **Scope**: all 122 tracked `PKGBUILD` recipes in the public Projects
+  checkout; every recipe passed `bash -n` and `.SRCINFO` generation.
+- **Findings**: WirePlumber appended unconditional `-march=native -O3` flags
+  and installed dead NEWS/README documentation. GTK4 demos and libadwaita's
+  optional `weston`/check path remain documented cleanup candidates, not
+  automatic removals.
+- **Fix**: removed WirePlumber's host-specific flag override and dead
+  documentation install, then added the optimization and trimming contract to
+  `CONTRIBUTING.md`.
+- **Rule**: use host `makepkg.conf` defaults, trim dead packaging inputs only
+  with their dependent paths, and preserve PGO workloads and maintained
+  features explicitly called out by `MEMORY.md`.
+
 ## 2026-09-04 — PKGBUILD trim audit (full workspace)
 
 Standard: trim docs/man/examples/tests/dead splits/dead makedeps; keep

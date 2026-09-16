@@ -22,6 +22,35 @@ logs and profiles.
    makepkg --printsrcinfo > .SRCINFO
    ```
 
+## Optimization and trimming standard
+
+Use the host's `makepkg.conf` as the default optimization policy. Do not
+append hard-coded `-O3`, `-march`, `-mtune`, or other host-specific ISA flags
+to a recipe. Use host-derived native settings only when they are already
+provided by the build environment; an explicit target such as
+`GSA_TARGET_CPU` must be intentional and documented.
+
+Trim packaging to the maintained target:
+
+- remove dead documentation, man pages, examples, tests, split packages,
+  `depends`, `makedepends`, `_pick` paths, install paths, and check paths
+  together;
+- keep PGO-training test suites, kmod compressors, the GTK4 Vulkan renderer,
+  Rust `profiler=true`, the `clang-opencl-headers` split, and CUPS/printing
+  support when they are part of the maintained feature set;
+- keep mold, LTO, and PGO phases aligned with the package's documented
+  exception. For a Meson PGO transition, replace `c_args`, `cpp_args`,
+  `c_link_args`, and `cpp_link_args` together, and exempt only
+  `missing-profile` warnings during profile-use configure probes; and
+- never use invalid `options` such as `!check` or `autodeps` to paper over a
+  recipe problem.
+
+After a trim, verify that disabled features have no remaining packaging
+paths, removed tools are absent from `makedepends`, and the resulting
+`.SRCINFO` matches the recipe. Do not remove a test or feature merely because
+it is not installed at runtime if it trains PGO or protects a maintained
+capability.
+
 ## Validation
 
 Before submitting a change, run:
@@ -36,6 +65,7 @@ fish build-all.fish --dry-run --group git
 fish build-all.fish --dry-run --group stable
 fish build-all.fish --dry-run --group core
 bash tests/project-config.sh
+bash tests/glib2-pgo-transition.sh
 bash tests/scheduler-intensity.sh
 ```
 

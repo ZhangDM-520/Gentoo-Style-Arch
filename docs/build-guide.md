@@ -83,3 +83,10 @@ running against the old libraries, then remove only the now-inactive residual
 build trees. Do not treat GLib warnings from a portal or sandboxed
 application as evidence of a builder process; correlate them with the
 installed library symbols and profile-file paths first.
+
+During a Meson PGO transition, the final reconfigure must replace both
+compiler and linker argument caches (`c_args`, `cpp_args`, `c_link_args`, and
+`cpp_link_args`). Profile-use flags also reach Meson's temporary compiler
+probes, so `-Wno-error=missing-profile` is required for that reconfigure;
+otherwise a missing profile for a probe can be misreported as an ABI or
+feature-detection failure.

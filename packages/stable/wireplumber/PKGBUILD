@@ -37,8 +37,6 @@ prepare() {
 
 build() {
   # ISA match + O3
-  CFLAGS+=" -march=native -O3"
-  CXXFLAGS+=" -march=native -O3"
 
   local meson_options=(
     -D doc=disabled
@@ -119,7 +117,6 @@ package_wireplumber() {
     # the usr/lib/girepository-1.0 _pick was removed with it — do not re-add.
   )
 
-  install -Dt "$pkgdir/usr/share/doc/$pkgname" -m644 $pkgbase/{NEWS,README}*
   install -Dt "$pkgdir/usr/share/licenses/$pkgname" -m644 $pkgbase/LICENSE
 }
 

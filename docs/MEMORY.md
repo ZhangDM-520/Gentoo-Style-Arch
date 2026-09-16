@@ -315,7 +315,10 @@ OpenShadingLanguage -> blender.
 - **PGO operational**: root-owned gcda appears if instrumented daemons are
   installed mid-iteration (→ sudo rm -rf src, avoid installing); gcda
   verification via `find <dir>`; MT trainers need `-fprofile-update=atomic`;
-  GCC `-fprofile-use` may need `-Wno-error=format-overflow
+  a Meson PGO reconfigure must replace `c_args`, `cpp_args`, `c_link_args`,
+  and `cpp_link_args` together so phase-1 `-fprofile-generate` cannot remain;
+  profile-use configure probes need `-Wno-error=missing-profile`; GCC
+  `-fprofile-use` may also need `-Wno-error=format-overflow
   -Wno-error=coverage-mismatch`; GCC 17 experimental ICEs on -fprofile-use
   are sometimes TRANSIENT (retry once when the box was OOM-stressed;
   systemd's was deterministic).
