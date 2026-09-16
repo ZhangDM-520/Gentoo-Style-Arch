@@ -26,6 +26,21 @@ credentials, downloaded sources, or generated build output to this journal.
   Do not publish package-local wildcard ignore files that can hide recipe
   changes.
 
+## 2026-09-17 — GTK4 local packaging assets omitted
+
+- **Symptom**: a clean checkout failed before building GTK4 because
+  `gtk-update-icon-cache.hook` was declared in `source=()` but was not found
+  in the recipe directory.
+- **Cause**: the four GTK4 hooks/scripts existed only as ignored working-tree
+  files; the package-local wildcard `.gitignore` hid them from the public
+  repository.
+- **Fix**: publish all four local assets, remove the GTK4 wildcard ignore, and
+  add `tests/gtk4-recipe-assets.sh` to require every asset to be present and
+  tracked.
+- **Rule**: every non-URL `source=()` asset is essential recipe input and must
+  be tracked; package-local wildcard ignore files are not an acceptable way to
+  hide generated build state.
+
 ## 2026-09-16 — GLib and Cairo PGO reconfigure probe failure
 
 - **Symptom**: after GLib or Cairo's PGO training pass, the final Meson

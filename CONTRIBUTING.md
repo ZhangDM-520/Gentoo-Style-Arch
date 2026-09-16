@@ -65,6 +65,7 @@ fish build-all.fish --dry-run --group git
 fish build-all.fish --dry-run --group stable
 fish build-all.fish --dry-run --group core
 bash tests/project-config.sh
+bash tests/gtk4-recipe-assets.sh
 bash tests/glib2-pgo-transition.sh
 bash tests/cairo-pgo-transition.sh
 bash tests/gtk3-pgo-transition.sh
