@@ -66,6 +66,7 @@ fish build-all.fish --dry-run --group stable
 fish build-all.fish --dry-run --group core
 bash tests/project-config.sh
 bash tests/glib2-pgo-transition.sh
+bash tests/cairo-pgo-transition.sh
 bash tests/scheduler-intensity.sh
 ```
 

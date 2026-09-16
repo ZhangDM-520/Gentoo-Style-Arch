@@ -26,38 +26,38 @@ credentials, downloaded sources, or generated build output to this journal.
   Do not publish package-local wildcard ignore files that can hide recipe
   changes.
 
-## 2026-09-16 — GLib PGO reconfigure probe failure
+## 2026-09-16 — GLib and Cairo PGO reconfigure probe failure
 
-- **Symptom**: after GLib's PGO training pass, the final Meson reconfigure
-  failed with `Could not determine size of size_t`.
+- **Symptom**: after GLib or Cairo's PGO training pass, the final Meson
+  reconfigure failed in compiler feature probes.
 - **Cause**: Meson retained phase-1 `-fprofile-generate` in cached linker
   arguments while the recipe added `-fprofile-use` to compiler arguments.
   Meson's temporary `-Werror` probes then emitted `-Wmissing-profile` for
   untrained probe files and were reported as failed type-detection checks.
-- **Fix**: the GLib recipe now replaces compiler and linker argument caches
-  together and adds `-Wno-error=missing-profile` only to the profile-use
+- **Fix**: both recipes now replace compiler and linker argument caches
+  together and add `-Wno-error=missing-profile` only to the profile-use
   transition.
-- **Validation**: a fake-Meson recipe fixture reproduces the stale-cache
-  failure and passes after the fix; a real temporary Meson project confirms
-  the four option sets are replaced and compiles successfully.
+- **Validation**: shared fake-Meson fixtures reproduce the stale-cache
+  failure for both recipes and pass after the fix; a real temporary Meson
+  project confirms the four option sets are replaced and compiles successfully.
 - **Rule**: treat Meson PGO transitions as a cache migration, not an
   environment-variable update; clear both compile/link instrumentation and
   tolerate missing profiles in configure probes.
 
-## 2026-09-16 — PGO verifier false positive
+## 2026-09-16 — GLib/Cairo PGO verifier false positive
 
-- **Symptom**: the final GLib build was rejected because
+- **Symptom**: the final GLib or Cairo build was rejected because
   `build/meson-private/sanity_check_for_c.exe` still exported profile
   instrumentation.
 - **Cause**: the verifier scanned every executable in the Meson build tree,
   including temporary configure helpers left from the training phase. That
   helper is not installed into either GLib package.
-- **Fix**: moved instrumentation verification to the staged `glib2-git`
-  package payload after `meson install`, while retaining rejection of
-  instrumented shared libraries and executables that would ship.
-- **Validation**: the GLib fixture now creates the exact `meson-private`
-  helper, confirms it is ignored, and confirms an instrumented staged library
-  still fails validation.
+- **Fix**: moved instrumentation verification to each staged package payload
+  after `meson install`, while retaining rejection of instrumented shared
+  libraries and executables that would ship.
+- **Validation**: shared GLib/Cairo fixtures create the exact
+  `meson-private` helper, confirm it is ignored, and confirm an instrumented
+  staged library still fails validation.
 - **Rule**: validate properties at the package boundary; do not reject
   temporary build helpers that cannot reach the installed artifact.
 
