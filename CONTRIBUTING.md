@@ -35,6 +35,7 @@ fish build-all.fish --list
 fish build-all.fish --dry-run --group git
 fish build-all.fish --dry-run --group stable
 fish build-all.fish --dry-run --group core
+bash tests/project-config.sh
 bash tests/scheduler-intensity.sh
 ```
 

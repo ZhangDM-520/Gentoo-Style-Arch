@@ -10,6 +10,22 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-16 — Published recipe omitted by local ignore rule
+
+- **Symptom**: a fresh checkout rejected `xorg-xwayland-git` during
+  `build-all.fish --list` with `invalid package map path`, even though the
+  package was listed in `config/packages.map` and `config/groups/git.list`.
+- **Cause**: the source workspace's package-local `.gitignore` contained `*`.
+  The migration copied the map entry but a normal `git add` skipped the
+  recipe directory, leaving a mapped package with no published `PKGBUILD`.
+- **Fix**: restored the recipe and `.SRCINFO` to the public tree without the
+  wildcard ignore file, and added `tests/project-config.sh` to exercise the
+  real listing path.
+- **Rule**: after a package migration, run `build-all.fish --audit` and
+  `build-all.fish --list`; every map entry must have a tracked `PKGBUILD`.
+  Do not publish package-local wildcard ignore files that can hide recipe
+  changes.
+
 ## 2026-09-04 — PKGBUILD trim audit (full workspace)
 
 Standard: trim docs/man/examples/tests/dead splits/dead makedeps; keep
