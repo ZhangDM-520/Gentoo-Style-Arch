@@ -108,9 +108,12 @@ package map, groups, and dependency graph before handling command-line
 arguments. It accepts package IDs, expands local dependencies, sorts them
 topologically, and rejects cycles or missing records.
 
-`--lanes auto --jobs auto` derives a conservative plan from CPU threads and
-available memory. Core packages run alone with a separate memory-aware job
-limit. Every lane is an external Fish child with isolated output, atomic
+`--intensity xhigh` is the default automatic plan. It derives bounded lanes
+and a global normal-lane job budget from CPU threads and available memory;
+`low`, `medium`, `high`, `xhigh`, and `max` trade utilization against
+headroom. Explicit `--lanes`/`--jobs` values override the profile. Core
+packages run alone with a separate memory-aware job limit. Every lane is an
+external Fish child with isolated output, atomic
 validated results, and a log tail owned by the parent dashboard. Plain output
 is append-only; interactive output is width-safe and sanitized. `-i` installs
 each package before its dependents compile, under a builder-owned pacman

@@ -71,19 +71,31 @@ set -g _PACMAN_MUTEX "$LOG_DIR/.pacman-install.lock"
 set -g _PACMAN_MUTEX_WAIT 300
 
 function ui_heading
-    echo (set_color cyan)"━━━ "(string join ' ' -- $argv)" ━━━"(set_color normal)
+    set -l prefix (set_color cyan)
+    set -l suffix (set_color normal)
+    set -l message (string join '' -- "━━━ " (string join ' ' -- $argv) " ━━━")
+    echo "$prefix$message$suffix"
 end
 
 function ui_success
-    echo (set_color green)"$_UI_ICON_OK "(string join ' ' -- $argv)(set_color normal)
+    set -l prefix (set_color green)
+    set -l suffix (set_color normal)
+    set -l message (string join '' -- "$_UI_ICON_OK " (string join ' ' -- $argv))
+    echo "$prefix$message$suffix"
 end
 
 function ui_warning
-    echo (set_color yellow)"$_UI_ICON_WARN "(string join ' ' -- $argv)(set_color normal)
+    set -l prefix (set_color yellow)
+    set -l suffix (set_color normal)
+    set -l message (string join '' -- "$_UI_ICON_WARN " (string join ' ' -- $argv))
+    echo "$prefix$message$suffix"
 end
 
 function ui_error
-    echo (set_color red)"$_UI_ICON_ERROR "(string join ' ' -- $argv)(set_color normal)
+    set -l prefix (set_color red)
+    set -l suffix (set_color normal)
+    set -l message (string join '' -- "$_UI_ICON_ERROR " (string join ' ' -- $argv))
+    echo "$prefix$message$suffix"
 end
 
 function ui_info
@@ -113,6 +125,7 @@ set -g _GROUP_misc
 set -g _GROUP_third_party
 set -g _DEFAULT_LANES auto
 set -g _DEFAULT_JOBS auto
+set -g _DEFAULT_INTENSITY xhigh
 set -g _MEMORY_PER_JOB_GIB 3
 set -g _CORE_MEMORY_PER_JOB_GIB 4
 set -g _RESERVED_MEMORY_GIB 2
@@ -159,6 +172,55 @@ function assign_group -a group_name
     return 0
 end
 
+function intensity_is_valid -a intensity_level
+    switch "$intensity_level"
+        case low medium high xhigh max
+            return 0
+        case '*'
+            return 1
+    end
+end
+
+function configure_intensity -a intensity_level
+    if not intensity_is_valid "$intensity_level"
+        ui_error "intensity must be one of low, medium, high, xhigh, or max"
+        return 1
+    end
+
+    switch "$intensity_level"
+        case low
+            set -g _INTENSITY_LANE_CAP 1
+            set -g _INTENSITY_CPU_PER_LANE 16
+            set -g _INTENSITY_MEMORY_PER_LANE 16
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 2
+            set -g _INTENSITY_CORE_MEMORY_FACTOR 1.5
+        case medium
+            set -g _INTENSITY_LANE_CAP 2
+            set -g _INTENSITY_CPU_PER_LANE 8
+            set -g _INTENSITY_MEMORY_PER_LANE 8
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 1
+            set -g _INTENSITY_CORE_MEMORY_FACTOR 1
+        case high
+            set -g _INTENSITY_LANE_CAP 3
+            set -g _INTENSITY_CPU_PER_LANE 6
+            set -g _INTENSITY_MEMORY_PER_LANE 6
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.6666666667
+            set -g _INTENSITY_CORE_MEMORY_FACTOR 0.75
+        case xhigh
+            set -g _INTENSITY_LANE_CAP 4
+            set -g _INTENSITY_CPU_PER_LANE 4
+            set -g _INTENSITY_MEMORY_PER_LANE 4
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.5
+            set -g _INTENSITY_CORE_MEMORY_FACTOR 0.625
+        case max
+            set -g _INTENSITY_LANE_CAP 6
+            set -g _INTENSITY_CPU_PER_LANE 2
+            set -g _INTENSITY_MEMORY_PER_LANE 2
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.3333333333
+            set -g _INTENSITY_CORE_MEMORY_FACTOR 0.5
+    end
+end
+
 function read_config_defaults
     test -f "$DEFAULT_CONFIG_FILE"; or return 1
     for raw_line in (cat "$DEFAULT_CONFIG_FILE")
@@ -172,6 +234,8 @@ function read_config_defaults
                 set -g _DEFAULT_LANES "$fields[2]"
             case jobs
                 set -g _DEFAULT_JOBS "$fields[2]"
+            case intensity
+                set -g _DEFAULT_INTENSITY "$fields[2]"
             case memory_per_job_gib
                 set -g _MEMORY_PER_JOB_GIB "$fields[2]"
             case core_memory_per_job_gib
@@ -198,6 +262,9 @@ function read_config_defaults
     end
     if set -q GSA_JOBS; and test -n "$GSA_JOBS"
         set -g _DEFAULT_JOBS "$GSA_JOBS"
+    end
+    if set -q GSA_INTENSITY; and test -n "$GSA_INTENSITY"
+        set -g _DEFAULT_INTENSITY "$GSA_INTENSITY"
     end
 end
 
@@ -237,6 +304,10 @@ function load_project_config
             ui_error "invalid parallelism default: $setting=$value"
             return 1
         end
+    end
+    if not intensity_is_valid "$_DEFAULT_INTENSITY"
+        ui_error "invalid intensity default: $_DEFAULT_INTENSITY"
+        return 1
     end
 
     set -g _PACKAGE_MAP
@@ -1983,9 +2054,9 @@ function available_cpu_threads
     nproc
 end
 
-function run_lanes -a lanes jobs_override install_flag clean_flag skip_flag no_sync_flag
+function run_lanes -a lanes jobs_override intensity_level install_flag clean_flag skip_flag no_sync_flag
     # Remaining argv = the topo-sorted package list
-    set -l sorted $argv[7..-1]
+    set -l sorted $argv[8..-1]
     if not command -v setsid >/dev/null 2>&1
         ui_error "setsid is required for isolated lane processes"
         return 1
@@ -1999,6 +2070,9 @@ function run_lanes -a lanes jobs_override install_flag clean_flag skip_flag no_s
     set -l total (count $sorted)
     if test "$total" -eq 0
         ui_error "selection resolved to no packages"
+        return 1
+    end
+    if not configure_intensity "$intensity_level"
         return 1
     end
     set -l needs_stable_sync 0
@@ -2029,8 +2103,11 @@ function run_lanes -a lanes jobs_override install_flag clean_flag skip_flag no_s
     if test "$memory_gib" -le 0
         set memory_gib 1
     end
+    set -l normal_memory (math "max(1, $memory_gib - $_RESERVED_MEMORY_GIB)")
+    set -l normal_memory_per_job (math "$_MEMORY_PER_JOB_GIB * $_INTENSITY_NORMAL_MEMORY_FACTOR")
+    set -l normal_job_budget (math "max(1, floor($normal_memory / $normal_memory_per_job))")
     if test "$lanes" = auto
-        set lanes (math "max(1, min(4, floor($nproc_count / 8), floor($memory_gib / 8)))")
+        set lanes (math "max(1, min($_INTENSITY_LANE_CAP, floor($nproc_count / $_INTENSITY_CPU_PER_LANE), floor($memory_gib / $_INTENSITY_MEMORY_PER_LANE), $normal_job_budget, $total))")
     else if not string match -qr '^[1-9][0-9]*$' -- "$lanes"
         ui_error "lane count must be a positive integer or auto"
         return 1
@@ -2039,9 +2116,8 @@ function run_lanes -a lanes jobs_override install_flag clean_flag skip_flag no_s
         set lanes $total
     end
     if test "$jobs_override" = auto
-        set -l normal_memory (math "max(1, $memory_gib - $_RESERVED_MEMORY_GIB)")
-        set -l memory_jobs (math "max(1, floor($normal_memory / $_MEMORY_PER_JOB_GIB))")
         set -l cpu_jobs (math "max(1, floor($nproc_count / $lanes))")
+        set -l memory_jobs (math "max(1, floor($normal_job_budget / $lanes))")
         set lane_jobs (math "max(1, min($cpu_jobs, $memory_jobs))")
     else if string match -qr '^[1-9][0-9]*$' -- "$jobs_override"
         set lane_jobs "$jobs_override"
@@ -2049,9 +2125,9 @@ function run_lanes -a lanes jobs_override install_flag clean_flag skip_flag no_s
         ui_error "jobs must be a positive integer or auto"
         return 1
     end
-    set -l core_memory (math "max(1, $memory_gib - $_RESERVED_MEMORY_GIB)")
-    set -l core_jobs (math "max(1, min($nproc_count, floor($core_memory / $_CORE_MEMORY_PER_JOB_GIB)))")
-    ui_info "parallelism: $nproc_count CPU threads, $memory_gib GiB available, $lanes lane(s), normal -j$lane_jobs, core -j$core_jobs"
+    set -l core_memory_per_job (math "$_CORE_MEMORY_PER_JOB_GIB * $_INTENSITY_CORE_MEMORY_FACTOR")
+    set -l core_jobs (math "max(1, min($nproc_count, floor($normal_memory / $core_memory_per_job)))")
+    ui_info "parallelism: $nproc_count CPU threads, $memory_gib GiB available, intensity $intensity_level, $lanes lane(s), normal -j$lane_jobs, core -j$core_jobs"
 
     set -l succeeded
     set -l failed
@@ -2419,11 +2495,14 @@ function usage
     echo "                    core-group builds run solo with a memory-aware job limit."
     echo "  --jobs N|auto      Set jobs per normal lane, or derive it from CPU/RAM"
     echo "                    (default "(string join '' -- "$_DEFAULT_JOBS")")."
+    echo "  --intensity LEVEL  Automatic resource profile: low, medium, high, xhigh,"
+    echo "                    or max (default "(string join '' -- "$_DEFAULT_INTENSITY")")."
+    echo "                    Explicit --lanes/--jobs override automatic profile values."
     echo "  --allow-broken-rustc"
     echo "                    Skip the rustc sanity probe (llvm-ABI-skew guard); only"
     echo "                    for runs that don't compile Rust"
-    echo "  Environment: GSA_STATE_DIR, GSA_LANES, GSA_JOBS, GSA_CPU_THREADS,"
-    echo "               GSA_MEMORY_GIB, GSA_TARGET_CPU"
+    echo "  Environment: GSA_STATE_DIR, GSA_LANES, GSA_JOBS, GSA_INTENSITY,"
+    echo "               GSA_CPU_THREADS, GSA_MEMORY_GIB, GSA_TARGET_CPU"
     echo "               override runtime state, parallelism, and optional CPU tuning."
     echo ""
     echo "Range syntax (requires a -g group or package selection):"
@@ -2516,6 +2595,7 @@ function main
     set -l dry_run 0
     set -l lane_count "$_DEFAULT_LANES"
     set -l jobs_override "$_DEFAULT_JOBS"
+    set -l intensity_level "$_DEFAULT_INTENSITY"
     set -l allow_broken_rustc 0
     set -l groups
     set -l packages
@@ -2575,6 +2655,17 @@ function main
                     return 1
                 end
                 set jobs_override $args[2]
+                set -e args[2]
+            case --intensity
+                if test (count $args) -lt 2
+                    ui_error "--intensity requires an argument"
+                    return 1
+                end
+                if not intensity_is_valid "$args[2]"
+                    ui_error "--intensity expects low, medium, high, xhigh, or max; got '$args[2]'"
+                    return 1
+                end
+                set intensity_level $args[2]
                 set -e args[2]
             case --allow-broken-rustc
                 # Escape hatch for check_rustc_sanity — for the rare case where
@@ -2793,6 +2884,7 @@ function main
     echo "Clean:    "(test "$clean_flag" = "1"; and echo "yes"; or echo "no")
     echo "Lanes:    $lane_count"
     echo "Jobs:     $jobs_override (normal lanes; auto uses CPU/RAM)"
+    echo "Intensity: $intensity_level"
     if test "$_ROOT_MODE" = "1"
         echo "User:     root (supervisor) — builds as $_BUILD_USER, installs as root"
     else
@@ -2831,7 +2923,7 @@ function main
     # Parallel lane dispatcher (--lanes 1 = strict topo order, the old
     # sequential semantics). Installs happen inside lanes in readiness
     # order; a dependent never starts before all its deps are installed.
-    run_lanes $lane_count $jobs_override $install_flag $clean_flag \
+    run_lanes $lane_count $jobs_override $intensity_level $install_flag $clean_flag \
         $skip_flag $no_sync_flag $sorted
     set -l run_rc $status
     set -l succeeded $_RL_SUCCEEDED

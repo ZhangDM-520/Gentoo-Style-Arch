@@ -14,7 +14,7 @@ fish build-all.fish --help
 fish build-all.fish --audit
 fish build-all.fish --list
 fish build-all.fish --dry-run --group core
-fish build-all.fish --group git --lanes auto --jobs auto
+fish build-all.fish --group git --intensity xhigh
 ```
 
 The builder refuses an empty selection. `--no-deps` is for a deliberately

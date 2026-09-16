@@ -66,21 +66,34 @@ See `docs/build-guide.md` before using installation or cleanup modes.
 
 ## Adaptive parallelism
 
-The default `--lanes auto --jobs auto` plan derives concurrency from available
-CPU threads and `MemAvailable`. Heavy `core` recipes run alone with a separate
-memory-aware job limit. Small hosts are never forced to use the old minimum of
-four jobs per lane.
+The default `--intensity xhigh` profile derives concurrency from available CPU
+threads and `MemAvailable`. It budgets normal-lane jobs globally, rather than
+granting every lane an independent memory allowance. Heavy `core` recipes run
+alone with a separate memory-aware job limit.
+
+Choose a named effort profile when automatic scheduling should be less or more
+aggressive:
+
+| Profile | Intent |
+| --- | --- |
+| `low` | One conservative lane; maximize memory headroom |
+| `medium` | Balanced baseline for long-running hosts |
+| `high` | More independent lanes and lower per-job memory budget |
+| `xhigh` | Default; aggressive utilization with bounded automatic lanes |
+| `max` | Highest automatic utilization; use only when OOM risk is acceptable |
 
 Override the plan explicitly when needed:
 
 ```sh
+fish build-all.fish --group git --intensity medium
 fish build-all.fish --group git --lanes 1 --jobs 2
-GSA_LANES=2 GSA_JOBS=1 fish build-all.fish --group git
+GSA_INTENSITY=low fish build-all.fish --group git
 ```
 
 `GSA_CPU_THREADS` and `GSA_MEMORY_GIB` are also available for constrained
 containers and deterministic scheduler fixtures. Normally they should be
-left unset so the host's `/proc` and `nproc` values are used.
+left unset so the host's `/proc` and `nproc` values are used. Explicit
+`--lanes` and `--jobs` values take precedence over the profile.
 
 Runtime logs, lane results, and locks are written under
 `.state/` by default and are ignored by Git. makepkg source trees and package
