@@ -1,0 +1,120 @@
+diff -ruN /tmp/osl-orig/src/cmake/externalpackages.cmake /tmp/osl-new/src/cmake/externalpackages.cmake
+--- a/src/cmake/externalpackages.cmake	2026-04-02 14:12:59.000000000 +0800
++++ b/src/cmake/externalpackages.cmake	2026-09-16 10:45:09.982598847 +0800
+@@ -58,7 +58,7 @@
+ # LLVM library setup
+ checked_find_package (LLVM REQUIRED
+                       VERSION_MIN 14.0
+-                      VERSION_MAX 22.9
++                      VERSION_MAX 24.9
+                       PRINT LLVM_SYSTEM_LIBRARIES CLANG_LIBRARIES
+                             LLVM_SHARED_MODE)
+ # ensure include directory is added (in case of non-standard locations
+diff -ruN /tmp/osl-orig/src/liboslexec/llvm_passes.h /tmp/osl-new/src/liboslexec/llvm_passes.h
+--- a/src/liboslexec/llvm_passes.h	2026-04-02 14:12:59.000000000 +0800
++++ b/src/liboslexec/llvm_passes.h	2026-09-16 10:49:04.551629907 +0800
+@@ -380,7 +380,7 @@
+ // New pass manager adapter
+ template<int WidthT>
+ class NewPreventBitMasksFromBeingLiveinsToBasicBlocks final
+-    : public llvm::PassInfoMixin<
++    : public llvm::OptionalPassInfoMixin<
+           NewPreventBitMasksFromBeingLiveinsToBasicBlocks<WidthT>> {
+     PreventBitMasksFromBeingLiveinsToBasicBlocks<WidthT> m_pass;
+ 
+diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec/llvm_util.cpp
+--- a/src/liboslexec/llvm_util.cpp	2026-04-02 14:12:59.000000000 +0800
++++ b/src/liboslexec/llvm_util.cpp	2026-09-16 10:51:47.096669204 +0800
+@@ -78,7 +78,6 @@
+ #include <llvm/Transforms/Scalar.h>
+ #include <llvm/Transforms/Scalar/GVN.h>
+ #include <llvm/Transforms/Utils.h>
+-#include <llvm/Transforms/Utils/UnifyFunctionExitNodes.h>
+ 
+ #include <llvm/Support/DynamicLibrary.h>
+ 
+@@ -1548,14 +1547,24 @@
+     // control is now handled via per-instruction fast-math flags in IR.
+     options.UnsafeFPMath = false;
+ #endif
++#if OSL_LLVM_VERSION < 230
++    // NoInfsFPMath, NoNaNsFPMath, and NoSignedZerosFPMath were removed from
++    // TargetOptions in LLVM 23; like UnsafeFPMath before them, FP math
++    // control is now handled via per-instruction fast-math flags in IR.
++    // The values we set here all matched LLVM's own defaults, so simply
++    // dropping them for LLVM 23+ preserves the existing behavior.
++    //
+     // Since there are OSL language functions isinf and isnan,
+     // we cannot assume there will not be infs and NANs
+     options.NoInfsFPMath = false;
+     options.NoNaNsFPMath = false;
+-    // We will not be setting up any exception handling for FP math
+-    options.NoTrappingFPMath = true;
+     // Debatable, but perhaps some tests care about the sign of +0 vs. -0
+     options.NoSignedZerosFPMath = false;
++#endif
++    // We will not be setting up any exception handling for FP math
++#if OSL_LLVM_VERSION < 240
++    options.NoTrappingFPMath = true;
++#endif
+     // We will NOT be changing rounding mode dynamically
+     options.HonorSignDependentRoundingFPMathOption = false;
+ 
+@@ -1563,7 +1572,12 @@
+     options.GuaranteedTailCallOpt = false;
+     options.FunctionSections      = true;
+     options.UseInitArray          = false;
++#if OSL_LLVM_VERSION < 240
++    // FloatABIType was removed from TargetOptions in LLVM 24; the float ABI
++    // is now taken from the module flags or inferred from the target triple,
++    // which matches the FloatABI::Default value that was set here.
+     options.FloatABIType          = llvm::FloatABI::Default;
++#endif
+ #if OSL_LLVM_VERSION < 190
+     options.RelaxELFRelocations = false;
+ #endif
+@@ -1814,10 +1828,17 @@
+         // control is now handled via per-instruction fast-math flags in IR.
+         options.UnsafeFPMath = 1;
+ #endif
++#if OSL_LLVM_VERSION < 230
++        // Removed from TargetOptions in LLVM 23; fast-math relaxations are
++        // now expressed with per-instruction fast-math flags in IR.
+         options.NoInfsFPMath                           = 1;
+         options.NoNaNsFPMath                           = 1;
++#endif
+         options.HonorSignDependentRoundingFPMathOption = 0;
++#if OSL_LLVM_VERSION < 240
++        // Removed from TargetOptions in LLVM 24 (see make_jit_execengine).
+         options.FloatABIType          = llvm::FloatABI::Default;
++#endif
+         options.AllowFPOpFusion       = llvm::FPOpFusion::Fast;
+         options.NoZerosInBSS          = 0;
+         options.GuaranteedTailCallOpt = 0;
+@@ -2315,7 +2336,7 @@
+             case 16: {
+                 // MUST BE THE FINAL PASS!
+                 m_new_pass_manager->module_pass_manager.addPass(
+-                    createModuleToFunctionPassAdaptor(
++                    llvm::createModuleToFunctionPassAdaptor(
+                         NewPreventBitMasksFromBeingLiveinsToBasicBlocks<16>(
+                             context())));
+                 break;
+@@ -2323,7 +2344,7 @@
+             case 8: {
+                 // MUST BE THE FINAL PASS!
+                 m_new_pass_manager->module_pass_manager.addPass(
+-                    createModuleToFunctionPassAdaptor(
++                    llvm::createModuleToFunctionPassAdaptor(
+                         NewPreventBitMasksFromBeingLiveinsToBasicBlocks<8>(
+                             context())));
+                 break;
+@@ -2331,7 +2352,7 @@
+             case 4:
+                 // MUST BE THE FINAL PASS!
+                 m_new_pass_manager->module_pass_manager.addPass(
+-                    createModuleToFunctionPassAdaptor(
++                    llvm::createModuleToFunctionPassAdaptor(
+                         NewPreventBitMasksFromBeingLiveinsToBasicBlocks<4>(
+                             context())));
+                 break;

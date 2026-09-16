@@ -1,0 +1,8 @@
+*.pkg.tar.xz
+src/
+pkg/
+*.git/
+blender/
+blender-addons/
+blender-addons-contrib/
+*.log

@@ -1,0 +1,67 @@
+# Maintainer: zhangdm (local dev stack, ~/Projects)
+# PySide6 + shiboken6 built from Qt's pyside-setup dev branch against
+# qt6-base-git (Qt 6.13-dev). Scoped to the essential base modules with
+# -DMODULES so no bindings are generated against the still-stock 6.11.2
+# optional modules (Qml, Quick, Multimedia, ...) — see NOTE.md.
+
+pkgbase=pyside6-git
+pkgname=pyside6-git
+pkgver=6.12.0.r12455.g1fba41dfd
+pkgrel=1
+pkgdesc='Python/C++ Qt6 bindings (shiboken6 + PySide6) from pyside-setup dev, built against qt6-base-git'
+arch=(x86_64)
+url='https://www.qt.io'
+license=(GPL-3.0-only
+         LGPL-3.0-only
+         LicenseRef-Qt-Commercial
+         Qt-GPL-exception-1.0)
+depends=(gcc-libs
+         glibc
+         python
+         qt6-base-git)
+makedepends=(clang
+             cmake
+             git
+             llvm
+             ninja
+             pkgconf
+             python-numpy
+             python-setuptools)
+provides=(pyside6
+          shiboken6
+          qt6-python-bindings)
+conflicts=(pyside6
+           shiboken6)
+replaces=(pyside6
+          shiboken6)
+source=(git+https://code.qt.io/pyside/pyside-setup.git#branch=dev)
+sha256sums=('SKIP')
+
+pkgver() {
+  cd pyside-setup
+  # dev branch's newest reachable tag can be ancient (5.11.2) — use the
+  # version the project itself declares (sources/shiboken6/.cmake.conf).
+  local ver rev
+  ver=$(sed -n 's/^set(shiboken_MAJOR_VERSION "\(.*\)")/\1/p;s/^set(shiboken_MINOR_VERSION "\(.*\)")/.\1/p;s/^set(shiboken_MICRO_VERSION "\(.*\)")/.\1/p' sources/shiboken6/.cmake.conf | tr -d '\n')
+  rev=$(git rev-list --count HEAD)
+  printf '%s.r%s.g%s' "$ver" "$rev" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cmake -B build -S pyside-setup -G Ninja \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_BUILD_TYPE=None \
+    -DSHIBOKEN_PYTHON_LIBRARIES=$(pkgconf python3-embed --libs) \
+    -DBUILD_TESTS=OFF \
+    -DFORCE_LIMITED_API=no \
+    -DNO_QT_TOOLS=yes \
+    -DMODULES='Core;Gui;Widgets' \
+    -DNUMPY_INCLUDE_DIR=$(numpy-config --cflags | sed -e 's|-I||')
+  PYTHONPATH="$PWD"/build/sources cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build/sources/shiboken6
+  DESTDIR="$pkgdir" cmake --install build/sources/shiboken6_generator
+  DESTDIR="$pkgdir" cmake --install build/sources/pyside6
+}

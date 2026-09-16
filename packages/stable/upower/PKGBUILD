@@ -1,0 +1,72 @@
+# Maintainer: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
+# Contributor: Jan de Groot <jgc@archlinux.org>
+
+pkgname=upower
+pkgver=1.91.4
+pkgrel=1.1
+pkgdesc="Abstraction for enumerating power devices, listening to device events and querying history and statistics"
+url="https://upower.freedesktop.org"
+arch=(x86_64)
+license=(GPL-2.0-or-later)
+depends=(
+  glib2
+  glibc
+  libgcc
+  libgudev
+  libimobiledevice
+  libplist
+  polkit
+)
+makedepends=(
+  docbook-xsl
+  git
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  python
+  systemd
+  usbmuxd
+)
+optdepends=('usbmuxd: Read charge status of iOS devices')
+checkdepends=(
+  python-dbus
+  python-dbusmock
+  python-gobject
+  python-packaging
+  umockdev
+)
+backup=(etc/UPower/UPower.conf)
+source=("git+https://gitlab.freedesktop.org/upower/upower.git#tag=v$pkgver")
+b2sums=('639eb2519f2586b4d919437a38d18eb0747ad2678b689d01ac36d14d374eadec222079f96e331de8b8d51f0e482ab578d07b1f65213685d294a7fc57ca4c7f97')
+
+prepare() {
+  cd upower
+}
+
+build() {
+  local meson_options=(
+    -D installed_tests=false
+  )
+
+  # House style: mold linker when available (arch-meson consumes LDFLAGS env)
+  local _mold=""
+  command -v mold >/dev/null 2>&1 && _mold="-fuse-ld=mold"
+  export LDFLAGS+=" ${_mold}"
+
+  arch-meson upower build "${meson_options[@]}"
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  depends+=(libg{lib,object,io}-2.0.so)
+  provides+=(libupower-glib.so)
+
+  meson install -C build --destdir "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:

@@ -1,0 +1,41 @@
+# Builder runtime state
+.state/
+.build-logs/
+.pkg-cache/
+.lane*.result
+.pacman-install.lock
+
+# makepkg outputs and downloaded sources
+**/src/
+**/pkg/
+**/build/
+**/_build/
+**/.git/
+**/keys/
+packages/*/*/*/
+!packages/*/*/LICENSES/
+!packages/*/*/LICENSES/**
+*.pkg.tar.*
+*.src.tar.*
+*.tar
+*.tar.*
+*.part
+*.sig
+*.asc
+*.log
+*.log.*
+
+# Host-specific profiles, generated configurations, and credentials
+afdo.prof
+propeller_cc_profile.txt
+propeller_ld_profile.txt
+config-[0-9]*
+*.profraw
+*.gcda
+*.gcno
+*.enc
+
+# Temporary metadata and local reports
+*.tmp.*
+.srcinfo.err
+Project-structure.txt

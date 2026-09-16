@@ -1,0 +1,32 @@
+pkgbase = fish
+	pkgdesc = Smart and user friendly shell intended mostly for interactive use
+	pkgver = 4.9.3
+	pkgrel = 1
+	url = https://fishshell.com/
+	install = fish.install
+	arch = x86_64
+	license = GPL-2.0-only AND BSD-3-Clause AND ISC AND MIT AND PSF-2.0
+	checkdepends = expect
+	checkdepends = procps-ng
+	checkdepends = python-pexpect
+	makedepends = cmake
+	makedepends = git
+	makedepends = jq
+	makedepends = llvm
+	makedepends = rust
+	depends = glibc
+	depends = libgcc
+	depends = pcre2
+	optdepends = python: man page completion parser / web config tool
+	optdepends = pkgfile: command-not-found hook
+	optdepends = groff: --help for built-in commmands
+	optdepends = mandoc: --help for built-in commmands (alternative)
+	optdepends = xsel: X11 clipboard integration
+	optdepends = xclip: X11 clipboard integration (alternative)
+	optdepends = wl-clipboard: Wayland clipboard integration
+	backup = etc/fish/config.fish
+	source = fish::git+https://github.com/fish-shell/fish-shell#tag=4.9.3
+	sha512sums = abebf6069d47da0d612f5666b4d3292c38286bc4b981dd71aa9e7e23ab4309652eb569b11644b08d00605c90a659c05c87f87c835c1f4d3d5518bdf03fb0823c
+	b2sums = 72e5624fd590281e70b4219aa2ecabbee1a8dc036f6bf91f0422c0f0f0d47dabd94274bafbd134fb30ea7b2d23aa4952cca515d94ee1730551b96c881ea01553
+
+pkgname = fish

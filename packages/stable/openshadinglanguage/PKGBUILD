@@ -1,0 +1,51 @@
+# Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
+
+pkgname=openshadinglanguage
+pkgver=1.15.3.0
+pkgrel=1.1
+pkgdesc="Advanced shading language for production GI renderers"
+arch=('x86_64')
+url="https://github.com/imageworks/OpenShadingLanguage"
+license=('BSD-3-Clause')
+depends=('openimageio' 'imath' 'freetype2' 'libpng' 'libtiff' 'zlib' 'pugixml'
+         'ncurses' 'clang' 'qt6-base' 'fmt' 'glibc' 'llvm-libs' 'libstdc++')
+makedepends=('cmake' 'python' 'llvm' 'ninja' 'git' 'pybind11')
+optdepends=('python: the Python module')
+source=($pkgname-$pkgver.tar.gz::https://github.com/AcademySoftwareFoundation/OpenShadingLanguage/archive/refs/tags/v${pkgver}.tar.gz
+        osl-llvm-compat.patch)
+sha512sums=('269ac2e502966d71bb29c56bb7d17984aa01eb77d7637bf17e0f7f7997998c7f0a0ee0af5b16d39c81dfcc5ccbb20de6cdbd7c08e6a08263f5e1c3a5a1232138'
+            '4debef9b94cbfa75f3948b82dc101ce51978bf986ab8edbbc70b1a995ba02e9d4c3488a77b0341713c5b8376b68f9ad8a07a8a71b0ba4fa7b1601d5c1005e15e')
+prepare() {
+  cd OpenShadingLanguage-$pkgver
+
+  # Backport of upstream LLVM 23 support (2e43fc367) adapted to 1.15.3.0,
+  # with the LLVM version gate extended to 24.x for system llvm-git 24.
+  patch -Np1 < "$srcdir"/osl-llvm-compat.patch
+}
+
+build() {
+  cd OpenShadingLanguage-$pkgver
+
+  cmake \
+    -B build \
+    -GNinja \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DSTOP_ON_WARNING=OFF
+  ninja -C build
+}
+
+package() {
+  cd OpenShadingLanguage-$pkgver
+
+  DESTDIR="$pkgdir/" ninja -C build install
+
+  # Fixup an upstream fucky (See #1)
+  rm -r "$pkgdir"/usr/build-scripts
+  rm -r "$pkgdir"/usr/cmake
+
+  install -Dm644 LICENSE.md "$pkgdir"/usr/share/licenses/$pkgname/LICENSE.md
+}
+
+# vim:set ts=2 sw=2 et:

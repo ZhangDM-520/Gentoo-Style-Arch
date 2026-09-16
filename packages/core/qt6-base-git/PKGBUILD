@@ -1,0 +1,104 @@
+# Merged with official ABS qt6-base PKGBUILD by João, 2024/07/31 (all respective contributors apply herein)
+# Maintainer: João Figueiredo <jf.mundox@gmail.com>
+# Contributor: Antonio Rojas <arojas@archlinux.org>
+# Contributor: Felix Yan <felixonmars@archlinux.org>
+# Contributor: Andrea Scarpino <andrea@archlinux.org>
+
+pkgbase=qt6-base-git
+pkgname=(qt6-base-git
+         qt6-xcb-private-headers-git)
+pkgver=6.12.0_r81448.g71794df97d3
+pkgrel=1
+arch=($CARCH)
+url='https://www.qt.io'
+license=(GPL3 LGPL3 FDL custom)
+pkgdesc='A cross-platform application and UI framework'
+makedepends=(git alsa-lib cmake cups git gst-plugins-base-libs libpulse ninja xmlstarlet)
+# Trimmed 2026-09-04: freetds/libfbclient/mariadb-libs/postgresql/unixodbc
+# (SQL server drivers — sqlite is the only DB used here) and gtk3 (GTK
+# platform plugin is dead weight under niri; wayland/xcb plugins cover it).
+# FEATURE_sql_* switches below keep the drivers off even if the libs are
+# installed at build time.
+depends=(brotli dbus double-conversion fontconfig freetype2 gcc-libs glib2 glibc harfbuzz icu krb5 libb2 libcups libdrm libgl libice libinput libjpeg-turbo libpng libproxy libsm libx11 libxcb libxkbcommon libxkbcommon-x11 md4c mesa mtdev openssl pcre2 shared-mime-info sqlite systemd-libs tslib vulkan-headers xcb-util-cursor xcb-util-image xcb-util-keysyms xcb-util-renderutil xcb-util-wm xdg-utils zlib zstd qt6-translations)
+optdepends=('gdk-pixbuf2: GTK platform plugin'
+            'pango: GTK platform plugin'
+            'perl: for syncqt'
+            'qt6-wayland: to run Qt6 applications in a Wayland session')
+groups=(qt6-git)
+source=(git+https://code.qt.io/qt/qtbase.git#branch=dev)
+sha256sums=('SKIP')
+
+pkgver() {
+  cd qtbase
+  _ver="$(git describe | sed 's/^v//;s/-.*//')"
+  echo "${_ver}_r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+}
+
+build() {
+  if command -v mold >/dev/null 2>&1; then
+    export LDFLAGS+=" -fuse-ld=mold"
+  fi
+
+  cmake -B build -S qtbase -G Ninja \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DINSTALL_BINDIR=lib/qt6/bin \
+    -DINSTALL_PUBLICBINDIR=usr/bin \
+    -DINSTALL_LIBEXECDIR=lib/qt6 \
+    -DINSTALL_DOCDIR=share/doc/qt6 \
+    -DINSTALL_ARCHDATADIR=lib/qt6 \
+    -DINSTALL_DATADIR=share/qt6 \
+    -DINSTALL_INCLUDEDIR=include/qt6 \
+    -DINSTALL_MKSPECSDIR=lib/qt6/mkspecs \
+    -DINSTALL_EXAMPLESDIR=share/doc/qt6/examples \
+    -DFEATURE_journald=ON \
+    -DFEATURE_libproxy=ON \
+    -DFEATURE_openssl_linked=ON \
+    -DFEATURE_system_sqlite=ON \
+    -DFEATURE_sql_sqlite=ON \
+    -DFEATURE_sql_mysql=OFF \
+    -DFEATURE_sql_psql=OFF \
+    -DFEATURE_sql_odbc=OFF \
+    -DFEATURE_sql_ibase=OFF \
+    -DFEATURE_sql_tds=OFF \
+    -DFEATURE_system_xcb_xinput=ON \
+    -DFEATURE_no_direct_extern_access=ON \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+    -DCMAKE_MESSAGE_LOG_LEVEL=STATUS
+  cmake --build build
+}
+
+package_qt6-base-git() {
+  conflicts=(${pkgname[0]%-git})
+  provides=(${pkgname[0]%-git})
+
+
+  DESTDIR="$pkgdir" cmake --install build
+
+  install -Dm644 qtbase/LICENSES/* -t "$pkgdir"/usr/share/licenses/$pkgbase
+
+  # Install symlinks for user-facing tools
+  cd "$pkgdir"
+  mkdir usr/bin
+  while read _line; do
+    ln -s $_line
+  done < "$srcdir"/build/user_facing_tool_links.txt
+}
+
+package_qt6-xcb-private-headers-git() {
+  pkgdesc='Private headers for Qt6 Xcb'
+  depends=("qt6-base-git=$pkgver")
+  optdepends=()
+  conflicts=(${pkgname[1]%-git})
+  provides=(${pkgname[1]%-git})
+
+  cd qtbase
+  install -d -m755 "$pkgdir"/usr/include/qt6xcb-private/gl_integrations
+  cp -r src/plugins/platforms/xcb/*.h "$pkgdir"/usr/include/qt6xcb-private/
+  cp -r src/plugins/platforms/xcb/gl_integrations/*.h "$pkgdir"/usr/include/qt6xcb-private/gl_integrations/
+  # nativepainting removed upstream in Qt 6.13+
+  if [[ -d src/plugins/platforms/xcb/nativepainting ]]; then
+    install -d -m755 "$pkgdir"/usr/include/qt6xcb-private/nativepainting
+    cp -r src/plugins/platforms/xcb/nativepainting/*.h "$pkgdir"/usr/include/qt6xcb-private/nativepainting/
+  fi
+}

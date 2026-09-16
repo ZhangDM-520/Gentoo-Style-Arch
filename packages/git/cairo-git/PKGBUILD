@@ -1,0 +1,95 @@
+# Maintainer: a821
+# Contributor:  Vincent Grande <shoober420@gmail.com>
+# Contributor: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
+# Contributor: Jan de Groot <jgc@archlinux.org>
+# Contributor: Brice Carpentier <brice@daknet.org>
+
+pkgbase=cairo-git
+pkgname=(cairo-git)
+pkgver=1.18.4.r141.gdd6262c17
+pkgrel=1
+pkgdesc="2D graphics library with support for multiple output devices"
+url="https://cairographics.org/"
+arch=(x86_64)
+license=('LGPL-2.1-only OR MPL-1.1')
+depends=(
+  bash
+  fontconfig
+  freetype2
+  glib2
+  glibc
+  libpng
+  libx11
+  libxcb
+  libxext
+  libxrender
+  lzo
+  pixman
+  zlib
+)
+makedepends=(
+  git
+  meson
+  valgrind
+)
+source=("git+https://gitlab.freedesktop.org/cairo/cairo.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd cairo
+  git describe --tags | sed 's/[^-]*-g/r&/;s/-/./g'
+}
+
+build() {
+  if command -v mold >/dev/null 2>&1; then
+    export LDFLAGS+=" -fuse-ld=mold"
+  fi
+
+  local meson_options=(
+    -D dwrite=disabled
+    -D gtk_doc=false
+    -D spectre=disabled
+    -D symbol-lookup=disabled
+    -D b_ndebug=true
+  )
+
+  # Phase 1: PGO instrumented build (tests enabled for training)
+  CFLAGS+=" -fprofile-generate" CXXFLAGS+=" -fprofile-generate"
+  arch-meson cairo build "${meson_options[@]}" \
+    -D tests=enabled \
+    -D b_lto=false
+  meson compile -C build
+
+  # Phase 2: training — run test suite
+  timeout -k 5 120 meson test -C build --print-errorlogs || true
+
+  # Phase 3: verify profile quality
+  local _gcda_count
+  _gcda_count="$(find build -name '*.gcda' 2>/dev/null | wc -l)"
+  if ((_gcda_count < 50)); then
+    warning "PGO produced only %d gcda files — rebuilding with LTO only" "$_gcda_count"
+    meson configure build -D tests=disabled -Db_lto=true
+  else
+    msg "PGO profile: %d gcda files — rebuilding with profile" "$_gcda_count"
+    export CFLAGS="${CFLAGS/ -fprofile-generate/} -fprofile-use=$(pwd)/build"
+    export CXXFLAGS="${CXXFLAGS/ -fprofile-generate/} -fprofile-use=$(pwd)/build"
+    meson setup --reconfigure cairo build
+    meson configure build -D tests=disabled -Db_lto=true
+    meson compile -C build
+  fi
+}
+
+package_cairo-git() {
+  provides=(
+    libcairo-gobject.so
+    libcairo-script-interpreter.so
+    libcairo.so
+  )
+  provides+=("${pkgname%-git}=${pkgver%%.r*}")
+  conflicts=("${pkgname%-git}")
+  options+=(!emptydirs)
+
+  meson install -C build --destdir "$pkgdir"
+}
+
+# vim: set ts=2 sw=2 et:

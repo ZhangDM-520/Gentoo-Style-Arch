@@ -1,0 +1,5 @@
+[rocm-core]
+source = "git"
+git = "https://github.com/ROCm/rocm-core.git"
+include_regex = 'rocm-\d+\.\d+\.\d+'
+prefix = "rocm-"

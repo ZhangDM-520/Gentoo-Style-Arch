@@ -1,0 +1,18 @@
+pkgbase = rust-bindgen-git
+	pkgdesc = Automatically generates Rust FFI bindings to C (and some C++) libraries
+	pkgver = 0.73.2.r2.gd1306286
+	pkgrel = 1
+	url = https://github.com/rust-lang-nursery/rust-bindgen
+	arch = x86_64
+	license = BSD-3-Clause
+	makedepends = cargo
+	makedepends = git
+	depends = glibc
+	depends = libgcc
+	depends = clang
+	provides = rust-bindgen
+	conflicts = rust-bindgen
+	source = git+https://github.com/rust-lang-nursery/rust-bindgen.git
+	sha512sums = SKIP
+
+pkgname = rust-bindgen-git

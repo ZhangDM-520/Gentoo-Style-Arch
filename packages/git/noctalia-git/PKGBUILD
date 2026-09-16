@@ -1,0 +1,214 @@
+# Maintainer: Noctalia Team <team@noctalia.dev>
+
+pkgname=noctalia-git
+_pkgname=noctalia
+pkgver=5.1.0.r5545.ge4eb0ff97
+pkgrel=1
+pkgdesc='A sleek, customizable desktop shell crafted for Wayland'
+arch=('x86_64' 'aarch64')
+url='https://github.com/noctalia-dev/noctalia'
+license=('MIT')
+options=('!debug')
+depends=(
+  'cairo'
+  'curl'
+  'fontconfig'
+  'freetype2'
+  'gcc-libs'
+  'git'
+  'glib2'
+  'glibc'
+  'jemalloc'
+  'libglvnd'
+  'libical'
+  'libjxl'
+  'libpipewire'
+  'libqalculate'
+  'librsvg'
+  'libsecret'
+  'libsndfile'
+  'libsodium'
+  'libwebp'
+  'libwireplumber'
+  'libxkbcommon'
+  'libxml2'
+  'md4c'
+  'pam'
+  'polkit'
+  'pango'
+  'sdbus-cpp'
+  'tomlplusplus'
+  'wayland'
+)
+
+makedepends=(
+  'meson'
+  'ninja'
+  'nlohmann-json'
+  'pkgconf'
+  'stb'
+  'wayland-protocols'
+  # VCS source (pkgver, vcs_tag)
+  'git'
+  # PGO training: headless sway session + a private session bus
+  'sway'
+  'dbus'
+)
+# strip:   makepkg strips the final binaries (STRIP_BINARIES="--strip-all")
+# lto:     makepkg appends -flto=auto to CFLAGS/CXXFLAGS/LDFLAGS (belt & braces
+#          with the explicit -Db_lto=true in build())
+# !debug:  no separate debug package
+options=('!debug' 'lto')
+provides=('noctalia')
+conflicts=('noctalia' 'noctalia-bin')
+source=("${_pkgname}::git+${url}.git#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${_pkgname}"
+
+  local version
+  version="$(sed -n "s/^  version: '\([^']*\)',/\1/p" meson.build)"
+  printf '%s.r%s.g%s' "${version}" "$(git rev-list --count HEAD)" "$(git rev-parse --short=9 HEAD)"
+}
+
+# Run the PGO training workload: exercise the real shell under a headless sway
+# session plus every headless CLI subcommand, so GCC's atexit handler can write
+# the .gcda profile data. All XDG state is sandboxed under $work.
+_pgo_train() {
+  local work="$1"
+  local bin="build-release/noctalia"
+
+  export XDG_CONFIG_HOME="$work/config"
+  export XDG_CACHE_HOME="$work/cache"
+  export XDG_DATA_HOME="$work/data"
+  export XDG_RUNTIME_DIR="$work/xdg-runtime"
+  export NOCTALIA_ASSETS_DIR="$PWD/${_pkgname}/assets"
+  export NOCTALIA_CONFIG_HOME="$work/noctalia-config"
+  mkdir -p -m 700 "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+    "$XDG_DATA_HOME" "$NOCTALIA_CONFIG_HOME"
+
+  local sway_pid=""
+  local socket=""
+
+  # Headless sway with the software renderer: no GPU, seat or logind needed.
+  cat > "$work/sway-config" <<'EOF'
+output HEADLESS-1 mode 1920x1080
+seat * hide_cursor 10000
+EOF
+  env WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
+    dbus-run-session -- sway -c "$work/sway-config" >"$work/sway.log" 2>&1 &
+  sway_pid=$!
+
+  # Wait for the Wayland socket to appear (up to ~10 s).
+  for _ in $(seq 1 100); do
+    socket="$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -print -quit 2>/dev/null)"
+    if [[ -n "$socket" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  if [[ -n "$socket" ]]; then
+    export WAYLAND_DISPLAY="${socket##*/}"
+    # Exercise the real shell: startup, bar/widgets, render loop, IPC. SIGINT is
+    # sent so noctalia can shut down cleanly and flush the profile; -k 5 guards
+    # against a hung exit. Do NOT check timeout's exit code: rc=124 simply means
+    # the 30 s training window elapsed — the profile dump is verified below by
+    # the presence of .gcda files.
+    timeout -s INT -k 5 30 "$bin" >/dev/null 2>&1 || true
+    sleep 1
+  else
+    warning "sway headless socket never appeared; PGO limited to CLI workload (see $work/sway.log)"
+  fi
+
+  # CLI subcommands always exit through main(), so they always flush profiles.
+  "$bin" --help                       >/dev/null 2>&1 || true
+  "$bin" --version                    >/dev/null 2>&1 || true
+  for sub in msg config theme ipc; do
+    "$bin" "$sub" --help              >/dev/null 2>&1 || true
+  done
+  for sh in bash zsh fish; do
+    "$bin" completions "$sh"          >/dev/null 2>&1 || true
+  done
+
+  if [[ -n "$sway_pid" ]]; then
+    kill -TERM "$sway_pid" 2>/dev/null || true
+    wait "$sway_pid" 2>/dev/null || true
+  fi
+}
+
+build() {
+  CXXFLAGS+=" -Wno-unused-result"
+
+  # Upstream meson.build gates -ffunction-sections/-fdata-sections and
+  # -Wl,--gc-sections on buildtype == 'release', but arch-meson configures with
+  # buildtype=plain, so apply them explicitly here.
+  CFLAGS+=" -ffunction-sections -fdata-sections"
+  CXXFLAGS+=" -ffunction-sections -fdata-sections"
+  LDFLAGS+=" -Wl,--gc-sections"   # -Wl,--as-needed already in makepkg.conf
+
+  # mold is noticeably faster at linking the large LTO binary. Runtime check so
+  # the PKGBUILD still works without it (mold-git does not provide 'mold').
+  if command -v mold >/dev/null 2>&1; then
+    LDFLAGS+=" -fuse-ld=mold"
+  fi
+
+  local -a meson_flags=(
+    -Db_ndebug=true
+    -Dtests=disabled
+    -Dnative_optimizations=true   # -march=native -mtune=native (local build)
+    -Djemalloc=enabled
+  )
+
+  # PGO: instrument first WITHOUT LTO, train, then rebuild with -fprofile-use.
+  # LTO is only enabled on the final rebuild.
+  local pgo=false
+  if command -v sway >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 2>&1; then
+    pgo=true
+    meson_flags+=(-Db_pgo=generate -Db_lto=false)
+  else
+    warning "sway/dbus-run-session not available; building with LTO but without PGO"
+    meson_flags+=(-Db_lto=true)
+  fi
+
+  arch-meson "${_pkgname}" build-release "${meson_flags[@]}"
+  meson compile -C build-release
+
+  if $pgo; then
+    _pgo_train "$srcdir/pgo-work"
+
+    # Only use the profile if the GUI run actually flushed data: a missing or
+    # trivial profile makes -fprofile-use treat uncovered code as cold and would
+    # pessimize the render loop — fall back to plain LTO in that case.
+    local gcda_count
+    gcda_count="$(find build-release -name '*.gcda' | wc -l)"
+    if (( gcda_count > 100 )); then
+      msg2 "PGO profile collected (${gcda_count} .gcda files); rebuilding with -fprofile-use + LTO"
+      meson configure build-release -Db_pgo=use -Db_lto=true
+    else
+      warning "PGO profile incomplete (${gcda_count} .gcda files); building without PGO"
+      meson configure build-release -Db_pgo=none -Db_lto=true
+    fi
+    meson compile -C build-release
+  fi
+}
+
+package() {
+  meson install -C build-release --destdir "${pkgdir}"
+
+  install -Dm644 "${_pkgname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${_pkgname}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+  # Shell completions generated by the binary we just built.
+  local shell completion_dir
+  for shell in bash zsh fish; do
+    case "$shell" in
+      bash) completion_dir='usr/share/bash-completion/completions' ;;
+      zsh)  completion_dir='usr/share/zsh/site-functions' ;;
+      fish) completion_dir='usr/share/fish/vendor_completions.d' ;;
+    esac
+    ./build-release/noctalia completions "$shell" \
+      | install -Dm644 /dev/stdin "${pkgdir}/${completion_dir}/noctalia"
+  done
+}

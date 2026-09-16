@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: AGPL-3.0
+#
+# Maintainer: Andrew Crerar <andrew (dot) crerar at gmail>
+# Contributor: RKA KriK <rka_krik@mail.ru>
+# Contributor: Boohbah <boohbah at gmail.com>
+# Contributor: Pellegrino Prevete (tallero) <pellegrinoprevete@gmail.com>
+# Contributor: Truocolo <truocolo@aol.com>
+# Maintainer: Solomon Choina <shlomochoina@gmail.com>
+_pkg="gtk"
+_project="gnome"
+_pkgbase="${_pkg}3"
+pkgbase="${_pkgbase}-git"
+pkgname=(
+  "${pkgbase}"
+)
+pkgver=3.24.52.r61.gfb1f0f187c
+pkgrel=1
+pkgdesc="GObject-based multi-platform GUI toolkit (GIT Version)"
+arch=($CARCH)
+url="http://www.${_pkg}.org/"
+license=(
+  'LGPL-2.0-only')
+depends=(
+  'at-spi2-atk'
+  'atk'
+  'cairo'
+  'colord'
+  'glib2'
+  "${_pkg}-update-icon-cache"
+  'libcups'
+  'libepoxy'
+  'libxcomposite'
+  'libxcursor'
+  'libxdamage'
+  'libxi'
+  'libxinerama'
+  'libxkbcommon'
+  'libxrandr'
+  'pango'
+  'shared-mime-info'
+  'wayland'
+  'wayland-protocols'
+  'iso-codes'
+  'tracker3'
+  'libcloudproviders'
+)
+makedepends=(
+  'gobject-introspection' 'git' 'meson' 'sassc')
+optdepends=(
+  "${_project}-icon-theme: Default icon theme"
+  "${_project}-themes-standard: Default widget theme")
+conflicts=('gtk3')
+provides=("gtk3=${pkgver}")
+backup=("usr/share/${_pkg}-3.0/settings.ini")
+_http="https://gitlab.${_project}.org"
+_ns="GNOME"
+_url="${_http}/${_ns}/${_pkg}"
+_local="file://${HOME}/${_pkg}"
+source=(
+  "git+${_url}.git#branch=${_pkg}-3-24"
+  # "git+${_local}#branch=${_pkg}-3-24"
+  settings.ini
+  "${_pkg}-query-immodules-3.0.hook"
+)
+sha256sums=('SKIP'
+            '01fc1d81dc82c4a052ac6e25bf9a04e7647267cc3017bc91f9ce3e63e5eb9202'
+            'a0319b6795410f06d38de1e8695a9bf9636ff2169f40701671580e60a108e229')
+
+pkgver() {
+  cd \
+    "${_pkg}"
+  git \
+    describe \
+    --long | \
+    sed \
+      -r \
+        's/([^-]*-g)/r\1/;s/-/./g'
+}
+
+_meson_options=(
+  -D broadway_backend=false
+  -D cloudproviders=false
+  -D colord=yes
+  -D gtk_doc=false
+  -D introspection=true
+  -D man=false
+  -D tracker3=true
+  -D b_ndebug=true
+)
+
+build() {
+  if command -v mold >/dev/null 2>&1; then
+    export LDFLAGS+=" -fuse-ld=mold"
+  fi
+
+  CFLAGS+=" -DG_DISABLE_CAST_CHECKS"
+
+  # Phase 1: PGO instrumented build
+  CFLAGS+=" -fprofile-generate" CXXFLAGS+=" -fprofile-generate"
+  arch-meson \
+    "${_pkg}" \
+    build \
+      "${_meson_options[@]}" \
+      -Db_lto=false
+  meson compile -C build
+
+  # Phase 2: training — run test suite
+  timeout -k 5 120 meson test -C build --print-errorlogs || true
+
+  # Phase 3: verify profile quality
+  local _gcda_count
+  _gcda_count="$(find build -name '*.gcda' 2>/dev/null | wc -l)"
+  if ((_gcda_count < 100)); then
+    warning "PGO produced only %d gcda files — rebuilding with LTO only" "$_gcda_count"
+    meson configure build -Db_lto=true
+  else
+    msg "PGO profile: %d gcda files — rebuilding with profile" "$_gcda_count"
+    export CFLAGS="${CFLAGS/ -fprofile-generate/} -fprofile-use=$(pwd)/build"
+    export CXXFLAGS="${CXXFLAGS/ -fprofile-generate/} -fprofile-use=$(pwd)/build"
+    meson setup --reconfigure "${_pkg}" build
+    meson configure build -Db_lto=true
+    meson compile -C build
+  fi
+}
+
+_pick() {
+  local p="$1" f d; shift
+  for f; do
+    d="$srcdir/$p/${f#$pkgdir/}"
+    mkdir \
+      -p \
+      "$(dirname \
+           "${d}")"
+    mv \
+      "${f}" \
+      "$d"
+    rmdir \
+      -p \
+      --ignore-fail-on-non-empty \
+      "$(dirname \
+           "${f}")"
+  done
+}
+
+package_gtk3-git() {
+  depends+=(
+    "${_pkg}-update-icon-cache")
+  optdepends=(
+    'evince: Default print preview command')
+  provides=(
+    "gtk3=${pkgver}"
+    "${_pkgbase}-print-backends"
+    libgailutil-3.so
+    libgdk-3.so
+    "lib${_pkg}-3.so"
+  )
+  conflicts=(
+    "gtk3"
+    "${_pkgbase}-print-backends")
+  replaces=(
+    "${_pkgbase}-print-backends<=3.22.26-1")
+  install="${pkgbase}.install"
+
+  meson \
+    install \
+      -C build \
+      --destdir "${pkgdir}"
+
+  install \
+    -Dm644 \
+    /dev/stdin \
+    "${pkgdir}/usr/share/${_pkg}-3.0/settings.ini" <<END
+[Settings]
+${_pkg}-icon-theme-name = Adwaita
+${_pkg}-theme-name = Adwaita
+gtk-font-name = Cantarell 11
+END
+
+  install \
+    -Dt \
+    "${pkgdir}/usr/share/libalpm/hooks" \
+    -m644 \
+    "${_pkg}-query-immodules-3.0.hook"
+
+  cd \
+    "${pkgdir}"
+
+  # Built by GTK 4, shared with GTK 3
+  rm -f \
+    "usr/bin/${_pkg}-update-icon-cache"
+  rm -f \
+    "usr/share/man/man1/${_pkg}-update-icon-cache.1"
+}
+
+# vim:set sw=2 sts=-1 et:

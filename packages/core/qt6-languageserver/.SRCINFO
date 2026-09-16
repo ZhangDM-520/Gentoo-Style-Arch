@@ -1,0 +1,19 @@
+pkgbase = qt6-languageserver
+	pkgdesc = An implementation of the Language Server Protocol
+	pkgver = 6.13.0_r647.gd845a85
+	pkgrel = 1
+	url = https://www.qt.io
+	arch = x86_64
+	groups = qt6
+	license = GPL-3.0-only
+	license = LGPL-3.0-only
+	license = LicenseRef-Qt-Commercial
+	license = Qt-GPL-exception-1.0
+	makedepends = cmake
+	makedepends = git
+	makedepends = ninja
+	depends = qt6-base
+	source = git+https://code.qt.io/qt/qtlanguageserver#commit=d845a857c0354e01286017e5a514f50b4546cf0d
+	sha256sums = SKIP
+
+pkgname = qt6-languageserver

@@ -1,0 +1,106 @@
+# Contributor: Levente Polyak <anthraxx[at]archlinux[dot]org>
+# Contributor: MGislv <mgislv at ceppo dot xyz>
+# Contributor: Diab Neiroukh <lazerl0rd at thezest dot dev>
+# Contributor: Jacek Szafarkiewicz <szafar at linux dot pl>
+
+pkgname=zlib-ng-git
+pkgver=2.3.1.r582.gg9e60980e
+pkgrel=1
+pkgdesc='zlib replacement with optimizations for next generation systems'
+url='https://github.com/zlib-ng/zlib-ng'
+arch=('x86_64')
+license=('Zlib')
+depends=('glibc')
+makedepends=('git' 'cmake' 'ninja')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd zlib-ng
+    git describe --long --tags | sed 's/-/.r/;s/-/.g/'
+}
+
+build() {
+    # Profile dir lives OUTSIDE build/ — phase 3 does `rm -rf build` and
+    # must not delete the profile data it is about to consume.
+    rm -rf pgo-profiles && mkdir -p pgo-profiles
+
+    # Phase 1: instrumented build (LTO off for speed)
+    msg "PGO Phase 1: instrumented build"
+    cmake -B build -S zlib-ng \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_C_FLAGS="$CFLAGS -fprofile-generate=$(pwd)/pgo-profiles" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold -fprofile-generate=$(pwd)/pgo-profiles" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold -fprofile-generate=$(pwd)/pgo-profiles" \
+        -DWITH_GTEST=ON \
+        -DBUILD_SHARED_LIBS=ON \
+        -DWITH_OPTIM=ON \
+        -Wno-dev
+
+    cmake --build build
+
+    # Phase 2: training — run test suite
+    msg "PGO Phase 2: training with test suite"
+    ctest --test-dir build --output-on-failure 2>/dev/null || true
+
+    # Verify profile data
+    # NOTE: -fprofile-generate=<dir> routes ALL .gcda files into that dir
+    local gcda_count=$(find pgo-profiles -name '*.gcda' 2>/dev/null | wc -l)
+    if [ "$gcda_count" -eq 0 ]; then
+        warning "No profile data generated — falling back to LTO-only build"
+        rm -rf build
+        cmake -B build -S zlib-ng \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=None \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_C_FLAGS="$CFLAGS -flto" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold -flto" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold -flto" \
+            -DWITH_GTEST=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DWITH_OPTIM=ON \
+            -Wno-dev
+        cmake --build build
+        rm -rf pgo-profiles
+        return 0
+    fi
+    msg "Profile data generated: $gcda_count .gcda files"
+
+    # Phase 3: rebuild with profile + LTO
+    msg "PGO Phase 3: optimized build"
+    rm -rf build
+    cmake -B build -S zlib-ng \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_C_FLAGS="$CFLAGS -flto -fprofile-use=$(pwd)/pgo-profiles" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold -flto -fprofile-use=$(pwd)/pgo-profiles" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold -flto -fprofile-use=$(pwd)/pgo-profiles" \
+        -DWITH_GTEST=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DWITH_OPTIM=ON \
+        -Wno-dev
+
+    cmake --build build
+    rm -rf pgo-profiles
+}
+
+check() {
+    ctest --output-on-failure --test-dir build
+}
+
+package() {
+    provides=(zlib-ng libz-ng.so)
+    conflicts=(zlib-ng)
+
+    DESTDIR="${pkgdir}" cmake --install build
+    install -Dm644 zlib-ng/LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname}"
+    install -Dm644 zlib-ng/README.md -t "${pkgdir}/usr/share/doc/${pkgname}"
+}
+
+# vim: set ts=4 sw=4 et:

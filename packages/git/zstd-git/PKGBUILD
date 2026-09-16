@@ -1,0 +1,77 @@
+# Maintainer: Johan Förberg <johan@forberg.se>
+pkgname=zstd-git
+_pkgname=zstd
+pkgver=1.5.7.r0.gf8745da6f
+pkgrel=1
+pkgdesc='Zstandard - Fast real-time compression algorithm (git build)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/facebook/zstd'
+license=('BSD-3-Clause' 'GPL-2.0-only')
+groups=()
+depends=('xz' 'zlib' 'lz4')
+makedepends=('git')
+conflicts=('zstd')
+provides=('zstd' 'libzstd.so=1-64')
+# Track the release branch — dev branch tags diverged after v1.4.7
+# (release tags are on a separate branch, unreachable from dev via git describe)
+source=('git+https://github.com/facebook/zstd.git#branch=release')
+noextract=()
+md5sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$_pkgname"
+    git describe --long --tags | sed 's/\([^-]*-g\)/r\1/;s/-/./g;s/^v//g'
+}
+
+build() {
+    cd "$srcdir/$_pkgname"
+
+    # Save original flags
+    local _cflags_orig="$CFLAGS"
+    local _cxxflags_orig="$CXXFLAGS"
+    local _ldflags_orig="$LDFLAGS"
+
+    # Phase 1: instrumented build (LTO off for speed)
+    export CFLAGS="${_cflags_orig} -fprofile-generate=$(pwd)/pgo-profiles"
+    export CXXFLAGS="${_cxxflags_orig} -fprofile-generate=$(pwd)/pgo-profiles"
+    export LDFLAGS="${_ldflags_orig} -fuse-ld=mold -fprofile-generate=$(pwd)/pgo-profiles"
+    make clean 2>/dev/null || true
+    make
+
+    # Phase 2: training — use built-in benchmark
+    # NOTE: the CLI lands at programs/zstd, NOT ./zstd
+    msg "PGO Phase 2: training with zstd benchmark"
+    ./programs/zstd -b1 2>/dev/null || true
+    ./programs/zstd -b3 2>/dev/null || true
+    ./programs/zstd -b7 2>/dev/null || true
+
+    # Verify profile data
+    local gcda_count=$(find . -name '*.gcda' 2>/dev/null | wc -l)
+    if [ "$gcda_count" -eq 0 ]; then
+        warning "No profile data generated — falling back to LTO-only build"
+        export CFLAGS="${_cflags_orig} -flto"
+        export CXXFLAGS="${_cxxflags_orig} -flto"
+        export LDFLAGS="${_ldflags_orig} -fuse-ld=mold -flto"
+        make clean 2>/dev/null || true
+        make
+        make -C contrib/pzstd
+        return 0
+    fi
+    msg "Profile data generated: $gcda_count .gcda files"
+
+    # Phase 3: rebuild with profile + LTO
+    export CFLAGS="${_cflags_orig} -flto -fprofile-use=$(pwd)/pgo-profiles"
+    export CXXFLAGS="${_cxxflags_orig} -flto -fprofile-use=$(pwd)/pgo-profiles"
+    export LDFLAGS="${_ldflags_orig} -fuse-ld=mold -flto -fprofile-use=$(pwd)/pgo-profiles"
+    make clean 2>/dev/null || true
+    make
+    make -C contrib/pzstd
+    rm -rf pgo-profiles
+}
+
+package() {
+    cd "$srcdir/$_pkgname"
+    make PREFIX="/usr" DESTDIR="$pkgdir/" install
+    install -D -m755 contrib/pzstd/pzstd "$pkgdir/usr/bin/pzstd"
+    install -D -m644 LICENSE "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
+}

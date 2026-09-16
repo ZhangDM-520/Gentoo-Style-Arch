@@ -1,0 +1,33 @@
+pkgbase = pyside6-git
+	pkgdesc = Python/C++ Qt6 bindings (shiboken6 + PySide6) from pyside-setup dev, built against qt6-base-git
+	pkgver = 6.12.0.r12455.g1fba41dfd
+	pkgrel = 1
+	url = https://www.qt.io
+	arch = x86_64
+	license = GPL-3.0-only
+	license = LGPL-3.0-only
+	license = LicenseRef-Qt-Commercial
+	license = Qt-GPL-exception-1.0
+	makedepends = clang
+	makedepends = cmake
+	makedepends = git
+	makedepends = llvm
+	makedepends = ninja
+	makedepends = pkgconf
+	makedepends = python-numpy
+	makedepends = python-setuptools
+	depends = gcc-libs
+	depends = glibc
+	depends = python
+	depends = qt6-base-git
+	provides = pyside6
+	provides = shiboken6
+	provides = qt6-python-bindings
+	conflicts = pyside6
+	conflicts = shiboken6
+	replaces = pyside6
+	replaces = shiboken6
+	source = git+https://code.qt.io/pyside/pyside-setup.git#branch=dev
+	sha256sums = SKIP
+
+pkgname = pyside6-git
