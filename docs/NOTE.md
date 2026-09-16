@@ -1327,18 +1327,26 @@ User directive: root dirs = git group; `.Heavy/` renamed to `.Heavyweight/`
   lane results, failure reporting, source-link repair, Fish syntax, group
   dry-runs, and workspace audit. No live package build was used as a test.
 
-## 2026-09-16 — legacy `.Heavyweight` build tree recreated externally
+## 2026-09-16 — root cause: PGO libraries recreated legacy paths
 
-- **Observation**: after the clean project migration, an external process or
-  automation repeatedly recreated legacy build paths such as
-  `../.Heavyweight/glib2-git/src/build` and `../cairo-git/src/build` within
-  seconds of their removal. No matching build process was visible to the
-  migration session, but application failures have also displayed GLib
-  profiling-related messages.
-- **Decision**: preserve the recreated paths for investigation rather than
-  repeatedly deleting possibly active build trees. They are outside the
-  public `Gentoo_Style_Arch` project and are not part of the package manifest.
-- **Follow-up**: identify the application, profiling hook, launcher, or
-  external session that owns the path before attempting cleanup. Check process
-  ancestry and logs at the time the directory reappears; do not treat its
-  existence as evidence that the public project requires the legacy path.
+- **Evidence**: the installed `glib2-git` and `cairo-git` shared libraries
+  exported `__gcov_*` symbols and contained absolute `.gcda` destinations
+  under the old build trees. `gdbus --version` and `pango-view --help`
+  refreshed those files, while `perf trace` captured `RDWR|CREAT` opens by
+  the consumer process. This explains why the trees returned after deletion:
+  an already-installed instrumented library writes its counters at process
+  exit and recreates every missing parent directory.
+- **Root cause**: the PGO recipes changed `CFLAGS`/`CXXFLAGS` before
+  `meson setup --reconfigure`, but Meson retained the cached instrumented
+  compiler options. The low-profile fallback also reconfigured without
+  compiling the final non-instrumented build. Applications then loaded the
+  instrumented libraries from `/usr/lib`.
+- **Fix**: `glib2-git` and `cairo-git` now pass final flags explicitly through
+  `-Dc_args`/`-Dcpp_args`, compile both PGO branches, reject final binaries
+  containing coverage/profile symbols, and increment `pkgrel`. The public
+  recipes must be rebuilt and installed before deleting the residual trees.
+- **Verification**: after replacement, `readelf -sW` on the installed GLib and
+  Cairo libraries must find no `__gcov_` or `__llvm_profile` symbols, and
+  `strings` must contain no legacy `.gcda` destinations. The earlier
+  `xdg-desktop-portal` `$HOME`/unknown-user warnings are a separate
+  Flatpak/portal namespace issue, not the path creator.

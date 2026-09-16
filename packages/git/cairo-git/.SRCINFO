@@ -1,7 +1,7 @@
 pkgbase = cairo-git
 	pkgdesc = 2D graphics library with support for multiple output devices
 	pkgver = 1.18.4.r141.gdd6262c17
-	pkgrel = 1
+	pkgrel = 2
 	url = https://cairographics.org/
 	arch = x86_64
 	license = LGPL-2.1-only OR MPL-1.1

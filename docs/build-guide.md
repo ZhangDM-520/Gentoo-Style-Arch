@@ -63,3 +63,23 @@ Read the per-package log named in a failure message. A stale system pacman
 lock is not removed automatically. Resume with the remaining package IDs
 printed by the failure summary, usually adding `--skip --install` after
 checking whether the archive was already produced.
+
+### PGO libraries recreating old build paths
+
+Some recipes use a temporary GCC profile-generation build for training. The
+final package must not contain that instrumentation. If an older
+`glib2-git` or `cairo-git` install recreates `src/build` after cleanup, replace
+the packages before removing the residual tree:
+
+```sh
+fish build-all.fish --no-deps --install glib2-git
+fish build-all.fish --no-deps --install cairo-git
+readelf -sW /usr/lib/libglib-2.0.so.0 | grep -E '__gcov_|__llvm_profile'
+readelf -sW /usr/lib/libcairo.so.2 | grep -E '__gcov_|__llvm_profile'
+```
+
+Both symbol checks must produce no output. Restart applications that were
+running against the old libraries, then remove only the now-inactive residual
+build trees. Do not treat GLib warnings from a portal or sandboxed
+application as evidence of a builder process; correlate them with the
+installed library symbols and profile-file paths first.
