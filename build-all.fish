@@ -2896,8 +2896,12 @@ function main
     if test "$_ROOT_MODE" != "1"; and test "$install_flag" = "1"
         # -- separator: args start with flags (-g …), which string join would
         # otherwise parse as its own options
-        echo (set_color yellow)"$_UI_ICON_INFO unprivileged run: for -i runs that will take longer than ~15 min, prefer:"
-        echo "  sudo fish $SCRIPT_DIR/build-all.fish "(string join ' ' -- $argv)""
+        set -l rerun_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level" --install
+        set -a rerun_args $argv
+        set -l rerun_prefix (set_color yellow)
+        set -l rerun_suffix (set_color normal)
+        echo "$rerun_prefix$_UI_ICON_INFO unprivileged run: for -i runs that will take longer than ~15 min, prefer:$rerun_suffix"
+        echo "  sudo fish $SCRIPT_DIR/build-all.fish "(string join ' ' -- $rerun_args)""
         echo "  (makepkg still builds as YOU — only the installs gain root; no password expiry)"(set_color normal)
         echo ""
     end
