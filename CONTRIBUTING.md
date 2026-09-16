@@ -35,6 +35,7 @@ fish build-all.fish --list
 fish build-all.fish --dry-run --group git
 fish build-all.fish --dry-run --group stable
 fish build-all.fish --dry-run --group core
+bash tests/scheduler-intensity.sh
 ```
 
 Do not use a full real rebuild as a syntax check. For changes to scheduling,

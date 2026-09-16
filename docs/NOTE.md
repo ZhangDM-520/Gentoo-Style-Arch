@@ -1350,3 +1350,21 @@ User directive: root dirs = git group; `.Heavy/` renamed to `.Heavyweight/`
   `strings` must contain no legacy `.gcda` destinations. The earlier
   `xdg-desktop-portal` `$HOME`/unknown-user warnings are a separate
   Flatpak/portal namespace issue, not the path creator.
+
+## 2026-09-16 — selectable scheduler intensity profiles
+
+- **Symptom**: automatic scheduling exposed only CPU/RAM-derived `lanes` and
+  `jobs`, so users could not choose a documented effort level. The displayed
+  `-j` value was per lane, making the old plan easy to misread as a global
+  worker count.
+- **Fix**: added `low`, `medium`, `high`, `xhigh`, and `max` profiles, with
+  `xhigh` as the default. Automatic normal-lane memory is budgeted globally
+  and divided across lanes; core packages retain a separate solo budget.
+  `--intensity` and `GSA_INTENSITY` select the profile, while explicit
+  `--lanes` and `--jobs` remain hard overrides.
+- **Rule**: treat `max` as an intentional low-headroom mode. Keep the
+  resolved intensity and plan in the startup output, and preserve both in
+  failure resume commands.
+- **Validation**: a temporary/future-maintainer fixture with fake `makepkg`
+  runs all five profiles on a deterministic 24-thread/21-GiB host and checks
+  the resolved lane/job plans without building a real package.

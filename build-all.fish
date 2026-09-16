@@ -2962,7 +2962,7 @@ function main
     if test (count $remaining) -gt 0
         echo ""
         echo "To resume, run:"
-        echo "  build-all.fish --lanes $lane_count --jobs $jobs_override "(string join ' ' $remaining)""
+        echo "  build-all.fish --lanes $lane_count --jobs $jobs_override --intensity $intensity_level "(string join ' ' $remaining)""
         echo "(Tip: add -s so already-built pkgs are skipped.)"
     end
     return 1
