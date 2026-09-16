@@ -1,7 +1,7 @@
 pkgbase = gtk3-git
 	pkgdesc = GObject-based multi-platform GUI toolkit (GIT Version)
 	pkgver = 3.24.52.r61.gfb1f0f187c
-	pkgrel = 1
+	pkgrel = 2
 	url = http://www.gtk.org/
 	arch = x86_64
 	license = LGPL-2.0-only

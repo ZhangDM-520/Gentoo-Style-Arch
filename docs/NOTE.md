@@ -61,6 +61,27 @@ credentials, downloaded sources, or generated build output to this journal.
 - **Rule**: validate properties at the package boundary; do not reject
   temporary build helpers that cannot reach the installed artifact.
 
+## 2026-09-16 — GTK PGO coverage symbols leaked into installed libraries
+
+- **Symptom**: after a full group build, `nautilus` and Electron failed at
+  load time with undefined `__gcov_indirect_call` from `libgtk-4.so.1` and
+  `libgdk-3.so.0`. Replacing the custom GTK and libadwaita packages with
+  repository builds restored linkage.
+- **Cause**: `gtk3-git` and `gtk4-git` changed shell `CFLAGS`/`CXXFLAGS`
+  after the initial Meson setup but did not replace Meson's cached linker
+  arguments. They also had no package-boundary check, so coverage-instrumented
+  GTK libraries could be installed.
+- **Fix**: GTK3, GTK4, and the same-pattern `xorg-xwayland-git` recipe now
+  replace all four Meson compiler/linker argument caches, exempt only
+  missing-profile configure probes, and reject instrumentation in the staged
+  payload. GTK3/GTK4 releases were bumped to `pkgrel=2`; Xwayland to `pkgrel=2`.
+- **Validation**: shared fake-Meson fixtures cover GLib, Cairo, GTK3, GTK4,
+  and Xwayland transitions, temporary Meson helpers, and contaminated staged
+  libraries. All pass after the fix.
+- **Rule**: never install a manual Meson PGO result until the final staged
+  package is checked for `__gcov_*` and `__llvm_profile`; rebuild all
+  consumers after replacing an instrumented GUI stack.
+
 ## 2026-09-16 — Full PKGBUILD optimization audit
 
 - **Scope**: all 122 tracked `PKGBUILD` recipes in the public Projects

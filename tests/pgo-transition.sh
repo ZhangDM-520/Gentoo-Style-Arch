@@ -51,7 +51,7 @@ case "${1:-}" in
         ;;
     test)
         mkdir -p build
-        for profile in $(seq 1 50); do
+        for profile in $(seq 1 120); do
             : >"build/profile-$profile.gcda"
         done
         exit 0
@@ -121,6 +121,7 @@ cat >"$fixture/run-build.sh" <<EOF
 set -euo pipefail
 cd "$fixture"
 package_id="$package_id"
+export CARCH="${CARCH:-x86_64}"
 warning() { :; }
 msg() { :; }
 error() {

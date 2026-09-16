@@ -84,6 +84,12 @@ build trees. Do not treat GLib warnings from a portal or sandboxed
 application as evidence of a builder process; correlate them with the
 installed library symbols and profile-file paths first.
 
+The same verification applies to `gtk3-git`, `gtk4-git`, and
+`xorg-xwayland-git`. If a GUI application reports an undefined `__gcov_*`
+symbol, replace the affected custom package with the fixed rebuild before
+rebuilding dependents; repository packages are a temporary recovery path, not
+the underlying fix.
+
 During a Meson PGO transition, the final reconfigure must replace both
 compiler and linker argument caches (`c_args`, `cpp_args`, `c_link_args`, and
 `cpp_link_args`). Profile-use flags also reach Meson's temporary compiler
