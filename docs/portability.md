@@ -18,6 +18,14 @@ The named profiles are:
 A core package receives a separate memory-aware job count and runs alone. The
 resolved profile and plan are printed before dispatch.
 
+The old automatic output reported `-j` per lane, so `2 lanes × -j6` could
+represent twelve normal job slots while each lane independently received the
+same memory allowance. The new profiles budget normal jobs globally; on a
+24-thread/21-GiB host the medium baseline is approximately `2 lanes × -j3`,
+while the default xhigh profile is approximately `4 lanes × -j3`. This is
+intentional: it increases independent package throughput without multiplying
+the memory allowance by the lane count.
+
 Use explicit overrides when benchmarking or when a machine has unusual
 resource limits:
 

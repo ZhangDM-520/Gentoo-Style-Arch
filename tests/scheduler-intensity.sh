@@ -37,7 +37,8 @@ cat >"$fixture/bin/makepkg" <<'EOF'
 if [[ "${GSA_FAIL_PACKAGE:-}" == "$(basename "$PWD")" ]]; then
     exit 1
 fi
-sleep 0.05
+printf 'fake makepkg %s\n' "$PWD"
+sleep "${GSA_FAKE_BUILD_SECONDS:-0.05}"
 EOF
 chmod +x "$fixture/bin/makepkg"
 
@@ -63,6 +64,14 @@ for level in low medium high xhigh max; do
         printf 'unexpected %s plan: %s\n' "$level" "$plan" >&2
         exit 1
     fi
+    for id in "${ids[@]}"; do
+        grep -F "fake makepkg $fixture/packages/$id" \
+            "$fixture/state-$level/logs/$id.log" >/dev/null
+    done
+    if find "$fixture/state-$level/logs" -maxdepth 1 -name '.lane*.result*' -print -quit | grep -q .; then
+        printf 'lane result artifact remained for %s\n' "$level" >&2
+        exit 1
+    fi
 done
 
 if failing_output=$(
@@ -71,15 +80,24 @@ if failing_output=$(
     GSA_CPU_THREADS=24 \
     GSA_MEMORY_GIB=21 \
     GSA_FAIL_PACKAGE=p1 \
+    GSA_FAKE_BUILD_SECONDS=0.2 \
     fish "$fixture/build-all.fish" \
         --allow-broken-rustc --no-deps --no-sync \
-        --intensity low "${ids[@]}" 2>&1
+        --intensity xhigh "${ids[@]}" 2>&1
 ); then
     printf 'failure fixture unexpectedly succeeded\n' >&2
     exit 1
 fi
-if ! printf '%s\n' "$failing_output" | grep -F -- '--intensity low' >/dev/null; then
-    printf 'resume command did not preserve intensity:\\n%s\\n' "$failing_output" >&2
+if ! printf '%s\n' "$failing_output" | grep -F -- '--intensity xhigh' >/dev/null; then
+    printf 'resume command did not preserve intensity:\n%s\n' "$failing_output" >&2
+    exit 1
+fi
+if ps -eo args= | grep -F "$fixture" | grep -v grep >/dev/null; then
+    printf 'lane child remained after failure drain\n' >&2
+    exit 1
+fi
+if find "$fixture/state-failure/logs" -maxdepth 1 -name '.lane*.result*' -print -quit | grep -q .; then
+    printf 'lane result artifact remained after failure drain\n' >&2
     exit 1
 fi
 
