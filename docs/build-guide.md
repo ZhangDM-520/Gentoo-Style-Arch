@@ -89,4 +89,7 @@ compiler and linker argument caches (`c_args`, `cpp_args`, `c_link_args`, and
 `cpp_link_args`). Profile-use flags also reach Meson's temporary compiler
 probes, so `-Wno-error=missing-profile` is required for that reconfigure;
 otherwise a missing profile for a probe can be misreported as an ABI or
-feature-detection failure.
+feature-detection failure. Instrumentation validation is performed against
+the staged package payload after `meson install`; temporary helpers under
+`build/meson-private/` are not shipped and must not be treated as package
+artifacts.

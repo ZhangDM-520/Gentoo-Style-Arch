@@ -44,6 +44,23 @@ credentials, downloaded sources, or generated build output to this journal.
   environment-variable update; clear both compile/link instrumentation and
   tolerate missing profiles in configure probes.
 
+## 2026-09-16 — PGO verifier false positive
+
+- **Symptom**: the final GLib build was rejected because
+  `build/meson-private/sanity_check_for_c.exe` still exported profile
+  instrumentation.
+- **Cause**: the verifier scanned every executable in the Meson build tree,
+  including temporary configure helpers left from the training phase. That
+  helper is not installed into either GLib package.
+- **Fix**: moved instrumentation verification to the staged `glib2-git`
+  package payload after `meson install`, while retaining rejection of
+  instrumented shared libraries and executables that would ship.
+- **Validation**: the GLib fixture now creates the exact `meson-private`
+  helper, confirms it is ignored, and confirms an instrumented staged library
+  still fails validation.
+- **Rule**: validate properties at the package boundary; do not reject
+  temporary build helpers that cannot reach the installed artifact.
+
 ## 2026-09-16 — Full PKGBUILD optimization audit
 
 - **Scope**: all 122 tracked `PKGBUILD` recipes in the public Projects

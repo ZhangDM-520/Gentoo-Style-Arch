@@ -42,6 +42,9 @@ set_option() {
 
 case "${1:-}" in
     compile)
+        mkdir -p build/meson-private
+        : >build/meson-private/sanity_check_for_c.exe
+        chmod +x build/meson-private/sanity_check_for_c.exe
         exit 0
         ;;
     test)
@@ -93,6 +96,24 @@ esac
 EOF
 chmod +x "$fixture/bin/meson"
 
+cat >"$fixture/bin/readelf" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" == *meson-private/sanity_check_for_c.exe* ]]; then
+    printf '0000000000000000 g    DF .text  0000000000000000 __gcov_init\n'
+    exit 0
+fi
+
+if [[ "$*" == *instrumented/libglib.so* ]]; then
+    printf '0000000000000000 g    DF .text  0000000000000000 __gcov_init\n'
+    exit 0
+fi
+
+exec /usr/bin/readelf "$@"
+EOF
+chmod +x "$fixture/bin/readelf"
+
 cat >"$fixture/run-build.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -105,6 +126,17 @@ error() {
 }
 source "$root/packages/core/glib2-git/PKGBUILD"
 build
+pkgdir="\$PWD/pkg"
+mkdir -p "\$pkgdir/usr/lib"
+: >"\$pkgdir/usr/lib/libglib-2.0.so.0"
+verify_no_profile_instrumentation "\$pkgdir"
+
+mkdir -p "\$PWD/instrumented"
+: >"\$PWD/instrumented/libglib.so"
+if verify_no_profile_instrumentation "\$PWD/instrumented" 2>/dev/null; then
+    printf 'instrumented package fixture unexpectedly passed\n' >&2
+    exit 1
+fi
 EOF
 chmod +x "$fixture/run-build.sh"
 
