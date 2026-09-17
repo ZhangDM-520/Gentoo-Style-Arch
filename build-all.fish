@@ -181,6 +181,19 @@ function intensity_is_valid -a intensity_level
     end
 end
 
+# Shared by --lanes and --jobs (identical accepted values, identical wording).
+# The caller passes its own flag name so both flags keep their message.
+function parallelism_is_valid -a flag value
+    if test "$value" = auto
+        return 0
+    end
+    if not string match -qr '^[0-9]+$' -- "$value"; or test "$value" -lt 1
+        ui_error "$flag expects a positive integer or auto, got '$value'"
+        return 1
+    end
+    return 0
+end
+
 function configure_intensity -a intensity_level
     if not intensity_is_valid "$intensity_level"
         ui_error "intensity must be one of low, medium, high, xhigh, or max"
@@ -672,10 +685,6 @@ function find_pkg_dirs
     end
 end
 
-function find_audit_pkg_dirs
-    find_pkg_dirs
-end
-
 # All current-version *.pkg.tar.zst across the workspace. Stale archives from
 # previous pkgver/pkgrel builds are excluded (install-only; cleanup gets all).
 function find_built_pkgs
@@ -928,66 +937,26 @@ function audit_workspace
     if not require_command rg
         return 1
     end
-    set -l old_dirs
-    for name in .Static .Heavy .Heavyweight
-        if test -e "$SCRIPT_DIR/$name"; and not test -L "$SCRIPT_DIR/$name"
-            set -a old_dirs "$SCRIPT_DIR/$name"
-        end
-    end
 
     ui_heading "Workspace legacy audit"
     echo ""
-    echo "Active legacy directories:"
-    if test (count $old_dirs) -eq 0
-        echo "  none"
-    else
-        for d in $old_dirs
-            echo "  $d"
-        end
-    end
-
-    echo ""
-    echo "Active control-file references:"
+    # ONE pass over everything a maintainer can edit. The pre-Git workspace
+    # split recipes across top-level .Stable/.Heavy/.Static/.Core/.Misc/.3rdP
+    # directories; any surviving mention of one is drift. config/ and docs/ are
+    # excluded: config/ is validated structurally at load time, and NOTE.md is
+    # a historical journal that is *expected* to name the old layout.
+    echo "Legacy layout references:"
     set -l refs (rg -n --hidden \
         --glob '!docs/**' --glob '!build-all.fish' --glob '!config/**' \
         --glob '!**/.state/**' --glob '!**/.git/**' \
         --glob '!**/src/**' --glob '!**/pkg/**' --glob '!**/build/**' \
-        '(^|/)\.(Static|Heavyweight|Heavy)(/|$)' "$SCRIPT_DIR" 2>/dev/null \
-        | head -100)
+        '(^|[^[:alnum:]_])\.(Stable|Static|Heavy|Heavyweight|Core|Misc|3rdP)/' \
+        "$SCRIPT_DIR" 2>/dev/null | head -100)
     if test (count $refs) -eq 0
         echo "  none"
     else
         for ref in $refs
             echo "  $ref"
-        end
-    end
-
-    echo ""
-    echo "Generated-artifact references:"
-    set -l generated (rg -l --hidden \
-        --glob '!docs/**' --glob '!build-all.fish' --glob '!config/**' \
-        --glob '!**/.state/**' --glob '!**/.git/**' \
-        --glob '!**/src/**' --glob '!**/pkg/**' --glob '!**/build/**' \
-        '(^|/)\.(Static|Heavyweight|Heavy)(/|$)' "$SCRIPT_DIR" 2>/dev/null \
-        | head -100)
-    if test (count $generated) -eq 0
-        echo "  none"
-    else
-        for path in $generated
-            echo "  $path"
-        end
-    end
-
-    echo ""
-    echo "Legacy symlink targets:"
-    set -l links (find "$SCRIPT_DIR" -path '*/.git' -prune -o -type l \
-        -printf '%p -> %l\n' 2>/dev/null \
-        | grep -E '(^|/)\.(Static|Heavyweight|Heavy)(/|$)' | head -100)
-    if test (count $links) -eq 0
-        echo "  none"
-    else
-        for link in $links
-            echo "  $link"
         end
     end
 
@@ -1630,7 +1599,7 @@ end
 # packages from the wide tail of the dependency graph.
 #
 # Concurrency design:
-# - Heavy-group packages are LTO/RAM monsters — they run SOLO with the full
+# - core-group packages are LTO/RAM monsters — they run SOLO with the full
 #   core count, never paired with another build (RAM contention).
 # - Non-solo lanes share a CPU/RAM-derived per-lane job limit.
 # - pacman installs happen inside background jobs (no tty): the dispatcher
@@ -2489,6 +2458,11 @@ function usage
     echo "  -ia, --installall Install ALL built packages in the workspace (pacman -U);"
     echo "                    extra args are passed through to pacman, e.g.:"
     echo "                      build-all.fish -ia --overwrite '*'"
+    echo "                    Group-install escape hatch only: it installs in ONE"
+    echo "                    transaction, so it cannot satisfy rule 11"
+    echo "                    (install-before-dependents-compile). Never use it in"
+    echo "                    place of -i when packages in the set depend on each"
+    echo "                    other — build with -i instead."
     echo "  -cc, --cleanup    Remove ALL built package archives (*.pkg.tar.zst)"
     echo "  -ccc, --nuclear   Remove pulled sources: src/pkg/build dirs, source git"
     echo "                    clones, and downloaded source tarballs (asks first)"
@@ -2503,7 +2477,8 @@ function usage
     echo "  -i, --install     Install each package IMMEDIATELY after it builds,"
     echo "                    in dependency order (pacman -U --noconfirm --ask 4 —"
     echo "                    unattended). Install failure aborts the run."
-    echo "  -si, --sepinstall DEPRECATED alias for -i (identical behavior)"
+    echo "                    This is the same behaviour the old -si/--sepinstall"
+    echo "                    alias selected; that alias was removed 2026-09-17."
     echo "  --no-deps         Build ONLY the named packages — skip dependency-chain"
     echo "                    expansion (leaf rebuild with known-current deps)"
     echo "  -c, --clean       Clean build artifacts before building"
@@ -2630,11 +2605,9 @@ function main
                 # order (pacman -U --noconfirm --ask 4). End-of-run collective
                 # install was removed 2026-09-07: mid-run packages compiled
                 # against the OLD installed deps (rust-git vs minimal
-                # llvm-git incident) even with correct build order.
-                set install_flag 1
-            case -si --sepinstall
-                # Deprecated alias — behavior unified with -i 2026-09-07.
-                ui_warning "-si/--sepinstall is deprecated — now identical to -i (immediate per-package install)"
+                # llvm-git incident) even with correct build order. The old
+                # -si/--sepinstall alias for this behaviour was dropped
+                # 2026-09-17: -i IS the separated install.
                 set install_flag 1
             case -c --clean
                 set clean_flag 1
@@ -2647,14 +2620,7 @@ function main
                     ui_error "--lanes requires an argument"
                     return 1
                 end
-                set -l invalid_lanes 0
-                if test "$args[2]" != auto
-                    if not string match -qr '^[0-9]+$' -- "$args[2]"; or test "$args[2]" -lt 1
-                        set invalid_lanes 1
-                    end
-                end
-                if test $invalid_lanes -eq 1
-                    ui_error "--lanes expects a positive integer or auto, got '$args[2]'"
+                if not parallelism_is_valid --lanes "$args[2]"
                     return 1
                 end
                 set lane_count $args[2]
@@ -2664,14 +2630,7 @@ function main
                     ui_error "--jobs requires an argument"
                     return 1
                 end
-                set -l invalid_jobs 0
-                if test "$args[2]" != auto
-                    if not string match -qr '^[0-9]+$' -- "$args[2]"; or test "$args[2]" -lt 1
-                        set invalid_jobs 1
-                    end
-                end
-                if test $invalid_jobs -eq 1
-                    ui_error "--jobs expects a positive integer or auto, got '$args[2]'"
+                if not parallelism_is_valid --jobs "$args[2]"
                     return 1
                 end
                 set jobs_override $args[2]

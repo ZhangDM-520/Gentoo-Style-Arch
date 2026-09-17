@@ -59,7 +59,11 @@
     topo order, via `install_pkgs_now` (pacman -U --noconfirm --ask 4, rc
     checked — install failure aborts the run). The old end-of-run collective
     install compiled mid-run packages against OLD installed deps (09-06
-    rust-git vs minimal llvm-git bricking). `-si` is a deprecated alias.
+    rust-git vs minimal llvm-git bricking). `-si/--sepinstall` — the old
+    spelling of that behaviour — was removed 2026-09-17; `-i` is the only
+    immediate-install flag. `-ia/--installall` is the one-transaction escape
+    hatch and deliberately bypasses this rule; never use it for a set whose
+    members depend on each other.
 12. **Mandatory selection + keystone discipline** (2026-09-07): build-all.fish
     has NO default action — always pass `-g` and/or package names. For
     ABI-coupled core updates use `-g core` (auto-installs the merged core set);

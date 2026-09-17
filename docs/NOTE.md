@@ -10,6 +10,56 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-17 — structure audit, phase A: dead CLI surface and the legacy audit
+
+- **Symptom**: the builder carried an option nothing had needed since
+  2026-09-07, a function nothing called, and an audit that ran the same scan
+  three ways — two of them unable to ever fire again.
+- **Dead function**: `find_audit_pkg_dirs` was a one-line wrapper around
+  `find_pkg_dirs` with no call sites. Function-by-function call counting over
+  all 55 definitions now shows every remaining function has a real invocation
+  (`handle_interrupt` is registered through `--on-signal`), so none is dead.
+- **Dead option**: `-si/--sepinstall` had been reduced to a warning plus the
+  same `set install_flag 1` as `-i`. `-i` *is* the separated install, so the
+  alias added a second spelling of one behaviour; removed from the parser and
+  from `usage()`, and `-si` now reports `unknown option` like any other stale
+  flag. The usage text for `-i` records where the alias went.
+- **Audit collapsed**: the three legacy scans (`rg -n` "control-file
+  references", a byte-identical `rg -l` pass mislabelled "generated-artifact
+  references", and a `find -type l` symlink sweep) became one `rg` pass. The
+  directory-existence and symlink arms were dropped: they resolved against
+  top-level `.Stable/.Heavy/.Static` trees that no longer exist, so all three
+  could only ever print `none`.
+- **Audit widened while narrowing**: the single surviving scan matches
+  `(^|[^[:alnum:]_])\.(Stable|Static|Heavy|Heavyweight|Core|Misc|3rdP)/`, i.e.
+  every pre-Git layout name, not just the three the old pattern knew. The old
+  pattern also required the name at line start or after `/`, so prose mentions
+  such as "cp .Heavy/foo ." were invisible; verified against a scratch file that
+  the new pattern catches both ` .Heavy/` and `/.Static/` while ignoring
+  `x.Core/`. `config/` stays excluded — it is validated structurally at load
+  time — and `docs/` stays excluded because this journal is *expected* to name
+  the old layout.
+- **`-ia/--installall` kept, documented**: it is the deliberate one-transaction
+  escape hatch and it structurally cannot satisfy rule 11
+  (install-before-dependents-compile). Its `usage()` entry now says so where the
+  model choice is visible, instead of leaving the contradiction implicit.
+- **Duplication removed**: `--lanes` and `--jobs` had byte-identical ~15-line
+  validation blocks; both now call `parallelism_is_valid <flag> <value>`, with
+  the caller's flag name interpolated so the two error strings are unchanged.
+- **Stale comment**: the lane-design block called core packages "Heavy-group
+  packages", a group name retired in the 2026-09-15 merge.
+- **Validation**: `fish -n`; `--list`, `--audit` and `--dry-run` for all five
+  groups byte-identical to the pre-change baseline except the audit's new
+  section; `-si` now rejected; `--lanes`/`--jobs` error strings verified
+  unchanged for missing, zero, and non-numeric values; the full fixture battery
+  (11 fixtures) passes.
+- **Rule**: an option, function, or audit arm that cannot change any outcome is
+  not free — it is a stale claim about how the project works. When a layout or
+  behaviour is retired, delete its CLI surface in the same pass; when an audit
+  section can only print `none`, either widen what it looks for or remove it.
+- **Note**: this is phase A of a three-part audit; layout (`config/`) and docs
+  (`MEMORY.md`/`NOTE.md`) phases follow and are logged separately.
+
 ## 2026-09-17 — stray `config/groups` inventory removed
 
 - **Symptom**: `config/groups/physical-groups.list` sat in the directory the
