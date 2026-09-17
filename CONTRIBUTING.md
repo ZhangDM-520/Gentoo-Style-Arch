@@ -71,9 +71,8 @@ Trim packaging to the maintained target:
   Rust `profiler=true`, the `clang-opencl-headers` split, and CUPS/printing
   support when they are part of the maintained feature set;
 - keep mold, LTO, and PGO phases aligned with the package's documented
-  exception. For a Meson PGO transition, replace `c_args`, `cpp_args`,
-  `c_link_args`, and `cpp_link_args` together, and exempt only
-  `missing-profile` warnings during profile-use configure probes; and
+  exception (the Meson reconfigure rules and the verification procedure are in
+  `docs/build-guide.md`; the failure mechanisms are in `MEMORY.md` §6); and
 - never use invalid `options` such as `!check` or `autodeps` to paper over a
   recipe problem.
 

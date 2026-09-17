@@ -10,6 +10,102 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+### Naming history (read this before interpreting old entries)
+
+The workspace was reorganized twice; entries keep whatever names were true when
+they were written. Current names are `packages/<category>/<package-id>/` with
+categories `git`, `stable`, `core`, `misc`, `third-party`, and logical groups
+of the same five names (`config/groups/*.list`).
+
+| In older entries | Was | Now |
+| --- | --- | --- |
+| `.Heavy/`, `.Heavyweight/` | the heavyweight build area | `packages/core/` (or `packages/git/` for rolling recipes) |
+| `.Static/`, `.Stable/` | stock-name packages whose versions track the repos | `packages/stable/` (or `packages/git/`) |
+| `.Core/` | `.Heavyweight/` renamed 2026-09-15 | `packages/core/` |
+| `.3rdP/` | third-party application recipes | `packages/third-party/` |
+| `.Misc/` | auxiliary recipes | `packages/misc/` |
+| `-g static`, `-g heavy`, `-g critical`, `-g rocm` | four separate groups | `-g stable` and `-g core` (2026-09-15); `core` auto-enables `-i` |
+| `-si`, `--sepinstall` | the separated-install flag | removed 2026-09-17 — `-i`/`--install` is the only spelling |
+| `--installall` at end of run | the old collective install | `-ia` remains as a one-transaction escape hatch; a normal run installs per package with `-i` |
+
+So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
+and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
+dependency edges, and incident root causes are unaffected by the renames.
+
+## 2026-09-17 — structure audit, phase C: documentation truth pass
+
+- **Symptom**: the docs described a stack that had moved on. Every claim below
+  was checked against the live host or the checked-in code, and each stale one
+  was rewritten rather than softened.
+- **`MEMORY.md` §5 "Pending tasks" was mostly already done** — verified with
+  pacman, not assumed: `hyperv`, `intel-speed-select`, `x86_energy_perf_policy`
+  and `llvm-ocaml-git` are gone, so that whole `-Rns` item is obsolete;
+  `seatd-git` is installed *and* its `.PKGINFO` already carries
+  `libseat.so=1-64`; the stale `gcc-*-snapshot` language splits are gone (only
+  fortran, libs and `lib*-snapshot` remain); mesa-git's zero-gcda abort is
+  implemented; llvm-git's `X86;AMDGPU;BPF` rebuild landed (`llvm-config
+  --targets-built` reports all three) and scx-scheds-git was rebuilt after it.
+  The ROCm row was **wrong in the opposite direction**: hsa-rocr, rocm-llvm and
+  comgr were reinstalled, so only `hip-runtime` is missing. Still open and kept:
+  the dbus-broker recipe redundancy, the gtk4-demos split, libadwaita-git's
+  `check()`+`checkdepends=(weston)` (which the earlier check missed by looking
+  in the wrong category), the doxygen-git purge, and one linux-firmware item
+  whose subject was never recorded — now flagged for re-specification because
+  upstream has no `legacy/` tree and the current trim already covers it.
+- **`MEMORY.md` §3 was a dated snapshot with rotten versions** (it claimed
+  `LLVM_TARGETS_TO_BUILD="X86;AMDGPU"` and qt6-base-git 6.13.0-dev while the
+  installed stack was newer and different). Rewritten as durable stack facts
+  with no version numbers — `pacman -Q` is authoritative — and the one-off
+  install history was dropped (NOTE.md has it).
+- **Golden rule 1 blamed the wrong thing**: it said the system `ls` is
+  "NON-GNU". GNU coreutils 9.11 *is* installed; the flag hazard comes from
+  CachyOS's fish aliases (`ls` → `eza -al`, `grep` → `--color=auto`, plus
+  `la/ll/lt/l.`, `update`, `big`, `rip`). The rule now separates the real
+  boundary — tool-call shells are bash, the login shell is fish — from the
+  alias trap, and lists the aliases.
+- **`MEMORY.md` §2** claimed `.state/` holds "logs, locks, lane results, and
+  builder caches"; `LOG_DIR` is the only path derived from `_STATE_DIR`, and
+  makepkg sources/archives land beside each recipe (`SRCDEST`/`PKGDEST` =
+  `$startdir`).
+- **`architecture.md` had the same runtime-state error** — it listed source
+  mirrors and package outputs under `.state/`, contradicting `build-guide.md`
+  and `README.md`. It also described a recipe as "a PKGBUILD, its .SRCINFO, and
+  only the local files needed by makepkg", omitting the license material and
+  maintenance metadata the tree actually carries (106 `LICENSE`/`LICENSES`,
+  50 `.nvchecker.toml`, 3 `BUILDING`).
+- **`portability.md` published one host's numbers** ("24-thread/21-GiB host …
+  `2 lanes × -j3`") in a document whose point is that no host's shape is baked
+  in. Replaced with the actual formulas from `run_lanes` — and verified by
+  recomputing all five profiles for the fixture's pinned 24-thread/21-GiB
+  inputs, which reproduce the fixture's expectations exactly (`low` 1/-j3/-j3,
+  `medium` 2/-j3/-j4, `high` 3/-j3/-j6, `xhigh` 4/-j3/-j7, `max` 6/-j3/-j9).
+- **Prerequisite lists were short**: `build-guide.md` and `README.md` sent
+  readers to `--audit` without listing `ripgrep`, and omitted `ps`/`tail`.
+  Corrected to match `check_runtime_prereqs` exactly, with `rg`/`git` called
+  out as mode-specific.
+- **`README.md`'s group table** invited a wrong sum: "126 recipes" over group
+  counts adding to 129. It now states both numbers and names the five `core`
+  members that live outside `packages/core/` (autofdo-git, libclc-git from
+  `git`; hip-runtime, hsa-rocr, openssl from `stable`).
+- **Triplicated PGO text collapsed**: the operational procedure stays in
+  `build-guide.md` (now stating the five libraries are verified clean — checked
+  live: `readelf` reports zero instrumentation symbols), the rule in
+  `CONTRIBUTING.md` is one line pointing there, and the failure mechanisms stay
+  in `MEMORY.md` §6.
+- **`NOTE.md` naming-history preamble added**: a table mapping `.Heavy/
+  .Heavyweight/.Static/.Stable/.Core/.3rdP/.Misc` onto today's
+  `packages/<category>/`, and `static/heavy/critical/rocm` (plus `-si`) onto
+  today's groups and flags, so the ~50 lines of pre-2026-09-15 entries are
+  readable without archaeology. `MEMORY.md` links to it from its header.
+- **Validation**: `tests/run-all.sh` → 13 fixtures pass (docs-only phase, so no
+  script behaviour changed and nothing needed re-baselining); every internal
+  `docs/*.md` reference resolves; the documented `.SRCINFO` command reproduces
+  the committed file byte-for-byte.
+- **Rule**: docs that state current state rot silently — state *how to check*
+  (a command, a formula, a pointer) instead of copying the answer; keep dated
+  snapshots in the journal, and re-verify a pending-task list against the host
+  before trusting any item on it.
+
 ## 2026-09-17 — structure audit, phase B: control data, ignore rules, fixtures
 
 - **Symptom**: the map, the ignore rules, and the fixture set all still

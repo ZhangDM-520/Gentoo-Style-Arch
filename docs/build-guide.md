@@ -2,10 +2,15 @@
 
 ## Prerequisites
 
-Use an Arch-based system with `fish`, `base-devel`, `git`, `makepkg`,
-`pacman`, `awk`, `sed`, `nproc`, `flock`, and `getent`. Add `sudo` for
-unprivileged immediate installs. A working compiler, enough disk space, and
-the package dependencies named by the selected recipes are also required.
+Use an Arch-based system with `fish`, `makepkg`, `nproc`, `ps`, `awk`, `sed`,
+`tail`, and `getent`. Add `ripgrep` (`rg`) for `--audit` and `git` for
+`--link-sources`. Building and installing also needs `pacman` (adding `flock`,
+plus `sudo` unless you run as root supervisor) and `base-devel` for the
+recipes themselves. A working compiler, enough disk space, and the package
+dependencies named by the selected recipes are also required.
+
+`--audit` and `--link-sources` are the only modes that need `rg`/`git`, so a
+minimal system can still build and install without them.
 
 ## Inspect, dry-run, then build
 
@@ -29,6 +34,12 @@ immediately after its build, before dependents are dispatched. This avoids
 compiling against an older ABI. Core selection automatically enables
 immediate installation because its ABI coupling makes a collective install
 unsafe.
+
+`--installall` (`-ia`) installs every archive in the workspace in **one**
+pacman transaction, so it cannot honour the install-before-dependents rule:
+use it only to re-install a set that does not depend on each other (for
+example after `--cleanup`, or with `--overwrite`), never as a substitute for
+`--install` in a run that builds a dependency chain.
 
 Root-supervisor mode is:
 
@@ -104,7 +115,9 @@ The same verification applies to `gtk3-git`, `gtk4-git`, and
 `xorg-xwayland-git`. If a GUI application reports an undefined `__gcov_*`
 symbol, replace the affected custom package with the fixed rebuild before
 rebuilding dependents; repository packages are a temporary recovery path, not
-the underlying fix.
+the underlying fix. All five libraries are verified clean on the maintained
+host: `readelf -sW <lib> | grep -cE '__gcov_|__llvm_profile'` returns 0 for
+libglib-2.0, libcairo, libgtk-3, libgtk-4 and libxwayland.
 
 During a Meson PGO transition, the final reconfigure must replace both
 compiler and linker argument caches (`c_args`, `cpp_args`, `c_link_args`, and
@@ -114,4 +127,5 @@ otherwise a missing profile for a probe can be misreported as an ABI or
 feature-detection failure. Instrumentation validation is performed against
 the staged package payload after `meson install`; temporary helpers under
 `build/meson-private/` are not shipped and must not be treated as package
-artifacts.
+artifacts. This section is the operational reference for the PGO rules that
+`CONTRIBUTING.md` states and that `MEMORY.md` §6 explains as failure modes.

@@ -13,9 +13,13 @@ before building or installing anything.
 
 ## What is included
 
-The current set has 126 recipes:
+The current set has 126 recipe directories and 129 group memberships. The
+counts differ because `core` is a logical build group: 36 of its 41 members
+live under `packages/core/`, while `autofdo-git`, `libclc-git` come from
+`packages/git/` and `hip-runtime`, `hsa-rocr`, `openssl` from
+`packages/stable/`:
 
-| Group | Count | Purpose |
+| Group | Members | Purpose |
 | --- | ---: | --- |
 | `git` | 56 | Top-level development and rolling packages |
 | `stable` | 29 | Stock-name packages synchronized with Arch repositories |
@@ -23,7 +27,6 @@ The current set has 126 recipes:
 | `misc` | 1 | Optional CachyOS kernel recipe |
 | `third-party` | 2 | Additional application recipes |
 
-`core` is a logical build group and overlaps some physically stable recipes.
 The package map, group membership, and local dependency graph are declarative
 files under `config/`; do not infer build order from directory names.
 
@@ -32,7 +35,7 @@ files under `config/`; do not infer build order from directory names.
 On an Arch-based system, install the normal packaging tools first:
 
 ```sh
-sudo pacman -S --needed base-devel fish git
+sudo pacman -S --needed base-devel fish git ripgrep
 ```
 
 Then inspect the project before building:

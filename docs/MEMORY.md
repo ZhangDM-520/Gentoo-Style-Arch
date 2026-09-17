@@ -3,16 +3,32 @@
 > Maintainer memory for this public project. Read this file + NOTE.md (chronological
 > incident journal, one `##` section per incident) before working. Keep this
 > file to rules + current state; log every non-trivial change in NOTE.md.
-> Host-specific paths, credentials, downloaded sources, and build artifacts
-> are intentionally excluded. Current layout and public workflows are
-> documented in the files beside this one.
+> NOTE.md opens with a **naming-history table** — entries written before
+> 2026-09-15 use the old `.Static/.Heavy/.Heavyweight/.3rdP` paths and the
+> `static/heavy/critical/rocm` group names, which map onto today's
+> `packages/{git,stable,core,misc,third-party}` layout.
+> Host-specific and private details — home directories, machine names,
+> credentials, downloaded sources, build artifacts — are intentionally
+> excluded. Standard system paths that the workflow depends on
+> (`/etc/pacman.conf`, `/usr/lib/llvm*`) are part of the contract, not host
+> state. Current layout and public workflows are documented in the files
+> beside this one.
 
 ## 1. Golden rules (violations caused real breakage)
 
 1. **fish shell**: wrap EVERY terminal command in `bash -c '...'`. No `export`,
-   no `[[ ]]`; arrays are 1-indexed; system `ls` is NON-GNU — never rely on
-   its flags; an UNMATCHED glob is a fatal fish error that `2>/dev/null` does
-   NOT suppress — use `find -name`.
+   no `[[ ]]`; arrays are 1-indexed; an UNMATCHED glob is a fatal fish error
+   that `2>/dev/null` does NOT suppress — use `find -name`. The host's login
+   shell is fish 4.9.3, so this applies to anything routed through `$SHELL`
+   (commands handed to the user, `!cmd`, pasted snippets), not just to scripts.
+   Tool-call shells here are bash (`$0` = `/bin/bash`), so bash syntax is fine
+   *inside* a tool call — the hazard is crossing a shell boundary.
+   CachyOS additionally ships aliases that change what a name does
+   (`/usr/share/cachyos-fish-config/cachyos-config.fish`): `ls` → `eza -al`,
+   `grep` → `grep --color=auto`, plus `la/ll/lt/l.`, `update`, `big`, `rip`.
+   GNU coreutils *is* installed — `ls` 9.11 — so the flag hazard comes from the
+   `eza` alias (and from `eza`'s different flag set), never from a non-GNU
+   `ls`. Never assume a bare `ls`/`grep` flag works in a fish context.
 2. **Agent-shell git hardening**: agent shells inject GIT_CONFIG_PARAMETERS
    (`safe.bareRepository=explicit`) → EVERY makepkg/git-bare-repo op from an
    agent shell needs `GIT_CONFIG_COUNT=0` (user fish shell unaffected).
@@ -101,10 +117,17 @@
 
 - The public tree is `Gentoo_Style_Arch/`; recipes live under
   `packages/{git,stable,core,misc,third-party}/`.
-- `config/packages.map` maps package IDs to recipe paths. Group files and
-  `config/dependencies.conf` are the scheduler's source of truth.
-- `.state/` (or `GSA_STATE_DIR`) contains logs, locks, lane results, and
-  builder caches. makepkg source trees and archives are ignored runtime state.
+- `config/packages.map` maps package IDs to recipe paths, two fields per
+  record (`package-id|recipe-path`; the loader rejects any other shape —
+  2026-09-17). Group files and `config/dependencies.conf` are the scheduler's
+  source of truth.
+- `.state/` (or `GSA_STATE_DIR`) holds builder-owned state only: `logs/`, the
+  per-package logs inside it, the pacman mutex, and the lane result files.
+  `LOG_DIR` is the only path derived from `_STATE_DIR` — there are no builder
+  caches there. makepkg's own source trees and archives land **beside each
+  recipe** (`SRCDEST`/`PKGDEST` default to `$startdir`), which is why the
+  recipe directories carry ignore rules; both classes are ignored runtime
+  state.
 - The current logical groups are `git` (56), `stable` (29), `core` (41),
   `misc` (1), and `third-party` (2). `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
@@ -151,33 +174,39 @@ OpenShadingLanguage -> blender.
 - Shared mirrors must have the exact origin URL and a usable fetch refspec.
 - A populated non-Git source path is never replaced automatically.
 
-## 3. Stack facts (2026-09-06 evening)
+## 3. Stack facts
 
-- Qt dev stack COMPLETE: all Qt6/Qt5 private-API-coupled modules are rebuilt
-  qt6-base-git 6.13.0-dev / qt5-base-git 5.15.19 (qt5-base rebuilt with
-  `-ffat-lto-objects` for the LTO-strip issue, see §6). pyside6-git scoped
-  `-DMODULES='Core;Gui;Widgets'`. Stock-only: qt6-translations, qt5ct, qt6ct.
-- llvm-git is DELIBERATELY MINIMAL: `-D LLVM_TARGETS_TO_BUILD="X86;AMDGPU"`;
-  rust-git is rebuilt against it (X86/AMDGPU codegen only).
-- Toolchain provides versioned: meson-git 1.12.0.r178, ninja-git, cmake-git,
-  doxygen-git (all installed at recent versions).
-- 2026-09-06 batch BUILT + INSTALLED (house, "Unknown Packager"): gc,
-  openssl, zsh (+zsh-doc, PDF dropped), bash, imagemagick, openssh, openvpn,
-  networkmanager 1.58.1 + NM-openvpn + NM-vpn-plugin-openvpn, upower, git-git
-  2.55.0.r787 (upstream-removed mw-to-git excised), rust-bindgen-git 0.73.1,
-  flatpak-git, polkit-git, libreoffice-fresh 26.8.0-2.1, linux-tools-meta.
-  gimp chain: babl-git + gegl-git installed WITH soname provides;
-- gimp chain COMPLETE (2026-09-07): cairo-git rebuilt with versioned
-  `cairo=1.18.4` provide; gimp-git 2:3.3.1.r1561 + krita-git 6.1.0.prealpha
-  BUILT + INSTALLED (house). gimp-git ships `gimp-3.3` (dev naming, no
-  `/usr/bin/gimp`) with bare `gimp` provide; krita-git provides versioned
-  `krita=…`. `pacman -Dk` free of chain errors; ldd resolves babl/gegl from
-  house packages.
-  blender-git 5.3.r164916 + house openshadinglanguage 1.15.3.0-1.2.
-- util-linux 2.42.3: python bindings + translated man off; verdef fix via
-  mold `--undefined-version` (see §6).
-- linux-firmware is trimmed for the maintained target set; pipewire-jack
-  dropped, jack-client kept; easyeffects-git replaced jamesdsp-git.
+Durable shape of the stack, re-verified 2026-09-17. Deliberately no version
+numbers: they rot within days and `pacman -Q <pkg>` is authoritative. Dated
+install history lives in `NOTE.md`.
+
+- **llvm-git is DELIBERATELY MINIMAL**: `-D LLVM_TARGETS_TO_BUILD="X86;AMDGPU;BPF"`
+  — the BPF backend exists so `scx-scheds-git` can build its BPF skeletons with
+  `clang -target bpf`. `rust-git` is built against this llvm-git, so both move
+  together (golden rule 13, §6).
+- **Qt dev stack**: every Qt6/Qt5 private-API-coupled module is house-built;
+  `qt5-base-git` carries `-ffat-lto-objects` for the LTO-strip hazard (§6).
+  `pyside6-git` is scoped with `-DMODULES='Core;Gui;Widgets'` because the rest
+  of Qt is still stock. Stock-only by design: qt6-translations, qt5ct, qt6ct.
+- **Toolchain `-git` packages carry VERSIONED provides** (`meson-git` →
+  `meson=<ver>`, likewise ninja-git, cmake-git, doxygen-git) — unversioned
+  provides cannot satisfy `>=N` makedepends (golden rule 4).
+- **GIMP/Krita chain**: `gimp-git` ships upstream's dev naming — the binary is
+  `gimp-3.3`, there is no `/usr/bin/gimp` — and declares only a bare `gimp`
+  provide. `krita-git` and `cairo-git` declare versioned provides
+  (`krita=…`, `cairo=…`) plus bare soname provides; `babl-git`/`gegl-git`
+  ship soname provides. `pacman -Dk` must stay free of chain errors and `ldd`
+  must resolve babl/gegl from the house packages.
+- **util-linux**: built with `-Dbuild-python=disabled` and
+  `-Dtranslate-docs=disabled` (po4a was purged; the feature HARD-FAILS rather
+  than skipping, §6). Its `libuuid`/`libblkid` verdefs need mold's
+  `-Wl,--undefined-version` (§6).
+- **linux-firmware** is trimmed to the maintained hardware set (AMD Strix Halo
+  + MediaTek MT7925 + Cirrus amps). In `pipewire`, the `pipewire-jack` split is
+  NOT built because it conflicts with the system's `jack2`, while
+  `pipewire-jack-client` is kept. `easyeffects-git` replaced `jamesdsp-git`.
+- **blender-git** pairs with house `openshadinglanguage` (same LLVM coupling as
+  §6 describes).
 
 ## 4. Optimization playbook
 
@@ -231,33 +260,41 @@ OpenShadingLanguage -> blender.
 
 ## 5. Pending tasks
 
+Re-verified against the host on 2026-09-17. Completed items were deleted
+rather than left in place — an unchecked task list reads as authority while
+going stale.
+
 ### Queued (claim by editing this section)
 
-- `sudo pacman -Rns hyperv intel-speed-select x86_energy_perf_policy` (the
-  trimmed linux-tools splits are still installed at 7.2.2-1) — add
-  `llvm-ocaml-git` to this removal (stale pre-trim split pinning old llvm-git;
-  verified no reverse deps during the 2026-09-07 post-trim audit).
-- **seatd-git**: PKGBUILD now declares `libseat.so` soname provide (trim-audit
-  fix, wlroots0.20's `libseat.so=1-64` dep) — rebuild+install pending.
-- **llvm-git**: `LLVM_TARGETS_TO_BUILD` now `X86;AMDGPU;BPF` (scx-scheds-git
-  BPF skeletons need `clang -target bpf`) — full rebuild pending; after it
-  lands, rebuild scx-scheds-git.
-- **ROCm decision** (heavy/critical audit 09-07 pm): hsa-rocr, hip-runtime,
-  rocm-llvm, comgr were uninstalled 2026-09-06 (one pacman transaction) —
-  system consistent without them, but HIP compute/Blender-HIP is gone.
-  Either `-g core` rebuild or prune the 4 workspace dirs and ROCm group
-  membership + rocm-core.
-- **Stale gcc-snapshot splits**: gcc-{ada,d,ga68,gcobol,go,m2,objc,rust}-
-  snapshot installed from the pre-trim full-suite build; PKGBUILD now
-  c,c++,fortran,lto only. Add to the queued `-Rns` batch (or restore languages).
-- **dbus-broker redundancy**: the rolling and stable recipes build the same
-  packages — pick one before expanding the public set.
-- **Optional purge** (user decision): `doxygen-git` + `xapian-core` (no
-  workspace consumer left).
-- Small: gtk4-git demo trim; libadwaita-git optional check()+weston drop;
-  linux-firmware legacy-removal line at next refresh; mesa-git PGO
-  0-gcda warn -> abort.
-- systemd is a separately coupled effort when its recipe changes.
+- **ROCm is half-removed**: `hsa-rocr` 7.2.4-1.1, `rocm-llvm` 2:7.2.4-2.1 and
+  `comgr` 2:7.2.4-2.1 are installed again (the 2026-09-06 collective removal was
+  reversed), while `hip-runtime` is absent — so HIP compute/Blender-HIP is still
+  gone. Either rebuild `hip-runtime` in the same `-g core` pass as its
+  dependencies, or prune the ROCm recipe dirs, their group membership, and
+  `rocm-core`.
+- **dbus-broker redundancy**: `stable/dbus-broker` and `git/dbus-broker-git`
+  build the same packages — pick one before expanding the public set. The
+  installed system package is stock `dbus-broker` 37-3.1.
+- **doxygen-git purge** (user decision): no workspace consumer left. Its other
+  half, `xapian-core`, is already gone.
+- **gtk4-git demo trim**: `_package_gtk4-demos` plus its `_pick demo` lines
+  still ship gtk4-demo, -widget-factory, -node-editor and -print-editor.
+- **libadwaita-git**: the optional `check()` and `checkdepends=(weston)` are
+  still present, so building it needs weston installed. Keep, or drop both.
+- **linux-firmware**: the 2026-09-04 audit deferred an extra legacy-firmware
+  `rm` line and never recorded what it targeted. The current trim already drops
+  pre-amdgpu `radeon` and the unused vendor directories, and upstream has no
+  `legacy/` tree, so the item is either redundant or needs re-specifying.
+- systemd is a separately coupled effort whenever its recipe changes.
+
+Deleted as done in this pass (each was verified, not assumed): the
+`-Rns hyperv intel-speed-select x86_energy_perf_policy` batch and
+`llvm-ocaml-git` (none remain installed); seatd-git's `libseat.so=1-64` provide
+(the installed `.PKGINFO` carries it); llvm-git's `X86;AMDGPU;BPF` rebuild and
+the dependent scx-scheds-git rebuild (installed llvm-git reports all three
+targets); the stale `gcc-*-snapshot` language splits (only fortran, libs and
+`lib*-snapshot` remain); mesa-git's PGO zero-gcda abort (implemented in the
+recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
@@ -328,8 +365,10 @@ OpenShadingLanguage -> blender.
   per-lib `readelf -d`/ldd (blender: libceres); prefer
   `-DWITH_SYSTEM_GLOG=ON -DWITH_SYSTEM_GFLAGS=ON`-style CMake options.
 - **IgnorePkg**: 62 names were once unprotected (audit method in golden rule
-  9); keep the closure diff empty after adding packages (3 cumulative lines
-  as of 2026-09-06; backups /etc/pacman.conf.bak-20260906*).
+  9); keep the closure diff empty after adding packages. Back up
+  `/etc/pacman.conf` before editing it — the file accumulates repeated
+  `IgnorePkg =` lines and a mistake is silent until `-Syu` replaces a house
+  package.
 - **Qt pkgver()**: MUST grep `QT_REPO_MODULE_VERSION` from `.cmake.conf` —
   git describe is unusable on Qt dev branches; pacman 7 makepkg needs a
   non-empty static pkgver= placeholder. qt6-speech packages EMPTY without

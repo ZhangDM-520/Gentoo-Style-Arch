@@ -20,11 +20,35 @@ resolved profile and plan are printed before dispatch.
 
 The old automatic output reported `-j` per lane, so `2 lanes × -j6` could
 represent twelve normal job slots while each lane independently received the
-same memory allowance. The new profiles budget normal jobs globally; on a
-24-thread/21-GiB host the medium baseline is approximately `2 lanes × -j3`,
-while the default xhigh profile is approximately `4 lanes × -j3`. This is
-intentional: it increases independent package throughput without multiplying
-the memory allowance by the lane count.
+same memory allowance. The profiles now budget normal jobs globally, and each
+profile scales all three inputs together (`threads` = `nproc`, `memory_gib` =
+`MemAvailable` unless overridden):
+
+```
+normal_memory         = max(1, memory_gib - RESERVED_MEMORY_GIB)
+normal_memory_per_job = MEMORY_PER_JOB_GIB * INTENSITY_NORMAL_MEMORY_FACTOR
+normal_job_budget     = max(1, floor(normal_memory / normal_memory_per_job))
+
+lanes (auto)          = max(1, min(INTENSITY_LANE_CAP,
+                                   floor(threads / INTENSITY_CPU_PER_LANE),
+                                   floor(memory_gib / INTENSITY_MEMORY_PER_LANE),
+                                   normal_job_budget, package_count))
+lane_jobs (auto)      = max(1, min(floor(threads / lanes),
+                                   floor(normal_job_budget / lanes)))
+
+core_memory_per_job   = CORE_MEMORY_PER_JOB_GIB * INTENSITY_CORE_MEMORY_FACTOR
+core_jobs             = max(1, min(threads, floor(normal_memory / core_memory_per_job)))
+```
+
+The `INTENSITY_*` constants live in `configure_intensity` in `build-all.fish`;
+the three GiB baselines (`memory_per_job_gib`, `core_memory_per_job_gib`,
+`reserved_memory_gib`) are in `config/build-defaults.conf`. Because every term
+is host-derived, do not predict the plan — read the line the builder prints
+(`parallelism: N CPU threads, M GiB available, intensity …, K lane(s),
+normal -j…, core -j…`). The same profile on a 24-thread/29-GiB workstation and
+on an 8-thread/16-GiB laptop yields different lane and job counts by design.
+The intent is to raise independent package throughput without multiplying the
+memory allowance by the lane count.
 
 Use explicit overrides when benchmarking or when a machine has unusual
 resource limits:
