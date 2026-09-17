@@ -101,7 +101,7 @@
   `config/dependencies.conf` are the scheduler's source of truth.
 - `.state/` (or `GSA_STATE_DIR`) contains logs, locks, lane results, and
   builder caches. makepkg source trees and archives are ignored runtime state.
-- The current logical groups are `git` (54), `stable` (29), `core` (41),
+- The current logical groups are `git` (55), `stable` (29), `core` (41),
   `misc` (1), and `third-party` (2). `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
 - No upstream checkout, package archive, downloaded signature, PGP cache,
@@ -212,6 +212,12 @@ OpenShadingLanguage -> blender.
   schema/terminals patches; `options=(staticlibs)` on lz4/pixman/mimalloc/
   libunwind. Deliberate no-ops: libreoffice-fresh (already `!lto` +
   `--enable-lto` + fortify 3→2 + -g1); blender-git (mold + ccache + !lto).
+- **Electron/JavaScript packages** (vscodium-insiders-git, logseq-desktop-git):
+  nothing is compiler-built except the native Node addons, so the recipes are
+  `!strip !debug !lto` and apply only ccache + the mold probe to those addons.
+  logseq-desktop-git additionally bundles `master` (2.x) which embeds an
+  OCaml/Melange CLI runtime — the opam switch lives under `$srcdir` and pins
+  OCaml 5.1.1 to match upstream CI.
 
 ## 5. Pending tasks
 

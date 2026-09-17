@@ -10,6 +10,52 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-17 — logseq-desktop-git recipe (desktop, upstream HEAD)
+
+- **Task**: add a self-tracking Logseq desktop recipe to the `git` group that
+  follows the house optimization standard.
+- **Decision**: track upstream `master` (the 2.x database line;
+  `src/main/frontend/version.cljs` carries `2.0.1`) rather than the 0.10.x
+  maintenance line, because group recipes follow upstream HEAD. `pkgver()`
+  reads the version the tree carries and appends the revision count and short
+  hash, matching the noctalia-git idiom.
+- **Finding**: upstream removed the ClojureScript CLI. The desktop app embeds
+  a CLI runtime that is built by OCaml + Melange (`cli/dune`) and bundled by
+  Vite, and `scripts/prepare-desktop-runtime-js.mjs` hard-requires
+  `static/js/logseq-cli.js`. `ocaml` and `opam` are therefore real
+  makedepends, not optional extras. The recipe creates a private switch under
+  `$srcdir/opam-root` (never the builder's `~/.opam`) and pins OCaml 5.1.1 to
+  match the upstream release workflow.
+- **Finding**: the only valid build sequence is the one in
+  `.github/workflows/build-desktop-release.yml`: `pnpm install`, `gulp build`,
+  `cljs:release-electron`, `db-worker-node:bundle`, `opam exec -- pnpm
+  cli:release`, `webpack-app-build`, `desktop:prepare-runtime-js`, then
+  electron-builder inside `static/`. The published AUR `logseq-desktop-git`
+  PKGBUILD is stale (yarn, electron-forge, 0.9.10) and is kept only as
+  attribution.
+- **Optimization standard**: the only compiled code is the two native Node
+  addons (`@zvec/zvec`, `keytar`), so the recipe declares
+  `options=(!strip !debug !lto)` and applies ccache plus the mold probe to
+  those addons only. No ISA or optimization flags are hard-coded.
+- **Packaging**: electron-builder runs with `--dir` (unsigned unpacked tree)
+  instead of the upstream AppImage; the tree is installed under
+  `/opt/logseq-desktop-git`, `chrome-sandbox` is installed setuid root, and
+  `/usr/bin/logseq` reads extra flags from
+  `${XDG_CONFIG_HOME:-$HOME/.config}/logseq-flags.conf`. Electron is bundled
+  from the version pinned in `resources/package.json` rather than taken from
+  the repositories.
+- **Validation**: `bash -n PKGBUILD`, `makepkg --printsrcinfo` parity,
+  `fish build-all.fish --list`, `--dry-run --group git` (55 packages) and
+  `--audit` (no membership drift, graph resolves) pass, together with
+  `tests/project-config.sh` and the new `tests/logseq-desktop-recipe.sh`
+  fixture (red-verified against removed mold probe, `!lto`, `ocaml`
+  makedepend, setuid bit, and branch). The full build was not executed here:
+  it needs several GB of npm, Clojure, opam and Electron downloads, and a full
+  rebuild is explicitly not a syntax check for this project.
+- **Rule**: for a from-source Electron package, mirror the upstream release
+  workflow literally, treat heavyweight toolchains (opam/OCaml) as real
+  makedepends, and keep their state inside `$srcdir`.
+
 ## 2026-09-17 — mkinitcpio optional NvPCR glob failure
 
 - **Symptom**: `mkinitcpio -P` failed for every kernel with

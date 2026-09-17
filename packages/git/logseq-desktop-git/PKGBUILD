@@ -1,0 +1,190 @@
+# Maintainer: Gentoo_Style_Arch <maintainer@localhost>
+# Contributor: Pi-Yueh Chuang <pychuang@pm.me> (AUR logseq-desktop-git)
+# Contributor: Xuanwo <xuanwo@archlinuxcn.org> (AUR logseq-desktop)
+#
+# Desktop build of Logseq, tracking upstream `master` (the database / 2.x line).
+# The build steps mirror the upstream release workflow
+# `.github/workflows/build-desktop-release.yml`, which is the authoritative
+# recipe:
+#
+#   pnpm install -> gulp build -> shadow-cljs release -> db-worker-node bundle
+#   -> OCaml/Melange CLI bundle -> webpack app build -> desktop runtime staging
+#   -> electron-builder
+#
+# The CLI runtime that the desktop app embeds is produced by an OCaml +
+# Melange bundle (`cli/`, built through a private opam switch) and then bundled
+# by Vite; there is no ClojureScript or prebuilt alternative upstream any more
+# (see docs/agent-guide/implemented/simplification/2026-08-24-remove-legacy-cljs-cli.md).
+# That is why `opam`/`ocaml` are build dependencies.
+#
+# The upstream Electron release (resources/package.json devDependencies) is
+# bundled into the package rather than borrowed from the repositories: the
+# app embeds the same Electron version it was compiled against and ships its
+# own sandbox helper, matching how this workspace packages other Electron
+# applications.
+
+pkgname=logseq-desktop-git
+_pkgname=logseq
+pkgver=2.0.1.r25560.g36964a777
+pkgrel=1
+pkgdesc="Privacy-first, open-source platform for knowledge management and collaboration (desktop, git build)"
+arch=('x86_64')
+url="https://github.com/${_pkgname}/${_pkgname}"
+license=('AGPL-3.0-or-later')
+# !strip: the bundled Electron runtime and its helper binaries must not be
+#         rewritten by makepkg.
+# !debug: an Electron tree has no useful separate debug symbols.
+# !lto:   nothing here is a compiler-driven build; the option only risks
+#         poisoning the Node addon builds (house Electron convention).
+options=('!strip' '!debug' '!lto')
+depends=(
+  'alsa-lib'
+  'cairo'
+  'fontconfig'
+  'glibc'
+  'gtk3'
+  'libnotify'
+  'libsecret'
+  'libxkbfile'
+  'libxss'
+  'libxtst'
+  'nss'
+)
+optdepends=(
+  'libappindicator-gtk3: system tray icon'
+  'xdg-utils: open external links in the browser'
+)
+makedepends=(
+  # VCS source (pkgver, git-based clojure/opam dependencies)
+  'git'
+  # Node toolchain: pnpm drives every JavaScript bundle
+  'nodejs'
+  'pnpm'
+  # shadow-cljs frontend and webpack app bundles
+  'clojure'
+  'jre-openjdk'
+  # OCaml/Melange CLI bundle (cli/): a private opam switch is created in
+  # $srcdir, so the build never touches the builder's ~/.opam
+  'ocaml'
+  'opam'
+  'm4'
+  # Native Node addons (@zvec/zvec, keytar)
+  'ccache'
+  'pkgconf'
+  'python'
+  'python-setuptools'
+)
+provides=('logseq' 'logseq-desktop')
+conflicts=(
+  'logseq'
+  'logseq-desktop'
+  'logseq-desktop-bin'
+  'logseq-desktop-electron-bin'
+  'logseq-desktop-nightly-bin'
+  'logseq-appimage'
+)
+source=(
+  "${_pkgname}::git+${url}.git#branch=master"
+  "${pkgname}.desktop"
+)
+sha256sums=('SKIP'
+            'acbe2e277b58a0db4c17efe8f048c5d88353e0363e44559cb066eb902e98fbdd')
+
+pkgver() {
+  cd "${_pkgname}"
+
+  # version.cljs is the release version carried by the tree; combine it with
+  # the git revision so the package version always tracks upstream `master`.
+  local _version
+  _version="$(sed -n 's/^(defonce version "\([^"]*\)")$/\1/p' src/main/frontend/version.cljs)"
+  printf '%s.r%s.g%s' "${_version}" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=9 HEAD)"
+}
+
+build() {
+  cd "${_pkgname}"
+
+  # @zvec/zvec and keytar are the only locally compiled code. Reuse the
+  # compiler cache across -git rebuilds and link the addons with mold.
+  export CCACHE_DIR="${CCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/ccache}"
+  export CCACHE_COMPILERCHECK=content
+  if [[ -d /usr/lib/ccache/bin ]]; then
+    export PATH="/usr/lib/ccache/bin:${PATH}"
+  fi
+  if command -v mold >/dev/null 2>&1; then
+    export LDFLAGS+=" -fuse-ld=mold"
+  fi
+
+  # The tree pins packageManager=pnpm@10; do not let a newer pnpm replace
+  # itself from the network in the middle of a build.
+  export npm_config_manage_package_manager_versions=false
+
+  ## JavaScript / ClojureScript dependency graph
+  pnpm install --frozen-lockfile
+  pnpm --dir cli install --frozen-lockfile --ignore-workspace
+
+  ## CLI runtime: private opam switch, then the Melange bundle
+  export OPAMROOT="${srcdir}/opam-root"
+  export OPAMSWITCH=logseq-cli
+  opam init --bare --disable-sandboxing -y >/dev/null
+  # Upstream pins OCaml 5.1.1 in the release workflow; Melange tracks the
+  # version it was released against, so use the same compiler rather than the
+  # repositories' newer one.
+  opam switch create "${OPAMSWITCH}" ocaml-base-compiler.5.1.1 -y
+  ( cd cli && opam install . --deps-only --with-test --yes )
+
+  ## Frontend, worker, and CLI bundles (upstream build-desktop-release.yml)
+  pnpm gulp:build
+  clojure -P -M:cljs
+  pnpm cljs:release-electron
+  pnpm db-worker-node:bundle
+  opam exec -- pnpm cli:release
+  pnpm webpack-app-build
+  pnpm desktop:prepare-runtime-js
+
+  ## Electron packaging: unsigned unpacked tree, installed by package().
+  ## Upstream also publishes an AppImage/zip from here; we deliberately build
+  ## only the unpacked tree we actually ship (no AppImage to unpack again).
+  ## pkgver is <version>.r<count>.g<hash>; electron-builder validates the app
+  ## version, so stamp the version the tree carries, as upstream does.
+  ( cd static
+    pnpm install --frozen-lockfile
+    sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${pkgver%%.r*}\"/" package.json
+    pnpm exec electron-builder --config electron-builder.yml --publish never \
+      --dir -c.executableName=logseq
+  )
+}
+
+package() {
+  cd "${_pkgname}/static/dist/linux-unpacked"
+
+  install -d "${pkgdir}/opt/${pkgname}"
+  cp -a . "${pkgdir}/opt/${pkgname}/"
+
+  # Electron's sandbox helper must remain setuid root to be usable.
+  chown root:root "${pkgdir}/opt/${pkgname}/chrome-sandbox"
+  chmod 4755 "${pkgdir}/opt/${pkgname}/chrome-sandbox"
+
+  install -Dm755 /dev/stdin "${pkgdir}/usr/bin/logseq" <<'EOF'
+#!/bin/sh
+# Extra flags can be added, one per line, to
+# ${XDG_CONFIG_HOME:-$HOME/.config}/logseq-flags.conf
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+flags_file="${config_home}/logseq-flags.conf"
+
+flags=""
+if [ -f "${flags_file}" ]; then
+  flags="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "${flags_file}" | tr '\n' ' ')"
+fi
+
+exec /opt/logseq-desktop-git/logseq ${flags} "$@"
+EOF
+
+  install -Dm644 "${srcdir}/${pkgname}.desktop" \
+    "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+  install -Dm644 "${srcdir}/${_pkgname}/resources/icons/logseq.png" \
+    "${pkgdir}/usr/share/pixmaps/logseq.png"
+  install -Dm644 "${srcdir}/${_pkgname}/LICENSE.md" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.md"
+}

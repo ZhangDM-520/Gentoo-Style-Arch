@@ -93,6 +93,7 @@ bash tests/cairo-pgo-transition.sh
 bash tests/gtk3-pgo-transition.sh
 bash tests/gtk4-pgo-transition.sh
 bash tests/xorg-xwayland-pgo-transition.sh
+bash tests/logseq-desktop-recipe.sh
 bash tests/scheduler-intensity.sh
 ```
 

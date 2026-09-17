@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+recipe="packages/git/logseq-desktop-git"
+pkgbuild="$root/$recipe/PKGBUILD"
+
+fail() {
+    printf 'logseq-desktop-git recipe: %s\n' "$1" >&2
+    exit 1
+}
+
+assets=(PKGBUILD .SRCINFO BUILDING .gitignore logseq-desktop-git.desktop)
+for asset in "${assets[@]}"; do
+    test -f "$root/$recipe/$asset" || fail "missing asset: $recipe/$asset"
+    if git -C "$root" check-ignore -q -- "$recipe/$asset"; then
+        fail "asset is hidden by .gitignore: $recipe/$asset"
+    fi
+done
+
+# Read the recipe the same way the builder does; the PKGBUILD overrides the
+# `source` builtin, so this runs in its own shell.
+vars=$(bash -c '
+    source "$1" || exit 1
+    printf "src=%s\n" "${source[@]}"
+    printf "makedepends=%s\n" "${makedepends[@]}"
+    printf "options=%s\n" "${options[@]}"
+    printf "provides=%s\n" "${provides[@]}"
+' _ "$pkgbuild") || fail "cannot source the PKGBUILD"
+
+has() {
+    grep -Fxq "$1=$2" <<<"$vars"
+}
+
+# Self-tracking: the VCS source follows upstream master and pkgver() reads the
+# version the tree carries, so the package version moves with upstream.
+has src 'logseq::git+https://github.com/logseq/logseq.git#branch=master' ||
+    fail "does not track upstream master"
+grep -Fq 'src/main/frontend/version.cljs' "$pkgbuild" ||
+    fail "pkgver() does not derive the version from version.cljs"
+
+# The desktop bundle embeds the ClojureScript frontend and the OCaml/Melange
+# CLI runtime; both toolchains must stay declared.
+for dep in clojure jre-openjdk ocaml opam nodejs pnpm; do
+    has makedepends "$dep" || fail "missing makedepend: $dep"
+done
+
+# The desktop bundle is only produced by this sequence, in this order
+# (upstream .github/workflows/build-desktop-release.yml).
+stages=(
+    'pnpm gulp:build'
+    'pnpm cljs:release-electron'
+    'pnpm db-worker-node:bundle'
+    'opam exec -- pnpm cli:release'
+    'pnpm webpack-app-build'
+    'pnpm desktop:prepare-runtime-js'
+)
+last=0
+for stage in "${stages[@]}"; do
+    line=$(grep -Fn -- "$stage" "$pkgbuild" | head -1 | cut -d: -f1) || line=""
+    test -n "$line" || fail "missing build stage: $stage"
+    if (( line <= last )); then
+        fail "build stage out of order: $stage"
+    fi
+    last=$line
+done
+
+# Optimisation standard: no hard-coded host ISA or optimisation level, and the
+# Electron exceptions are declared explicitly.
+if grep -Eq -- '-march=|-mtune=|-O[0-9]' "$pkgbuild"; then
+    fail "hard-codes a host ISA or optimisation flag"
+fi
+for opt in '!strip' '!debug' '!lto'; do
+    has options "$opt" || fail "missing option: $opt"
+done
+grep -Fq 'command -v mold' "$pkgbuild" ||
+    fail "native Node addons are not linked through the house mold probe"
+grep -Fq 'CCACHE_DIR' "$pkgbuild" ||
+    fail "native Node addons do not reuse the compiler cache"
+has provides 'logseq-desktop' || fail "does not provide logseq-desktop"
+
+# The bundled Electron sandbox helper only works when it is setuid root.
+grep -Fq 'chmod 4755' "$pkgbuild" || fail "chrome-sandbox is not made setuid"
+grep -Fq 'dist/linux-unpacked' "$pkgbuild" || fail "unpacked Electron tree unused"
+
+# Topology: the recipe must be reachable through the map and the git group.
+grep -Fxq "logseq-desktop-git|$recipe|logseq-desktop-git" \
+    "$root/config/packages.map" || fail "not registered in config/packages.map"
+grep -Fxq 'logseq-desktop-git' "$root/config/groups/git.list" ||
+    fail "not a member of the git group"
+grep -q '^logseq-desktop-git:' "$root/config/dependencies.conf" ||
+    fail "not registered in config/dependencies.conf"
+
+# .SRCINFO must match the recipe.
+if ! GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" |
+    diff -q - "$root/$recipe/.SRCINFO" >/dev/null; then
+    fail ".SRCINFO is out of sync with the PKGBUILD"
+fi
+
+printf 'logseq-desktop-git recipe fixture: PASS\n'

@@ -95,6 +95,7 @@ libinput-git|packages/git/libinput-git|libinput-git
 libunwind-git|packages/git/libunwind-git|libunwind-git
 liburing-git|packages/git/liburing-git|liburing-git
 libva-git|packages/git/libva-git|libva-git
+logseq-desktop-git|packages/git/logseq-desktop-git|logseq-desktop-git
 lz4-git|packages/git/lz4-git|lz4-git
 mesa-git|packages/git/mesa-git|mesa-git
 mimalloc-git|packages/git/mimalloc-git|mimalloc-git
