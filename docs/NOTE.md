@@ -10,6 +10,39 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-17 — stray `config/groups` inventory removed
+
+- **Symptom**: `config/groups/physical-groups.list` sat in the directory the
+  builder loads group definitions from and looked authoritative, but nothing in
+  the tree referenced it.
+- **Character in the build script**: it was never read. `read_group_config` is
+  called for exactly the five declared names
+  (`for group_name in git stable core misc third-party`), and `resolve_group`
+  switches on those same five, so `--group physical-groups` is rejected (rc=1)
+  without any file being opened. Even if it were read, its tab-separated
+  `category<TAB>package-id` lines fail the loader's `^[A-Za-z0-9._+-]+$` check
+  and it would report `invalid package group`.
+- **Staleness**: it was a publication-time snapshot that was already wrong when
+  created — its 123 entries missed `core cmake-git` and `stable mkinitcpio`, and
+  by now also missed `git logseq-desktop-git` and `git texlive-texmf`.
+- **Redundancy**: its whole content is derivable from `config/packages.map`
+  (`awk -F'|' 'NF>=2 && $0 !~ /^#/ {n=split($2,a,"/"); print a[2]"\t"$1}'
+  config/packages.map | sort`), so nothing is lost by deleting it.
+- **Fix**: deleted the file. Nothing else changed — the loader never opened it,
+  `--group physical-groups` behaves identically before and after (rejected,
+  rc=1, no output), and every group command still validates the five real files
+  through `load_project_config`.
+- **Guard**: `tests/project-config.sh` now asserts that `config/groups/`
+  contains exactly the five declared groups, so a stray file there (an
+  inventory, a `.bak`, a hand-made list) fails the fixture instead of drifting
+  silently.
+- **Validation**: `tests/project-config.sh` plus the whole fixture battery,
+  `--list`, `--audit` and `--dry-run` for the five groups all pass after the
+  removal.
+- **Rule**: a file living in a directory the builder reads, but unreachable
+  through that directory's loader, is a trap — either wire it up or delete it;
+  never keep a stale duplicate of another control file.
+
 ## 2026-09-17 — texlive-texmf recipe (TeX Live collections, meta closure)
 
 - **Task**: be able to build the 19 `texlive-*` packages that
@@ -66,10 +99,9 @@ credentials, downloaded sources, or generated build output to this journal.
   mirror that pkgbase rather than inventing per-split recipes; trim by deleting
   whole splits together with their depends/provides/paths, and state explicitly
   when a package has no compiler phase to optimise.
-- **Unrelated observation (not changed)**: `config/groups/physical-groups.list`
-  is dead weight — nothing globs `config/groups/`, the five group names are
-  hardcoded in `build-all.fish`, and the file is stale (it also lacks
-  `logseq-desktop-git`). Left untouched because it is outside this change.
+- **Flagged, then fixed in a follow-up commit**: `config/groups/physical-groups.list`
+  was unreachable, stale control state. Removed; the reason is recorded in the
+  entry above this one.
 
 ## 2026-09-17 — logseq-desktop-git recipe (desktop, upstream HEAD)
 
