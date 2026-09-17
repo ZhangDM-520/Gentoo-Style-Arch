@@ -10,6 +10,26 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-17 — mkinitcpio optional NvPCR glob failure
+
+- **Symptom**: `mkinitcpio -P` failed for every kernel with
+  `file not found: '/usr/lib/nvpcr/*.nvpcr'`; the generated image was
+  reported as potentially incomplete.
+- **Cause**: the Projects systemd recipe intentionally sets
+  `-Dbootloader=disabled` for Limine, so it does not install systemd's
+  optional NvPCR definition files. Stock `mkinitcpio 42-1` added an
+  unguarded glob to its systemd and `sd-encrypt` install hooks.
+- **Fix**: added a `mkinitcpio` stable recipe at `pkgrel=2` with a minimal
+  patch that skips absent optional `.nvpcr` files, plus a regression fixture.
+  The systemd bootloader choice remains unchanged.
+- **Validation**: the hook fixture passes with no `/usr/lib/nvpcr` directory;
+  the patched package metadata, project audit, and full recipe checks pass.
+  The patched package must be installed before regenerating the real Limine
+  initramfs images.
+- **Rule**: optional initramfs payloads must be guarded at the hook boundary;
+  do not make an unrelated bootloader feature mandatory to satisfy an
+  optional glob.
+
 ## 2026-09-16 — Published recipe omitted by local ignore rule
 
 - **Symptom**: a fresh checkout rejected `xorg-xwayland-git` during

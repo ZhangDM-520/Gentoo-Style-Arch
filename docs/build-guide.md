@@ -64,6 +64,22 @@ lock is not removed automatically. Resume with the remaining package IDs
 printed by the failure summary, usually adding `--skip --install` after
 checking whether the archive was already produced.
 
+### mkinitcpio and optional NvPCR definitions
+
+The package set disables systemd's bootloader integration because this project
+boots through Limine. That means systemd does not install optional
+`/usr/lib/nvpcr/*.nvpcr` definitions, while stock `mkinitcpio` 42-1's systemd
+hooks still try to add that glob literally. The project carries a patched
+`mkinitcpio` recipe that skips absent optional definitions:
+
+```sh
+fish build-all.fish --no-deps --install mkinitcpio
+sudo mkinitcpio -P
+```
+
+Do not re-enable systemd's bootloader feature just to satisfy this optional
+initramfs input; the guarded hook is the intended compatibility boundary.
+
 ### PGO libraries recreating old build paths
 
 Some recipes use a temporary GCC profile-generation build for training. The

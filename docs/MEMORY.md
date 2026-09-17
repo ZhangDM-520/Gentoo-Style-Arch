@@ -95,7 +95,7 @@
   `config/dependencies.conf` are the scheduler's source of truth.
 - `.state/` (or `GSA_STATE_DIR`) contains logs, locks, lane results, and
   builder caches. makepkg source trees and archives are ignored runtime state.
-- The current logical groups are `git` (54), `stable` (28), `core` (41),
+- The current logical groups are `git` (54), `stable` (29), `core` (41),
   `misc` (1), and `third-party` (2). `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
 - No upstream checkout, package archive, downloaded signature, PGP cache,

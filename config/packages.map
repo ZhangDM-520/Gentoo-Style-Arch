@@ -50,6 +50,7 @@ imagemagick|packages/stable/imagemagick|.Stable/imagemagick
 libisl-git|packages/stable/libisl-git|.Stable/libisl-git
 libreoffice-fresh|packages/stable/libreoffice-fresh|.Stable/libreoffice-fresh
 linux-api-headers|packages/stable/linux-api-headers|.Stable/linux-api-headers
+mkinitcpio|packages/stable/mkinitcpio|mkinitcpio
 linux-firmware|packages/stable/linux-firmware|.Stable/linux-firmware
 linux-tools|packages/stable/linux-tools|.Stable/linux-tools
 networkmanager|packages/stable/networkmanager|.Stable/networkmanager

@@ -10,6 +10,7 @@ udisks2
 zram-generator
 pipewire
 wireplumber
+mkinitcpio
 linux-firmware
 linux-tools
 gc

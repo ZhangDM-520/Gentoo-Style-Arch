@@ -13,12 +13,12 @@ before building or installing anything.
 
 ## What is included
 
-The current set has 123 recipes:
+The current set has 124 recipes:
 
 | Group | Count | Purpose |
 | --- | ---: | --- |
 | `git` | 54 | Top-level development and rolling packages |
-| `stable` | 28 | Stock-name packages synchronized with Arch repositories |
+| `stable` | 29 | Stock-name packages synchronized with Arch repositories |
 | `core` | 41 | Heavy, ABI-coupled, source-heavy, and ROCm packages |
 | `misc` | 1 | Optional CachyOS kernel recipe |
 | `third-party` | 2 | Additional application recipes |
