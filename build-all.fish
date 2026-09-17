@@ -69,6 +69,14 @@ set -g _UI_ICON_INFO "·"
 set -g _UI_ICON_ACTIVE "→"
 set -g _PACMAN_MUTEX "$LOG_DIR/.pacman-install.lock"
 set -g _PACMAN_MUTEX_WAIT 300
+# Unprivileged -i runs: the dispatcher refreshes the sudo cached credential so
+# the lane installs (`sudo -n`, lane children have no tty) never need a
+# password. The interval sits well inside the 5-min sudo timeout so a slow poll
+# iteration under heavy CPU load cannot overshoot it (2026-09-07 llvm incident:
+# a 70-min build whose keepalive prompt timed out). The prompt bound keeps an
+# unattended run from hanging on a password nobody can type.
+set -g _SUDO_KEEPALIVE_S 150
+set -g _SUDO_PROMPT_S 120
 
 function ui_heading
     set -l prefix (set_color cyan)
@@ -1666,6 +1674,46 @@ function check_runtime_prereqs -a install_flag needs_stable_sync
     return 0
 end
 
+# What can sudo do RIGHT NOW? Never prompts: lane children have no tty, and the
+# dispatcher must not block on a password nobody may type.
+#   fresh    — `sudo -n -v` refreshed the cached credential
+#   nopasswd — the credential cannot be refreshed, but installs are
+#              password-free anyway. Stopping the run here is WRONG: a dual
+#              sudoers set ("(ALL) ALL" + "(ALL : ALL) NOPASSWD: ALL") makes
+#              `sudo -v` fail forever while every `sudo -n` install succeeds —
+#              the 2026-09-17 incident that stopped long runs for nothing.
+#   cold     — sudo cannot run anything without a password right now
+# The last probe runs the mechanism the lanes themselves use (`sudo -n pacman`),
+# so its verdict cannot be rosier than an install would be. If a host has a
+# password-free rule for that probe but a password-gated pacman, the run keeps
+# dispatching and the lane's install still fails loudly and stops dispatch.
+function sudo_probe
+    if sudo -n -v >/dev/null 2>&1
+        echo fresh
+        return 0
+    end
+    if sudo -n pacman --version >/dev/null 2>&1
+        echo nopasswd
+        return 0
+    end
+    echo cold
+    return 1
+end
+
+# Last resort when a credential dies mid-run: the dispatcher still owns the
+# terminal (lane children never do), so it can ask for the password itself and
+# keep the run going. Only when a human is plausibly present (stdin is a
+# terminal) and always bounded by `timeout` — a prompt nobody can answer must
+# never hang an unattended run.
+function sudo_elevate_interactively
+    test -t 0; or return 1
+    command -q timeout; or return 1
+    printf '\n'
+    ui_warning "sudo needs a password — asking now (installs themselves stay non-interactive)"
+    timeout "$_SUDO_PROMPT_S" sudo -v
+    return $status
+end
+
 function write_lane_result -a result_file pkg rc dur
     set -l tmp_result "$result_file.tmp.$fish_pid"
     if not printf '%s %s %s\n' "$pkg" "$rc" "$dur" >"$tmp_result"
@@ -2061,6 +2109,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     end
     set -g _RL_INTERRUPTED 0
     set -g _RL_BLOCKED 0
+    set -g _RL_SUDO_NOTE ""
     set -g _lane_sorted $sorted
     set -g _lane_done
     set -g _lane_started
@@ -2133,6 +2182,26 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -l failed_dur
     set -l stop_starting 0
     set -l blocked 0
+    set -l sudo_stopped 0
+    # -i preflight: decide whether installs are possible BEFORE the first hour
+    # of building is spent on packages that could never be installed. A prompt
+    # belongs here — the human just started the run — so this is the one place
+    # we may ask for a password; the old code found out 150 s into dispatch.
+    set -l sudo_state up
+    if test $install_flag -eq 1; and test "$_ROOT_MODE" != "1"
+        switch (sudo_probe)
+            case nopasswd
+                # Nothing to keep warm: probing again would only be noise.
+                set sudo_state nopasswd
+            case cold
+                if not sudo_elevate_interactively
+                    set -g _RL_SUDO_NOTE "no install rights: nothing was built"
+                    ui_error "sudo cannot install non-interactively — refusing to start an -i run"
+                    echo "  Prefer 'sudo fish $SCRIPT_DIR/build-all.fish ...' for long runs: installs run as root and never expire."
+                    return 1
+                end
+        end
+    end
     set -l last_sudo (date +%s)
     set -l disp_count 0
 
@@ -2259,24 +2328,39 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
             end
         end
 
-        # Keep the sudo timestamp warm so background installs never hit a
-        # password prompt (background jobs have no tty). -n = fail FAST instead
-        # of hanging the dispatcher on a prompt nobody can answer; interval is
-        # deliberately well inside the 5-min sudo timeout so a slow poll
-        # iteration under heavy CPU load can't overshoot it (2026-09-07 llvm
-        # incident: 70-min build, keepalive prompt timed out).
-        # Root mode needs none of this — installs are direct pacman calls.
-        if test $install_flag -eq 1; and test "$_ROOT_MODE" != "1"
+        # Keep the sudo credential warm so background installs never hit a
+        # password prompt (lane children have no tty). Root mode needs none of
+        # this — installs are direct pacman calls.
+        if test $install_flag -eq 1; and test "$_ROOT_MODE" != "1"; and test "$sudo_state" = up
             set -l now (date +%s)
-            if test (math $now - $last_sudo) -gt 150
-                if sudo -n -v >/dev/null 2>&1
-                    set last_sudo $now
-                else
-                    abort_dashboard
-                    ui_error "sudo timestamp expired and cannot be refreshed non-interactively — stopping dispatch"
-                    echo "  In-flight lane installs will fail fast (no hang). After the run, from a"
-                    echo "  terminal where sudo works: install with 'build-all.fish -ia', or resume with -s -i."
-                    set stop_starting 1
+            if test (math $now - $last_sudo) -gt $_SUDO_KEEPALIVE_S
+                switch (sudo_probe)
+                    case fresh
+                        set last_sudo $now
+                    case nopasswd
+                        # `-v` will never be permitted here, yet every install
+                        # succeeds: stop probing rather than re-deciding this
+                        # every interval.
+                        set sudo_state nopasswd
+                        set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_INFO sudo: installs need no password"
+                    case cold
+                        abort_dashboard
+                        if sudo_elevate_interactively
+                            set last_sudo (date +%s)
+                            ui_success "sudo refreshed — dispatch continues"
+                        else
+                            # Latch: every later probe would fail and re-print.
+                            # Say it ONCE, stop dispatch, and let in-flight lanes
+                            # finish (their own installs fail fast, no hang).
+                            set sudo_state down
+                            if test (count $_lane_started) -lt $total
+                                set sudo_stopped 1
+                                set -g _RL_SUDO_NOTE "sudo credential lost: some packages were never started"
+                            end
+                            ui_error "sudo credential expired and cannot be refreshed — stopping dispatch"
+                            echo "  Install later with 'build-all.fish -ia', or resume with 'build-all.fish -s -i'."
+                            set stop_starting 1
+                        end
                 end
             end
         end
@@ -2443,7 +2527,9 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -g _RL_SUCCEEDED $succeeded
     set -g _RL_FAILED $failed
     set -g _RL_BLOCKED $blocked
-    if test (count $failed) -gt 0 -o "$blocked" -gt 0
+    # A dispatch stopped by a lost sudo credential left packages unbuilt: that
+    # must never be reported as "All builds succeeded!" (2026-09-17).
+    if test (count $failed) -gt 0 -o "$blocked" -gt 0; or test "$sudo_stopped" -eq 1
         return 1
     end
     return 0
@@ -2486,6 +2572,11 @@ function usage
     echo "  -i, --install     Install each package IMMEDIATELY after it builds,"
     echo "                    in dependency order (pacman -U --noconfirm --ask 4 —"
     echo "                    unattended). Install failure aborts the run."
+    echo "                    Lane installs run as 'sudo -n': the dispatcher keeps"
+    echo "                    the cached credential warm, asks for your password"
+    echo "                    itself if it expired, and refuses to start when"
+    echo "                    installs are impossible (instead of building for an"
+    echo "                    hour first)."
     echo "                    This is the same behaviour the old -si/--sepinstall"
     echo "                    alias selected; that alias was removed 2026-09-17."
     echo "  --no-deps         Build ONLY the named packages — skip dependency-chain"
@@ -2876,7 +2967,7 @@ function main
     if test "$_ROOT_MODE" = "1"
         echo "User:     root (supervisor) — builds as $_BUILD_USER, installs as root"
     else
-        echo "User:     $_BUILD_USER (installs via sudo, keepalive 150 s)"
+        echo "User:     $_BUILD_USER (installs via sudo, keepalive $_SUDO_KEEPALIVE_S s)"
     end
     echo "State:    $_STATE_DIR"
     echo ""
@@ -2921,6 +3012,7 @@ function main
     set -l succeeded $_RL_SUCCEEDED
     set -l failed $_RL_FAILED
     set -l blocked $_RL_BLOCKED
+    set -l sudo_note "$_RL_SUDO_NOTE"
 
     if test "$_RL_INTERRUPTED" = "1"
         return 130
@@ -2945,7 +3037,11 @@ function main
             set -a remaining $pkg
         end
     end
-    ui_error "Build failed — stopped dispatching, drained in-flight lanes."
+    if test -n "$sudo_note"; and test (count $failed) -eq 0 -a "$blocked" -eq 0
+        ui_warning "Stopped early — $sudo_note."
+    else
+        ui_error "Build failed — stopped dispatching, drained in-flight lanes."
+    end
     echo ""
     echo "Successful builds: "(count $succeeded)
     echo "Failed builds:     "(count $failed)

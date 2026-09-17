@@ -51,6 +51,33 @@ The supervisor installs as root but runs `makepkg` as the invoking user and
 resolves that user's real home directory. A bare root shell without an
 invoking user is rejected.
 
+### sudo during `--install`
+
+Unprivileged `--install` installs happen inside lane children, which have no
+terminal, so every transaction is `sudo -n`. The dispatcher keeps that
+possible, and never confuses "I cannot refresh a credential" with "installs
+are impossible":
+
+- Before dispatch it probes what sudo can actually do, and **refuses to
+  start** when installs could not succeed — rather than building for an hour
+  first.
+- While running it refreshes the credential at `_SUDO_KEEPALIVE_S` (150 s,
+  well inside the sudo timeout). If `sudo -v` is refused but a plain install
+  command works — a sudoers `NOPASSWD` entry covers the installs — there is
+  no credential to keep warm and it stops probing instead of stopping the
+  run.
+- If the credential is genuinely lost, the dispatcher asks for the password
+  itself: it still owns the terminal even though its lanes never do. The
+  prompt is bound by `_SUDO_PROMPT_S` (120 s) so an unattended run cannot
+  hang.
+- When the password cannot be entered, dispatch stops once (one message, not
+  one per poll), in-flight lanes drain, and the run lists the unstarted
+  packages as remaining and exits non-zero. A stopped dispatch is never
+  reported as a successful build.
+
+`sudo fish build-all.fish …` remains the option-free way to avoid credential
+expiry altogether: installs run as root and `makepkg` still builds as you.
+
 ## Runtime state and cleanup
 
 Builder state is under `.state/` by default. Set `GSA_STATE_DIR` to put logs,

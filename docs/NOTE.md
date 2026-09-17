@@ -32,6 +32,63 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-17 — sudo keepalive stopped runs for nothing, then spammed
+
+- **Symptom** (screenshot from a `-i` run): a three-line block — "sudo timestamp
+  expired and cannot be refreshed non-interactively — stopping dispatch" —
+  repeated every poll for as long as lanes kept building, while the dashboard
+  sat on `▲ STOPPING`. Dispatch stopped; when the in-flight lanes happened to
+  succeed, the run then printed **"All builds succeeded! Built: 0 packages"**.
+- **Root cause 1 — the probe measured the wrong thing.** `sudo -n -v` was used
+  as a proxy for "an install can run". On this host it is not:
+  `/etc/sudoers` has `(ALL) ALL` *and* `(ALL : ALL) NOPASSWD: ALL`, so
+  `sudo -n -v` fails forever (the password rule owns validation) while
+  `sudo -n pacman -U …` succeeds every time — verified live:
+  `sudo -n -v` → rc=1, `sudo -n pacman --version` → rc=0. The keepalive fired
+  ~150 s in (the cached credential had aged past its timeout by then), declared
+  the credential dead, and stopped a run whose installs were never at risk.
+- **Root cause 2 — the failure path had no memory.** `last_sudo` was only
+  updated on success, so once the probe failed the branch re-fired on every
+  0.5 s poll and re-printed the whole message; nothing latched.
+- **Root cause 3 — a stopped dispatch reported success.** `run_lanes` returned
+  0 whenever no package had *failed*, so packages that were never dispatched
+  disappeared into "All builds succeeded! Built: 0 packages".
+- **Fix** (`build-all.fish`):
+  - `sudo_probe` classifies `fresh` (`sudo -n -v` refreshed), `nopasswd`
+    (`-v` refused but `sudo -n pacman` works → nothing to keep warm) or `cold`,
+    and the last of those probes the mechanism the lanes themselves use, so its
+    answer cannot be rosier than an install would be.
+  - An `-i` preflight settles sudo *before* building: it refreshes, or
+    self-elevates, or refuses to start. Building for an hour to discover that
+    the installs cannot happen was the old behaviour.
+  - `sudo_elevate_interactively` lets the dispatcher ask for the password
+    itself (it owns the terminal; lane children never do), gated on stdin
+    being a terminal and bounded by `timeout` so an unattended run cannot hang.
+  - The cold path latches (`sudo_state = down`): one message, one stop, no
+    repeats — and if packages were left unstarted the run exits non-zero with
+    `_RL_SUDO_NOTE` replacing the misleading "Build failed" heading.
+- **Fixing that exposed a second, older bug** (same subsystem, found because the
+  new fixture tails lane stderr): `set -gx MAKEFLAGS (string join ' ' $make_flags)`
+  always failed — fish hands every argument after the first to `string`'s own
+  option parser, so `-j4` produced `string join: -j4: unknown option`, the
+  substitution aborted, and **MAKEFLAGS was never exported to a lane**. The
+  per-lane job budget therefore never reached upstream Makefiles (only
+  `GSA_BUILD_JOBS`, which the workspace's own PKGBUILDs read, did). Fixed with
+  a quoted list expansion (`set -gx MAKEFLAGS "$make_flags"`), which joins with
+  spaces and cannot be parsed as an option.
+- **Tests**: new `tests/sudo-keepalive.sh` drives four real sudoers shapes
+  (`nopasswd`, `cold`, `expires` mid-run, `promptable`) through the actual
+  dispatcher with a fake `sudo`/`pacman` and a virtual clock (the 150 s
+  interval elapses inside a 10 s fixture), including a pty sub-case via
+  `script` that proves the dispatcher prompts exactly once and carries on. It is
+  red on the previous script ("nopasswd run stopped dispatch although installs
+  need no password"). `tests/scheduler-intensity.sh` now asserts each lane's
+  exported `-j` budget in `MAKEFLAGS`/`NINJAFLAGS`/`GSA_BUILD_JOBS`, which is
+  red on the old `string join` form.
+- **Rule**: probe a capability with the mechanism the code will actually use,
+  never with a neighbouring command that merely looks equivalent; and a run
+  that stops before dispatching everything is a failure, not a success.
+
 ## 2026-09-17 — structure audit, phase C: documentation truth pass
 
 - **Symptom**: the docs described a stack that had moved on. Every claim below

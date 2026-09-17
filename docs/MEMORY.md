@@ -80,6 +80,12 @@
     immediate-install flag. `-ia/--installall` is the one-transaction escape
     hatch and deliberately bypasses this rule; never use it for a set whose
     members depend on each other.
+    Those installs are background jobs with no tty, so the dispatcher owns
+    sudo liveness (see build-guide.md "sudo during --install"): it must never
+    infer "installs are impossible" from `sudo -v` alone — a `NOPASSWD`
+    sudoers entry makes `-v` fail forever while every install succeeds — and a
+    run whose dispatch stopped early must exit non-zero instead of reporting
+    success (2026-09-17).
 12. **Mandatory selection + keystone discipline** (2026-09-07): build-all.fish
     has NO default action — always pass `-g` and/or package names. For
     ABI-coupled core updates use `-g core` (auto-installs the merged core set);
@@ -150,7 +156,12 @@ external Fish child with isolated output, atomic
 validated results, and a log tail owned by the parent dashboard. Plain output
 is append-only; interactive output is width-safe and sanitized. `-i` installs
 each package before its dependents compile, under a builder-owned pacman
-mutex. A system pacman database lock is never deleted automatically.
+mutex. Those installs are non-interactive (`sudo -n`) because lane children
+have no terminal, so the dispatcher probes whether an install can actually
+run, refreshes the credential, asks for the password itself when a human is
+attached, and stops dispatch exactly once — with a non-zero exit — when
+nothing can restore it. A system pacman database lock is never deleted
+automatically.
 
 `--no-deps` is a deliberate leaf rebuild. `--audit` checks active topology and
 runtime drift. `--link-sources` deduplicates compatible VCS mirrors without
