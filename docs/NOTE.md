@@ -40,6 +40,18 @@ credentials, downloaded sources, or generated build output to this journal.
 - **Rule**: optional initramfs payloads must be guarded at the hook boundary;
   do not make an unrelated bootloader feature mandatory to satisfy an
   optional glob.
+- **Re-verify** without touching the installed package by pointing the hook
+  search path at a directory of copied hooks (`-D` replaces, not extends, the
+  search path, so pass the parent containing `hooks/`, `install/`, and
+  `post/`):
+
+  ```sh
+  sudo mkinitcpio -D /tmp/hookroot -g /tmp/red.img -k /boot/vmlinuz-linux
+  sudo mkinitcpio -D /usr/lib/initcpio -g /tmp/green.img -k /boot/vmlinuz-linux
+  ```
+
+  Stock hooks report `file not found: '/usr/lib/nvpcr/*.nvpcr'`; the patched
+  hooks finish with `Initcpio image generation successful`.
 - **Rule**: when a signed tag fails verification, resolve the signer against
   the maintainer's published key and add the signing subkey fingerprint to
   `validpgpkeys`; never bypass the check.
