@@ -1991,7 +1991,12 @@ function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip
         end
     end
     set -a make_flags "-j$total_jobs"
-    set -gx MAKEFLAGS (string join ' ' $make_flags)
+    # Quoted list expansion, not `string join`: fish hands every argument after
+    # the FIRST `string join` argument to its own option parser, so "-j4" made
+    # the builtin fail ("unknown option") and left MAKEFLAGS unset — the lane
+    # job budget silently never reached the build. A quoted variable joins the
+    # list with spaces and cannot be mistaken for an option.
+    set -gx MAKEFLAGS "$make_flags"
     set -l ninja_flags
     if set -q NINJAFLAGS
         for flag in (string split ' ' -- "$NINJAFLAGS")
@@ -2001,7 +2006,8 @@ function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip
         end
     end
     set -a ninja_flags "-j$total_jobs"
-    set -gx NINJAFLAGS (string join ' ' $ninja_flags)
+    # See MAKEFLAGS above: `string join` cannot take a "-jN" argument.
+    set -gx NINJAFLAGS "$ninja_flags"
     set -l start_s (date +%s)
     build_package $pkg_dir $install_flag $clean_flag $skip_flag $no_sync_flag 1
     set -l rc $status

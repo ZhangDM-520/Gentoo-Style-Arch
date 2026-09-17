@@ -38,6 +38,11 @@ if [[ "${GSA_FAIL_PACKAGE:-}" == "$(basename "$PWD")" ]]; then
     exit 1
 fi
 printf 'fake makepkg %s\n' "$PWD"
+# The lane must hand its per-lane job budget to the build system: MAKEFLAGS and
+# NINJAFLAGS are what upstream Makefiles/Ninja honour, GSA_BUILD_JOBS is what
+# this workspace's PKGBUILDs read.
+printf 'job flags: MAKEFLAGS=%s NINJAFLAGS=%s GSA_BUILD_JOBS=%s\n' \
+    "${MAKEFLAGS:-unset}" "${NINJAFLAGS:-unset}" "${GSA_BUILD_JOBS:-unset}"
 sleep "${GSA_FAKE_BUILD_SECONDS:-0.05}"
 EOF
 chmod +x "$fixture/bin/makepkg"
@@ -64,9 +69,17 @@ for level in low medium high xhigh max; do
         printf 'unexpected %s plan: %s\n' "$level" "$plan" >&2
         exit 1
     fi
+    plan_jobs=$(printf '%s\n' "$plan" | sed -E 's/.*normal -j([0-9]+).*/\1/')
     for id in "${ids[@]}"; do
         grep -F "fake makepkg $fixture/packages/$id" \
             "$fixture/state-$level/logs/$id.log" >/dev/null
+        if ! grep -F "MAKEFLAGS=-j$plan_jobs NINJAFLAGS=-j$plan_jobs GSA_BUILD_JOBS=$plan_jobs" \
+            "$fixture/state-$level/logs/$id.log" >/dev/null; then
+            printf 'lane %s did not export its -j%s budget under %s:\n' \
+                "$id" "$plan_jobs" "$level" >&2
+            cat "$fixture/state-$level/logs/$id.log" >&2
+            exit 1
+        fi
     done
     if find "$fixture/state-$level/logs" -maxdepth 1 -name '.lane*.result*' -print -quit | grep -q .; then
         printf 'lane result artifact remained for %s\n' "$level" >&2
