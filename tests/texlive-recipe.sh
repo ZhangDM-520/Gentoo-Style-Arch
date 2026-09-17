@@ -165,7 +165,7 @@ for script in texlive-fmtutil texlive-language texlive-updmap; do
 done
 
 # Topology registration.
-grep -Fxq "texlive-texmf|$recipe|texlive-texmf" "$root/config/packages.map" ||
+grep -Fxq "texlive-texmf|$recipe" "$root/config/packages.map" ||
     fail "not registered in config/packages.map"
 grep -Fxq 'texlive-texmf' "$root/config/groups/git.list" ||
     fail "not a member of the git group"

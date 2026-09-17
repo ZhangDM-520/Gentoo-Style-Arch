@@ -28,7 +28,7 @@ for i in $(seq 1 8); do
     ids+=("$id")
     mkdir -p "$fixture/packages/$id"
     printf 'pkgname=%s\n' "$id" >"$fixture/packages/$id/PKGBUILD"
-    printf '%s|packages/%s|%s\n' "$id" "$id" "$id" >>"$fixture/config/packages.map"
+    printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
     printf '%s\n' "$id" >>"$fixture/config/groups/git.list"
 done
 

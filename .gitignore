@@ -38,4 +38,3 @@ config-[0-9]*
 # Temporary metadata and local reports
 *.tmp.*
 .srcinfo.err
-Project-structure.txt

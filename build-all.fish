@@ -330,7 +330,10 @@ function load_project_config
         test -n "$line"; or continue
         string match -q '#*' -- "$line"; and continue
         set -l fields (string split '|' -- "$line")
-        if test (count $fields) -ne 3
+        # Exactly two fields: the pre-Git `.Stable/.Heavy/.Static/...` location
+        # of each recipe was dropped 2026-09-17 — nothing read that third
+        # column, and a record that carries it is drift, not provenance.
+        if test (count $fields) -ne 2
             ui_error "invalid package map record: $line"
             return 1
         end

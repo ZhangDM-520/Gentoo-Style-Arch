@@ -10,6 +10,66 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-17 — structure audit, phase B: control data, ignore rules, fixtures
+
+- **Symptom**: the map, the ignore rules, and the fixture set all still
+  described a tree that no longer existed, and nothing checked the invariants
+  they encoded.
+- **Dead control column removed**: `config/packages.map` carried a third field
+  (`original-path`, e.g. `.Stable/dbus-broker`). `load_project_config` stores
+  only `"$id|$relative_path"`, so the column was parsed and thrown away — its
+  only consumer was the loader's own `count $fields -ne 3` guard. It was also
+  internally inconsistent: 66 of 126 rows held a real pre-Git path while the
+  rest held the bare package name as filler, since the restructure added the
+  field to satisfy validation rather than to record anything. The map is now
+  `package-id|recipe-path` and the loader requires exactly two fields; a
+  three-field record is red-verified to fail with `invalid package map record`.
+  Nothing is lost — the same old paths survive in this journal.
+- **Integration caught by the new runner**: two recipe fixtures asserted the
+  old `id|path|id` shape and failed the moment the map changed. They now assert
+  `id|path`. This is the argument for running the whole battery rather than the
+  fixture that matches the recipe being edited.
+- **Dead ignore rule removed**: `.gitignore` excluded `Project-structure.txt`,
+  a file that exists nowhere in the tree — a rule left over from the pre-Git
+  workspace.
+- **Self-hiding ignore removed**: `packages/git/xorg-xwayland-git/.gitignore`
+  was a bare `*` with no negations, which also hid the file from itself — so it
+  could never be committed, and a clean checkout had no ignore rule at all. The
+  root rule `packages/*/*/*/` already covers the `xserver/` clone makepkg
+  fetches there; verified by recreating the directory and confirming
+  `git check-ignore -v` still matches it from the root rule while `git status`
+  stays clean.
+- **New fixture `tests/recipe-sources.sh`** (repo-wide, was only ever checked
+  per-recipe): for all 126 recipes it sources each `PKGBUILD` in a subshell —
+  the way the builder itself resolves sources — and asserts that every non-URL
+  `source=()` entry exists **and** is committed, that every `install=` script
+  exists and is committed (11 recipes; `${pkgbase}` is resolved), that no recipe
+  `.gitignore` hides itself, and that no ignore rule matches an already-tracked
+  file (`git ls-files -i -c --exclude-standard`). Baseline: 118 local sources,
+  11 install scripts, all tracked.
+  Red-verified one case at a time — nonexistent source, source present but
+  ignored, source present but untracked, nonexistent install script, untracked
+  install script, self-hiding ignore — each failing with its own message before
+  being restored. `DOWNLOADED` GNU patch files under `packages/stable/bash/` are
+  the single deliberate exemption.
+- **New runner `tests/run-all.sh`**: discovers every fixture (a new one needs no
+  edit here), runs them all, prints per-fixture results with the failing output
+  indented, and exits non-zero on any failure. Accepts a substring filter
+  (`tests/run-all.sh recipe`). Fixture permissions normalised to 755, and
+  `CONTRIBUTING.md`'s validation section now points at the runner instead of a
+  hand-maintained list that had already drifted.
+- **CONTRIBUTING hardened**: a new local asset must negate its recipe's
+  default-deny `*` rule in the same change (`git check-ignore -v <asset>` must
+  print nothing), an ignore file must never match itself, and the map's
+  two-field format is stated where maintainers add recipes.
+- **Validation**: `fish -n`; `--list`, `--audit` and all five `--dry-run` outputs
+  byte-identical to the pre-change baseline; `tests/run-all.sh` → 13 fixtures
+  pass; each new assertion red-verified then restored.
+- **Rule**: dead control data is worse than a missing feature — it looks like
+  authority. When a column, rule, or script has no reader, delete it in the same
+  change that retires the layout it describes; and never trust a per-recipe
+  guard to cover a repo-wide invariant.
+
 ## 2026-09-17 — structure audit, phase A: dead CLI surface and the legacy audit
 
 - **Symptom**: the builder carried an option nothing had needed since

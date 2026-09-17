@@ -84,7 +84,7 @@ grep -Fq 'chmod 4755' "$pkgbuild" || fail "chrome-sandbox is not made setuid"
 grep -Fq 'dist/linux-unpacked' "$pkgbuild" || fail "unpacked Electron tree unused"
 
 # Topology: the recipe must be reachable through the map and the git group.
-grep -Fxq "logseq-desktop-git|$recipe|logseq-desktop-git" \
+grep -Fxq "logseq-desktop-git|$recipe" \
     "$root/config/packages.map" || fail "not registered in config/packages.map"
 grep -Fxq 'logseq-desktop-git' "$root/config/groups/git.list" ||
     fail "not a member of the git group"

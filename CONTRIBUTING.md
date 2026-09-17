@@ -12,7 +12,18 @@ logs and profiles.
    source URLs intact.
 3. Put necessary local patches, hooks, install files, and desktop assets next
    to the recipe. Explain non-obvious compatibility patches in the recipe.
-4. Update `config/packages.map` only when adding or relocating a recipe.
+   **A new local asset must survive `.gitignore`.** Nine recipes default-deny
+   with a bare `*` (or `/*`) plus `!` negations, so a file added without a
+   matching negation is silently dropped from the commit while still building
+   locally — a clean checkout then fails with "was not found in the build
+   directory" (2026-09-16). Add the negation in the same change and confirm
+   with `git check-ignore -v <asset>` (no output = visible). Never let a recipe
+   `.gitignore` match itself: an ignore file that hides itself cannot be
+   committed, so on a clean checkout the rule is simply absent.
+4. Update `config/packages.map` only when adding or relocating a recipe. The
+   format is exactly two fields, `package-id|recipe-path`; the loader rejects
+   any other field count, and the map is the only place that binds an ID to a
+   path.
 5. Update the appropriate group file and `config/dependencies.conf` only after
    verifying the dependency with the package metadata and a build-order
    reason.
@@ -78,25 +89,23 @@ Before submitting a change, run:
 
 ```sh
 fish -n build-all.fish
-bash -n packages/path/to/PKGBUILD
-makepkg --printsrcinfo --dir packages/path/to
 fish build-all.fish --audit
 fish build-all.fish --list
 fish build-all.fish --dry-run --group git
 fish build-all.fish --dry-run --group stable
 fish build-all.fish --dry-run --group core
-bash tests/project-config.sh
-bash tests/gtk4-recipe-assets.sh
-bash tests/mkinitcpio-nvpcr.sh
-bash tests/glib2-pgo-transition.sh
-bash tests/cairo-pgo-transition.sh
-bash tests/gtk3-pgo-transition.sh
-bash tests/gtk4-pgo-transition.sh
-bash tests/xorg-xwayland-pgo-transition.sh
-bash tests/logseq-desktop-recipe.sh
-bash tests/texlive-recipe.sh
-bash tests/scheduler-intensity.sh
+bash -n packages/path/to/PKGBUILD
+makepkg --printsrcinfo --dir packages/path/to
+bash tests/run-all.sh
 ```
+
+`tests/run-all.sh` runs every fixture (discovered, so new ones need no edit
+here); pass a substring to narrow it, e.g. `bash tests/run-all.sh recipe`. The
+fixtures are non-mutating and cover the project configuration, recipe
+registration and assets, source sharing, PGO transitions, and the scheduler's
+resource profiles, so run the whole battery rather than only the file matching
+the recipe you touched — the map-format change of 2026-09-17 was caught by two
+unrelated recipe fixtures.
 
 Do not use a full real rebuild as a syntax check. For changes to scheduling,
 installation, cleanup, source sharing, or signals, add or run a focused
