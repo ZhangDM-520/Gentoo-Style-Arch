@@ -22,6 +22,27 @@ logs and profiles.
    makepkg --printsrcinfo > .SRCINFO
    ```
 
+### Source verification and signing keys
+
+1. Never disable verification with `--skippgpcheck` or remove `#signed` from a
+   source to work around a failure.
+2. A tag can be signed by a signing **subkey**, while the upstream
+   `validpgpkeys` array lists only the **primary** fingerprint. Compare
+   `git verify-tag <tag>` (or `gpg --verify`) against the maintainer's
+   published key:
+
+   ```sh
+   git verify-tag v42            # reports the key that made the signature
+   gpg --list-keys --with-subkey-fingerprint <primary-fingerprint>
+   ```
+
+3. Confirm the reported fingerprint belongs to a UID and subkey published by
+   the maintainer (for example `https://github.com/<maintainer>.gpg`), then add
+   that fingerprint to `validpgpkeys` with a comment naming the role. Import
+   the verified key locally so the build can check the signature.
+4. If a fingerprint cannot be confirmed against a published key, stop and
+   report the mismatch instead of trusting it.
+
 ## Optimization and trimming standard
 
 Use the host's `makepkg.conf` as the default optimization policy. Do not

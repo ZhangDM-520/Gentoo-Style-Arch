@@ -86,6 +86,12 @@
     pull). "Unhandled python OSError" from meson = masked environment error:
     force the traceback with MESON_FORCE_BACKTRACE=1 from INSIDE the
     failing context (e.g. exported in the PKGBUILD), never interactively.
+15. **Never bypass source verification** (09-17 mkinitcpio incident): a signed
+    tag may be signed by a SUBKEY while upstream `validpgpkeys` lists only the
+    primary key. `git verify-tag <tag>` names the actual signer; confirm that
+    fingerprint against the maintainer's published key, add it to
+    `validpgpkeys` with a role comment, and import the key. Never pass
+    `--skippgpcheck` or drop `#signed`.
 
 ## 2. Workspace overview
 

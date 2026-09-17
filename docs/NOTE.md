@@ -22,13 +22,27 @@ credentials, downloaded sources, or generated build output to this journal.
 - **Fix**: added a `mkinitcpio` stable recipe at `pkgrel=2` with a minimal
   patch that skips absent optional `.nvpcr` files, plus a regression fixture.
   The systemd bootloader choice remains unchanged.
+- **Second failure (source verification)**: the first rebuild of the new
+  recipe aborted with `unknown public key 6B5387E670A955AD`. The upstream
+  `validpgpkeys` array lists only nl6720's primary key; the `v42` tag is
+  signed by the newer NIST P-384 signing subkey
+  `73B3CABFC4BF3F207641BD4B6B5387E670A955AD`.
+- **Fix for the second failure**: verified the subkey fingerprint against the
+  maintainer's published key (GitHub `nl6720.gpg`, GitLab Arch, keys.openpgp.org),
+  added it to `validpgpkeys` next to the primary key, imported the verified key,
+  and re-ran the build. No verification was skipped.
 - **Validation**: the hook fixture passes with no `/usr/lib/nvpcr` directory;
-  the patched package metadata, project audit, and full recipe checks pass.
-  The patched package must be installed before regenerating the real Limine
-  initramfs images.
+  `git verify-tag v42` reports `Good signature`; the package builds, and the
+  installed `mkinitcpio 42-2` ships hooks with the guard at
+  `/usr/lib/initcpio/install/{sd-encrypt,systemd}`. `sudo mkinitcpio -P`
+  regenerated every preset (Limine) successfully, including
+  `linux-cachyos-rt-bore-lto` and stock `linux`.
 - **Rule**: optional initramfs payloads must be guarded at the hook boundary;
   do not make an unrelated bootloader feature mandatory to satisfy an
   optional glob.
+- **Rule**: when a signed tag fails verification, resolve the signer against
+  the maintainer's published key and add the signing subkey fingerprint to
+  `validpgpkeys`; never bypass the check.
 
 ## 2026-09-16 — Published recipe omitted by local ignore rule
 
