@@ -217,7 +217,7 @@ function configure_intensity -a intensity_level
             set -g _INTENSITY_LANE_CAP 3
             set -g _INTENSITY_CPU_PER_LANE 6
             set -g _INTENSITY_MEMORY_PER_LANE 6
-            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.6666666667
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.67
             set -g _INTENSITY_CORE_MEMORY_FACTOR 0.75
         case xhigh
             set -g _INTENSITY_LANE_CAP 4
@@ -229,7 +229,7 @@ function configure_intensity -a intensity_level
             set -g _INTENSITY_LANE_CAP 6
             set -g _INTENSITY_CPU_PER_LANE 2
             set -g _INTENSITY_MEMORY_PER_LANE 2
-            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.3333333333
+            set -g _INTENSITY_NORMAL_MEMORY_FACTOR 0.34
             set -g _INTENSITY_CORE_MEMORY_FACTOR 0.5
     end
 end
