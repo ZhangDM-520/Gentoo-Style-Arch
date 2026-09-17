@@ -760,11 +760,14 @@ end
 # Wipes everything makepkg pulled/built EXCEPT the built package archives
 # (those are -cc's job). Per package dir this removes:
 #   - src/, pkg/, build/ and _build/ staging dirs
-#   - the source git clones makepkg checked out next to the PKGBUILD
-#     (SRCDEST defaults to $startdir: cairo-git/cairo, packages/core/llvm-git/llvm-project, ...)
-#   - downloaded source tarballs (*.tar.* incl. .sig/.asc companions and .part)
+#   - the source VCS checkouts makepkg created next to the PKGBUILD
+#     (SRCDEST defaults to $startdir: cairo-git/cairo, packages/core/llvm-git/llvm-project,
+#     texlive-texmf/texmf-dist, ...)
+#   - downloaded source files (*.tar.* and *.whl, incl. .sig/.asc companions
+#     and .part)
 # Source names come from each PKGBUILD's source=() array, resolved in bash so
-# entries like git+${url}.git or name::URL match exactly what makepkg fetches.
+# entries like git+${url}.git, svn://…#revision=N or name::URL match exactly
+# what makepkg fetches.
 # Local support files (patches, hooks, keys/, .nvchecker.toml) are never touched.
 # Symlinks are NEVER deleted nor followed: deliberately shared sources — e.g.
 # llvm-project symlinked into spirv-llvm-translator-git to save storage — are
@@ -818,6 +821,21 @@ function nuclear_cleanup
                         set -a pkg_targets "$d/$name"
                     end
                 end
+            else if string match -qr '^svn\+|^svn://' -- "$url"
+                # SVN source → makepkg checks it out as $SRCDEST/<basename>
+                # (get_filename: basename with the fragment removed), keeping
+                # it in sync with `svn update -r` on rebuild. svn:// is used
+                # without a svn+ prefix by some recipes, hence both matches.
+                if test -z "$name"
+                    set name (basename (string replace -r '/$' '' -- (string replace -r '[?#].*$' '' -- (string replace -r '^svn\+' '' -- "$url"))))
+                end
+                if test -n "$name" -a "$name" != . -a "$name" != .. -a -d "$d/$name"
+                    if test -L "$d/$name"
+                        set -a pkg_skipped "$d/$name"
+                    else
+                        set -a pkg_targets "$d/$name"
+                    end
+                end
             else if string match -qr '^(https?|ftp)://' -- "$url"
                 # Remote file source → only downloaded archives; plain local
                 # entries (patches, hooks, keyrings) never match a URL here
@@ -825,8 +843,10 @@ function nuclear_cleanup
                 if test -z "$fname"
                     set fname (basename (string replace -r '[?#].*$' '' -- "$url"))
                 end
-                if string match -q '*.tar.*' -- "$fname"; and test -f "$d/$fname"; and not test -L "$d/$fname"
-                    set -a pkg_targets "$d/$fname"
+                if string match -q '*.tar.*' -- "$fname"; or string match -q '*.whl' -- "$fname"
+                    if test -f "$d/$fname"; and not test -L "$d/$fname"
+                        set -a pkg_targets "$d/$fname"
+                    end
                 end
                 for ext in sig asc sign
                     if test -f "$d/$fname.$ext"; and not test -L "$d/$fname.$ext"

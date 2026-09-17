@@ -1,0 +1,110 @@
+TeX Live collection set, built from the upstream TeX Live release in the
+TeX Live SVN repository.
+
+This is one pkgbase (`texlive-texmf`) that produces 23 packages:
+
+  texlive-meta + 22 non-lang collections:
+  basic bibtexextra binextra context fontsextra fontsrecommended fontutils
+  formatsextra games humanities latex latexextra latexrecommended luatex
+  mathscience metapost music pictures plaingeneric pstricks publishers xetex
+
+`texlive-meta` is the entry point: it depends on exactly those 22
+collections, so building this recipe installs the same set as
+`paru -S texlive-meta`. The builder installs every split of a pkgbase, so all
+23 packages are installed together.
+
+There is no `build()`: texmf-dist is data. `prepare()` splits the checked-out
+texmf tree into one directory per collection by reading
+`tlpkg/texlive.tlpdb`, and each `package_texlive-<collection>()` moves its
+directory into `$pkgdir`.
+
+Why the delivered set is trimmed
+--------------------------------
+
+Upstream also ships 17 `lang*` collections and `texlive-doc`. They are
+deliberately dropped here (see the header comment in the PKGBUILD): `lang*`
+splits and the documentation split are outside the maintained target, and
+`texlive-meta`'s dependencies only cover the non-lang collections, so removing
+them keeps every retained package content-identical to the Arch package of the
+same release. Dropping whole splits is the only optimisation that applies to a
+data package; there is no compiler, so no ISA, LTO, or PGO phase exists.
+
+`texmf-dist/doc/` and `texmf-dist/source/` are part of the single `texmf-dist`
+source, so they are still downloaded even though nothing packages them. That is
+upstream's layout; only the packaging work and the installed size are saved.
+
+Requirements
+------------
+
+  * `subversion` (makedepends) and a route to `svn://tug.org` on TCP 3690.
+    That is the only endpoint: `https://svn.tug.org/texlive/` (and
+    `http://tug.org/svn/texlive/`, which redirects to it) answer HTTP 406 to
+    `svn ls`, so it is not a Subversion-over-HTTP server. If port 3690 is
+    blocked there is no drop-in URL alternative for these three sources.
+  * `texlive-bin` from the repositories (installed at 2026.0-2.1 here). It
+    provides `/usr/bin/*`, which the pacman hooks installed by `texlive-basic`
+    and `texlive-context` call (mktexlsr, fmtutil, updmap, mtxrun). It is not
+    built by this workspace.
+  * The full source checkout is roughly 3.5 GB and stays in the recipe
+    directory (SRCDEST defaults to the recipe directory); the checkout is
+    cached and only updated on rebuild.
+
+Building
+--------
+
+  $ sudo fish build-all.fish --no-deps --install texlive-texmf
+
+Or by hand, from this directory:
+
+  $ makepkg -sr
+  $ pacman -U texlive-*.pkg.tar.zst
+
+After installing, the hooks regenerate the format and font maps. Verify with:
+
+  $ kpsewhich latex.ltx
+  $ texdoc --version
+
+Keep the workspace packages protected from repository upgrades (golden rule 9).
+The closure for this recipe is:
+
+  $ comm -23 \
+      <(bash -c 'source PKGBUILD && printf "%s\n" "${pkgbase}" "${pkgname[@]}"' | sort -u) \
+      <(pacman-conf IgnorePkg | sort -u)
+
+An empty result means every name is covered by `/etc/pacman.conf`.
+
+Updating to a new upstream release
+----------------------------------
+
+TeX Live publishes point releases inside a year (`2024.0`, `2024.1`, ...,
+`2026.1`), so this is a two-line bump:
+
+  1. Newest tag. `.nvchecker.toml` ships the same signal upstream tracks
+     (`regex = 'tags/texlive-([\d.]+)'` against
+     https://git.texlive.info/texlive/); by hand:
+
+       $ svn ls svn://tug.org/texlive/tags/ | sort -V | tail -1
+
+  2. Set `pkgver` to that release, then pin `_rev` to the revision you want to
+     build (Arch's value is the repository revision at packaging time) and
+     regenerate metadata:
+
+       $ svn info "svn://tug.org/texlive/tags/texlive-<version>/Master/tlpkg" |
+           sed -n 's/^Revision: //p'
+       $ makepkg --printsrcinfo > .SRCINFO
+
+     `Revision:` is the repository revision, which is what the three
+     `#revision=` pins mean. Do **not** use `Last Changed Rev`: it is only the
+     revision at which that one directory last changed, and TeX Live keeps
+     patching a tag after it is cut (for `texlive-2026.1`, `Last Changed Rev`
+     for `tlpkg` is 78234 while the pinned 78408 additionally contains the
+     changes from r78237 and r78408 under it).
+
+  `_rev` is used as the `#revision=` pin on all three SVN sources, so the
+  recipe always builds a fixed, reproducible tree; `svn checkout -r <rev>`
+  fails loudly if the pinned revision predates the tag.
+
+`list-collections` is the upstream helper that regenerates the `_collections`
+array from `tlpkg/texlive.tlpdb`. It needs an installed TeX Live, and it
+re-adds the `lang*` collections and `texlive-doc`: re-apply the trim from the
+PKGBUILD header after running it.

@@ -10,6 +10,67 @@ Older entries retain historical directory names where they explain an
 incident. They are not active configuration. Do not add private paths,
 credentials, downloaded sources, or generated build output to this journal.
 
+## 2026-09-17 — texlive-texmf recipe (TeX Live collections, meta closure)
+
+- **Task**: be able to build the 19 `texlive-*` packages that
+  `paru -S texlive-meta` would install, tracking upstream, in the `git` group.
+- **Finding**: those 19 packages are exactly `texlive-meta` plus its depends
+  closure, and the dependencies come from a single pkgbase. Arch builds the
+  whole collection set from `texlive-texmf`, whose three pinned SVN sources
+  (`Master/{texmf-dist,tlpkg,bin/x86_64-linux}`, `#revision=78408`) are split
+  per collection by `prepare()` from `tlpkg/texlive.tlpdb`. The per-collection
+  repositories visible in Arch's GitLab (`texlive-fontsextra`, ...) are stale
+  leftovers: the shipped `extra/texlive-*` packages come out of
+  `texlive-texmf`, and `texlive-doc`/`texlive-meta` are splits of it too.
+- **Decision**: keep the recipe trimmed to the maintained target —
+  `texlive-meta` plus the 22 non-lang collections. The 17 `lang*` collections
+  and `texlive-doc` are dropped together with their `texlive-langextra`
+  provides/replaces and the `groups=('texlive-lang')` branch. Only whole splits
+  are removed, so `pkgrel` stays 1 and every retained package remains
+  content-identical to the repository package at `2026.1-1`.
+- **Finding (SVN sources)**: `makepkg` accepts a plain `svn://…#revision=N`
+  source (no `svn+` prefix needed), caches the checkout in
+  `$SRCDEST/<basename>` and refreshes it with `svn update -r`. The builder's
+  `nuclear_cleanup` only understood `git+` VCS sources and `*.tar.*` downloads,
+  so the recipe's `texmf-dist`/`tlpkg`/`x86_64-linux` checkouts (~3.5 GB) and
+  the new `latexminted` wheel would have survived `--nuclear` forever. Fixed:
+  `svn://`/`svn+` sources are now resolved like `git+` ones (name derivation
+  matches makepkg's `get_filename`, verified against all three URLs) and
+  `*.whl` is cleaned with the other downloads.
+- **Finding (optimisation)**: `arch=(any)` means there is no compiler phase, so
+  the ISA/LTO/PGO playbook cannot apply. Debug packages are produced by the
+  strip tidy rule, so upstream's `options=(!strip)` also disables the debug
+  split, and the host `makepkg.conf` already sets `!debug`. The applicable
+  optimisation is scope, so the tlpdb splitting loop and the
+  `texmf-dist/doc/*` skip were left verbatim (changing them would alter package
+  contents) and `makedepends` stay at `subversion` only.
+- **Validation**: `bash -n`, `makepkg --printsrcinfo` parity, `fish -n`,
+  `--list`, `--audit` (no membership drift; dependency graph resolves) and
+  `--dry-run --group git` pass, and the new `tests/texlive-recipe.sh` fixture
+  is red-verified for a removed collection, a pkgver bump, a `_rev` bump, a
+  restored `texlive-doc` split, a dropped `!strip`, an added `build()` phase,
+  a removed SVN cleanup branch, and a missing support file.
+- **Live upstream check**: `2026.1` is the newest tag, and the pinned revision
+  resolves (`svn info -r 78408` succeeds for both
+  `tags/texlive-2026.1/Master/tlpkg` and `.../texmf-dist`). Two traps found
+  while checking, both now documented in `BUILDING`: `Revision:` from
+  `svn info` is the *repository* revision (80294 at check time) while
+  `Last Changed Rev` is only that directory's own last change (78234) — TeX
+  Live keeps patching a tag after it is cut (r78237 and r78408 touched files
+  under `tlpkg`), so the higher pin is deliberate; and an https fallback does
+  not exist (`https://svn.tug.org/texlive/` and `http://tug.org/svn/texlive/`
+  answer HTTP 406, so only `svn://` on port 3690 works). An earlier draft of
+  `BUILDING` claimed an https alternative and was corrected.
+- **Not run**: the full build (multi-GB checkout plus 23 splits), by request.
+- **Rule**: when a distribution builds many split packages from one pkgbase,
+  mirror that pkgbase rather than inventing per-split recipes; trim by deleting
+  whole splits together with their depends/provides/paths, and state explicitly
+  when a package has no compiler phase to optimise.
+- **Unrelated observation (not changed)**: `config/groups/physical-groups.list`
+  is dead weight — nothing globs `config/groups/`, the five group names are
+  hardcoded in `build-all.fish`, and the file is stale (it also lacks
+  `logseq-desktop-git`). Left untouched because it is outside this change.
+
 ## 2026-09-17 — logseq-desktop-git recipe (desktop, upstream HEAD)
 
 - **Task**: add a self-tracking Logseq desktop recipe to the `git` group that

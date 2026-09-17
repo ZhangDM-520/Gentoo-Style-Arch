@@ -101,7 +101,7 @@
   `config/dependencies.conf` are the scheduler's source of truth.
 - `.state/` (or `GSA_STATE_DIR`) contains logs, locks, lane results, and
   builder caches. makepkg source trees and archives are ignored runtime state.
-- The current logical groups are `git` (55), `stable` (29), `core` (41),
+- The current logical groups are `git` (56), `stable` (29), `core` (41),
   `misc` (1), and `third-party` (2). `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
 - No upstream checkout, package archive, downloaded signature, PGP cache,
@@ -218,6 +218,12 @@ OpenShadingLanguage -> blender.
   logseq-desktop-git additionally bundles `master` (2.x) which embeds an
   OCaml/Melange CLI runtime — the opam switch lives under `$srcdir` and pins
   OCaml 5.1.1 to match upstream CI.
+- **TeX Live data packages** (texlive-texmf): `arch=(any)`, so there is no
+  compiler and no ISA/LTO/PGO phase at all. The recipe keeps upstream's
+  `!strip`, which also skips the strip/debug tidy pass, and optimises by scope
+  only (whole splits dropped with their depends/provides/paths). It is the only
+  recipe using SVN sources; `nuclear_cleanup` treats `svn://`/`svn+` like
+  `git+` and also removes downloaded `*.whl` files.
 
 ## 5. Pending tasks
 

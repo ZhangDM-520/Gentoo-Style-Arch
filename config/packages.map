@@ -110,6 +110,7 @@ rust-bindgen-git|packages/git/rust-bindgen-git|rust-bindgen-git
 scx-scheds-git|packages/git/scx-scheds-git|scx-scheds-git
 scx-tools-git|packages/git/scx-tools-git|scx-tools-git
 seatd-git|packages/git/seatd-git|seatd-git
+texlive-texmf|packages/git/texlive-texmf|texlive-texmf
 vscodium-insiders-git|packages/git/vscodium-insiders-git|vscodium-insiders-git
 vulkan-headers-git|packages/git/vulkan-headers-git|vulkan-headers-git
 vulkan-icd-loader-git|packages/git/vulkan-icd-loader-git|vulkan-icd-loader-git
