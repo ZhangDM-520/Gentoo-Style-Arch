@@ -37,6 +37,10 @@ kept in the harness's `$TMPDIR` trees instead).
 | `CONTRIBUTING.md` | Recipe-change checklist, trimming standard, source-verification rules. |
 | `SECURITY.md` | Trust model (a recipe executes arbitrary shell), safe-operation rules, what must never be committed. |
 
+`docs/NOTE.md` is 2 100+ lines and keeps growing: grep a dated section rather
+than reading it end to end, and remember its naming-history table when an old
+entry mentions paths that no longer exist.
+
 ## Commands
 
 Shells are split deliberately: **the builder and its CLI are fish**
@@ -79,6 +83,23 @@ applies to many packages takes its package/project as `$1`/`$2`
 wrappers that `exec` it with their package pair), and `tests/assets/` is *not* discovered —
 it holds frozen reference material such as the previous split-loop
 implementation, so nothing there runs standalone.
+
+Scheduler, install and cleanup fixtures never exercise the real repository.
+They build a synthetic workspace under `$TMPDIR` — copy `build-all.fish`, then
+write a minimal `config/` (all five group files, an empty `dependencies.conf`,
+a hand-written `packages.map`, one-line `PKGBUILD`s) — and prefix `PATH` with
+stub `makepkg`/`sudo`/`pacman` executables. The fixture drives those stubs
+through variables the *stub* defines, not the builder: `GSA_FAKE_SUDO_MODE`,
+`GSA_FAKE_SUDO_STATE`, `GSA_FAKE_SUDO_LOG`, `GSA_FAKE_BUILD_SECONDS`,
+`GSA_FAKE_MARKER_DIR`, `GSA_FAIL_PACKAGE`, `GSA_SPAWN_LOG`.
+`tests/sudo-keepalive.sh` also stubs `date`, so the 150 s sudo keepalive
+elapses on a virtual clock inside a run that lasts seconds. Those `GSA_FAKE_*`
+names are fixture-side only: the builder honours exactly the eight variables
+`--help` lists — `GSA_LANES`, `GSA_JOBS`, `GSA_INTENSITY`, `GSA_CPU_THREADS`,
+`GSA_MEMORY_GIB`, `GSA_STATE_DIR`, `GSA_BUILD_JOBS`, `GSA_TARGET_CPU` — and
+`GSA_CPU_THREADS`/`GSA_MEMORY_GIB` are the deterministic way to pin a profile
+assertion. Prefer expressing a scenario with a stub over adding a test knob to
+the builder.
 
 Validation for a change:
 
@@ -128,12 +149,15 @@ only modes needing `rg`/`git`. `--allow-broken-rustc` bypasses the rustc
 sanity probe that guards against LLVM-snapshot ABI skew — it is an escape hatch
 for runs that compile no Rust, not a way past a real ABI mismatch.
 
-The remaining build-time flags: `-c`/`--clean` (wipe artifacts first),
-`-s`/`--skip` (skip a package whose `.pkg.tar.zst` is newer than its
-`PKGBUILD` — the resume idiom), `--no-sync` (stop auto-updating stable
-versions from the repos), `--intensity LEVEL`, `--lanes`, `--jobs`. Note the
-short-flag overloads: `-s` is *not* install, `-l` is `--list`, `-n` is
-`--dry-run`, and `-c`/`-cc`/`-ccc` are three different strengths of wipe.
+The remaining build-time flags: `-s`/`--skip` (skip a package whose
+`.pkg.tar.zst` is newer than its `PKGBUILD` — the resume idiom), `--no-sync`
+(stop auto-updating stable versions from the repos), `--intensity LEVEL`
+(`low`…`max`, default `xhigh`), `--lanes`, `--jobs`. Note the short-flag
+overloads: `-s` is *not* install, `-l` is `--list`, `-n` is `--dry-run`, and
+the three wipe strengths are `-c`/`--clean` (`src/`, `pkg/`, `build/` and the
+archive of each selected package, run before the skip check so it forces a
+rebuild), `-cc`/`--cleanup` (every built archive in the workspace) and
+`-ccc`/`--nuclear` (pulled sources as well).
 Installs run in the lanes as `sudo -n`, so the dispatcher keeps a credential
 warm and refuses to start a long run when installs are impossible; `sudo fish
 build-all.fish …` starts a root supervisor while `makepkg` still runs as the
@@ -172,9 +196,11 @@ Consequences worth internalising:
 - The loader validates the map, all five group files, the dependency graph, and
   a complete topological sort on **every** invocation. One malformed record
   breaks `--list`, `--help`, and every build, not just the affected package.
-- Do not infer build order from directory names. `core` is a logical group that
-  deliberately overlaps `packages/stable/` and `packages/git/` recipes whose
-  ABI must move as one batch.
+- Do not infer build order or group membership from directory names. `core` is
+  a logical group that deliberately overlaps the physical categories:
+  `autofdo-git` and `libclc-git` are `packages/git/` recipes, while
+  `hip-runtime`, `hsa-rocr` and `openssl` are `packages/stable/` recipes — all
+  five are core members whose ABI must move as one batch.
 - Scheduler invariants are part of the maintainer contract: selection is
   mandatory (a bare invocation never starts a rebuild), `-i` installs each
   package before its dependents compile, core packages run alone with a
@@ -188,6 +214,9 @@ Consequences worth internalising:
 - Resource planning is entirely host-derived; the profiles and formulas are in
   `docs/portability.md`. Never predict a plan — read the `parallelism:` line the
   builder prints. `--lanes`/`--jobs` override `--intensity`.
+- `build-all.fish` is one ~3 100-line fish program with no includes, so there
+  is no module to look for: every helper, the lane dispatcher, and the
+  `INTENSITY_*` constants (inside `configure_intensity`) live in that file.
 
 ## Conventions
 
@@ -206,6 +235,13 @@ from every recipe and diffing against `pacman-conf IgnorePkg | sort -u` with
 keeps stale option values. After *any* `meson-git` upgrade, purge every build
 dir whose `meson-info.json` version differs before rebuilding — build dirs sit
 at arbitrary depths, so a `maxdepth` sweep misses them.
+
+**Bootloader boundary.** The set disables systemd's bootloader integration
+(this project boots Limine), so stock `mkinitcpio` 42-1's systemd hooks try to
+add the optional `/usr/lib/nvpcr/*.nvpcr` glob literally. The `mkinitcpio`
+recipe here guards that absent optional input instead. Do not re-enable the
+systemd bootloader feature to satisfy it — rebuild the guard:
+`fish build-all.fish --no-deps --install mkinitcpio`, then `sudo mkinitcpio -P`.
 
 **Local assets and ignore rules.** Two ignore layers must both pass. Nine
 recipes default-deny with a bare `*` plus `!` negations, so a new file without
