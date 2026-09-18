@@ -55,7 +55,8 @@ Options:
                        froze the machine and is ~20x the work)
   --stage STAGE        parse | move | full   (default: full)
   --scratch DIR        parent for the farm (default: $XDG_CACHE_HOME or /tmp)
-  --keep               keep the scratch dir and print its path
+  --keep               keep the scratch dir even after a clean run; an aborted
+                       or failed run always keeps it and prints the path
   --limit-mem GiB      cgroup MemoryMax                 (default: 4)
   --limit-cpu PERCENT  cgroup CPUQuota                  (default: 400%)
   --limit-io-weight N  cgroup IOWeight 1..10000         (default: 10)
@@ -78,6 +79,11 @@ Options:
                        This is how the real build gets measured — e.g.
                        --watch-cmd 'makepkg -si' --cwd <recipe> --unsafe
   --cwd DIR            working directory for --watch-cmd (default: --recipe)
+  --watch-pid PID      attach to a process that is ALREADY running: sample the
+                       machine (and that process's state) until it exits. No
+                       cgroup (an existing process cannot be confined) and no
+                       kill — the abort rules only stop the sampling. This is how
+                       a build you started by hand gets measured
   --legacy-loop        run the PRE-2026-09-18 split loop (frozen in
                        tests/assets/texlive-split-legacy.sh) instead of the
                        recipe's current one. This is the implementation that
@@ -116,6 +122,7 @@ full_farm=0
 rebuild_farm=0
 legacy_loop=0
 watch_cmd=""
+watch_pid=""
 cwd_dir=
 
 while (($#)); do
@@ -140,6 +147,7 @@ while (($#)); do
         --unsafe) unsafe=1; shift ;;
         --yes-unsafe) yes_unsafe=1; shift ;;
         --watch-cmd) watch_cmd=${2:?--watch-cmd needs a value}; shift 2 ;;
+        --watch-pid) watch_pid=${2:?--watch-pid needs a value}; shift 2 ;;
         --cwd) cwd_dir=${2:?--cwd needs a value}; shift 2 ;;
         --legacy-loop) legacy_loop=1; shift ;;
         --full-farm) full_farm=1; shift ;;
@@ -163,6 +171,17 @@ recipe_dir=$(cd "$recipe_dir" && pwd)
 [[ -n $cwd_dir ]] || cwd_dir=$recipe_dir
 [[ -d $cwd_dir ]] || die "--cwd $cwd_dir is not a directory"
 cwd_dir=$(cd "$cwd_dir" && pwd)
+
+# ─── Attach mode: sample a process that is already running ─────────────────
+if [[ -n $watch_pid ]]; then
+    kill -0 "$watch_pid" 2>/dev/null || die "no such process: --watch-pid $watch_pid"
+    watch_cmd="(attached to pid $watch_pid)"
+    # An existing process cannot be moved into our cgroup, so limits are moot and
+    # the abort rules can only stop the sampling — the point of this mode is the
+    # sampler plus the observed process's state.
+    unsafe=1
+    yes_unsafe=1
+fi
 
 # ─── Resolve the tree (borrowed read-only through hardlinks) ────────────────
 # --watch-cmd measures somebody else's command and needs none of this, so the
@@ -245,11 +264,18 @@ if [[ -n $watch_cmd ]]; then
     tree="$run"
     mkdir -p "$tree"
     workload="$run/workload.sh"
-    {
-        printf '%s\n' '#!/usr/bin/env bash'
-        printf 'cd %q || exit 1\n' "$cwd_dir"
-        printf '%s\n' "$watch_cmd"
-    } >"$workload"
+    if [[ -n $watch_pid ]]; then
+        {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf 'while kill -0 %s 2>/dev/null; do sleep 1; done\n' "$watch_pid"
+        } >"$workload"
+    else
+        {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf 'cd %q || exit 1\n' "$cwd_dir"
+            printf '%s\n' "$watch_cmd"
+        } >"$workload"
+    fi
     chmod +x "$workload"
 else
 
@@ -433,7 +459,15 @@ sample_line() { # sample_line <elapsed> -> TSV row, sets sample_* globals
     local writeback_mib=$(awk -v k="${writeback_kb:-0}" 'BEGIN { printf "%.0f", k/1024 }')
     local zram_mem=0
     [[ -r $zram_stat ]] && zram_mem=$(awk '{print $3}' "$zram_stat")
-    local progress=$(tail -c 300 "$loop_out" 2>/dev/null | tr '\r' '\n' | grep -v '^$' | tail -1 | tr '\t' ' ' | cut -c1-60)
+    local progress
+    if [[ -n $watch_pid ]]; then
+        # 'D' here, sustained, is the signature we are hunting for.
+        progress=$(awk -v pid="$watch_pid" '{ i=index($0,")"); printf "pid=%s state=%s", pid, substr($0,i+2,1) }' \
+            "/proc/$watch_pid/stat" 2>/dev/null)
+        [[ -n $progress ]] || progress="pid=$watch_pid gone"
+    else
+        progress=$(tail -c 300 "$loop_out" 2>/dev/null | tr '\r' '\n' | grep -v '^$' | tail -1 | tr '\t' ' ' | cut -c1-60)
+    fi
 
     sample_dcount=$dcount
     sample_psi_io_full=$psi_io_full
@@ -601,7 +635,10 @@ else
     printf 'probe: clean — no threshold tripped\n'
 fi
 
-if ((keep)); then
+# Evidence outlives the run whenever something went wrong: an aborted or failed
+# run is exactly the one whose samples are wanted afterwards, and a scratch dir
+# in a shared /tmp is too easy to lose (it has been lost that way once).
+if ((keep)) || ((aborted)) || ((workload_rc != 0)); then
     printf 'probe: kept %s\n' "$run"
 else
     rm -rf -- "$scratch"
