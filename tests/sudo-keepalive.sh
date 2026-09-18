@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Note: this fixture leans on the dispatcher's 0.5 s polling and on lane
+# children surviving long enough to write their result. Under a machine-wide
+# process storm (a 105k-file experiment spewing ~300k spawns) a lane can fail to
+# fork and this fixture reports the run as failed — seen once, 2026-09-18.
+# Re-run it on an idle machine before believing a failure here.
+#
 # Sudo liveness for unprivileged -i runs. Lane installs run `sudo -n` (lane
 # children have no tty), so the dispatcher must decide, without ever hanging:
 # is sudo still usable, and what happens when it is not? This fixture pins

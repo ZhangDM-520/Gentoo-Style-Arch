@@ -18,6 +18,44 @@ texmf tree into one directory per collection by reading
 `tlpkg/texlive.tlpdb`, and each `package_texlive-<collection>()` moves its
 directory into `$pkgdir`.
 
+How the split loop works
+-----------------------
+
+The loop is the recipe's hot path and is deliberately batched — measured, not
+assumed: rescanning the 18.7 MB tlpdb per package costs 4,115 full passes, and
+one `mkdir -p` + one `mv` per file costs 301k process spawns for the 150k
+runfiles. Instead:
+
+  * `awk` cuts the tlpdb into one file per package section in a single pass
+    (`.tlpdb/blocks/` under `$srcdir`, removed when `prepare()` ends);
+  * runfiles, `execute AddFormat`/`addMap`/`AddHyphen` and the `bin/x86_64-linux`
+    links are extracted from those sections with shell builtins, so a package
+    costs no process at all;
+  * renames are deferred and applied per collection, sorted by destination, so
+    one `mv -t` moves every file of a directory (500 per call, in case a single
+    directory — `fonts/tfm/google/noto` — holds thousands).
+
+That is 0.94 s instead of 13.79 s for `fontsrecommended` (5,299 files, 14.7x),
+and 37 instead of 2,482 process spawns on the synthetic fixture tree.
+
+**The split moves files, it does not copy them.** `texmf-dist` is therefore
+consumed: running `prepare()` a second time over the same tree would produce
+packages with files silently missing. `prepare()` counts every runfiles entry
+that is absent and refuses to continue (naming the count, five of the paths, and
+the remedy — `rm -rf src`, which makes makepkg check out a fresh tree). A clean
+checkout has zero absent entries; this checkout had 13,870 of 150,746.
+
+`tests/texlive-split.sh` pins all of that: it runs the previous implementation
+(frozen as `tests/assets/texlive-split-legacy.sh`) and the current one over the
+same synthetic tree and requires identical tree listings (type, mode, path,
+symlink target), identical content hashes, identical `pkgdesc-*`/`depends-*`/
+`packages-*`/`.fmts`/`.maps`/`.dat*`, a large spawn reduction, and the refusal
+on a depleted tree.
+
+Disk cost is worth knowing before starting: the SVN working copies carry a
+9.1 GB `.svn/pristine` shadow of every file, so `texmf-dist` occupies ~19 GB and
+`src/texmf-dist` another ~19 GB.
+
 Why the delivered set is trimmed
 --------------------------------
 
@@ -45,9 +83,10 @@ Requirements
     provides `/usr/bin/*`, which the pacman hooks installed by `texlive-basic`
     and `texlive-context` call (mktexlsr, fmtutil, updmap, mtxrun). It is not
     built by this workspace.
-  * The full source checkout is roughly 3.5 GB and stays in the recipe
-    directory (SRCDEST defaults to the recipe directory); the checkout is
-    cached and only updated on rebuild.
+  * The checkout stays in the recipe directory (SRCDEST defaults to it) and is
+    cached between builds. Expect ~38 GB on disk, not the ~3.5 GB of data: the
+    three SVN working copies keep a 9.1 GB `.svn/pristine` shadow each, so
+    `texmf-dist` costs ~19 GB and `src/texmf-dist` another ~19 GB.
 
 Building
 --------

@@ -81,16 +81,48 @@ prepare() {
   cp texmf-dist/web2c/{fmtutil.cnf,updmap.cfg,texmf.cnf} .
   cp texmf-dist/tex/generic/config/language.{dat,dat.lua,def} .
   
-  # Split files per package
+  # Split files per package.
+  #
+  # tlpkg/texlive.tlpdb is 18.7 MB. The direct implementation rescans all of it
+  # for every collection and every package (4,115 full passes, ~1.5 min of pure
+  # scanning) and then moves each file with its own `mkdir -p` + `mv` (301k
+  # process spawns for the 150k runfiles, ~6 min). This version cuts the package
+  # sections in ONE awk pass, extracts them with shell builtins, and issues the
+  # renames per destination directory in batches — roughly 10k spawns in total.
+  # Semantics are unchanged: same collection membership, same append order for
+  # depends-/packages-, same format/map/hyphen extraction, same doc skip, same
+  # bin-script symlinks. tests/texlive-split.sh diffs this implementation against
+  # the previous one on a synthetic tlpdb to keep it that way.
+  #
+  # The split MOVES files out of texmf-dist, so it cannot be run twice over the
+  # same tree: a second pass would silently produce packages with files missing.
+  # That case is detected and refused at the end of prepare().
+  _tl_root="${srcdir}/.tlpdb"
+  rm -rf "$_tl_root"
+  mkdir -p "$_tl_root/blocks"
+  awk -v dir="$_tl_root/blocks" '
+      /^name /   { name = substr($0, 6); next }
+      /^$/       { name = ""; next }
+      name != "" { print >(dir "/" name) }
+  ' tlpkg/texlive.tlpdb
+  _tl_planned=0
+  _tl_missing=0
+
   for _coll in ${_collections[@]}; do
     echo -ne "splitting collection ${_coll}"
-    # extract description
-    _desc=`sed -e "0,/^name collection-${_coll}$/d;/^$/Q" tlpkg/texlive.tlpdb | sed -ne 's|^shortdesc ||p'`
+    # extract description and depends
+    _desc=""
+    _pkgs=""
+    while IFS= read -r _line; do
+      case $_line in
+        'shortdesc '*) _desc="${_line#shortdesc }" ;;
+        'depend '*)    _pkgs+=" ${_line#depend }" ;;
+      esac
+    done <"$_tl_root/blocks/collection-${_coll}"
     echo $_desc > pkgdesc-$_coll
-    # extract depends
-    _pkgs=`sed -e "0,/^name collection-${_coll}$/d;/^$/Q" tlpkg/texlive.tlpdb | sed -ne 's|^depend ||p'`
     _prog=0
-    _total=`echo $_pkgs | wc -w`
+    _pkgs_arr=($_pkgs)
+    _total=${#_pkgs_arr[@]}
     for _pkg in $_pkgs; do
       _prog=$(($_prog+1))
       echo -ne "\rsplitting collection ${_coll} ($_prog/$_total)"
@@ -99,17 +131,50 @@ prepare() {
         echo ${_pkg/collection-/texlive-} >> depends-$_coll
       else
         echo $_pkg >> packages-$_coll
-        # move files to the corresponding subdir
-        _split=`sed -e "0,/^name ${_pkg}$/d;/^$/Q" tlpkg/texlive.tlpdb`
-        _files=`echo "$_split" | sed -e "0,/^runfiles/d;/^[a-z]/Q" | grep texmf-dist` || true
+        # move files to the corresponding subdir. The section is read from the
+        # block cut above; the runfiles scan and the rename itself are done with
+        # shell builtins and batched in _tl_apply_plan, so neither costs a
+        # process per file or a full scan of the tlpdb per package.
+        _split=""
+        _block="$_tl_root/blocks/$_pkg"
+        [[ -r $_block ]] && _split=$(<"$_block")
+        _files=""
+        _in_runfiles=0
+        _fmts=""
+        _maps=""
+        _langs=""
+        while IFS= read -r _line; do
+          if [[ $_in_runfiles == 0 ]]; then
+            [[ $_line == runfiles* ]] && _in_runfiles=1
+            continue
+          fi
+          [[ $_line == ' '* ]] || break          # end of the runfiles list
+          _line=${_line# }
+          [[ $_line == *texmf-dist* ]] && _files+=" $_line"
+        done <<<"$_split"
+        # extract formats, maps and hyphen rules (substring tests, as before)
+        while IFS= read -r _line; do
+          case $_line in
+            *'execute AddFormat'*)      _fmts+="${_fmts:+$'\n'}$_line" ;;
+            *'execute addKanjiMap'*)    _maps+="${_maps:+$'\n'}$_line" ;;
+            *'execute addMixedMap'*)    _maps+="${_maps:+$'\n'}$_line" ;;
+            *'execute addMap'*)         _maps+="${_maps:+$'\n'}$_line" ;;
+            *'execute AddHyphen'*)      _langs=1 ;;
+          esac
+        done <<<"$_split"
         for _file in $_files; do
           # some modules include docs in runfiles
           [[ $_file == texmf-dist/doc/* ]] && continue
-          mkdir -p texlive-$_coll/$(dirname $_file)
-          mv $_file texlive-$_coll/$(dirname $_file)
+          _tl_planned=$(($_tl_planned+1))
+          if [[ -e $_file || -L $_file ]]; then
+            # deferred: renamed in batches per destination directory below
+            printf '%s\t%s\n' "texlive-$_coll/${_file%/*}" "$_file" >>"$_tl_root/plan-$_coll"
+          else
+            _tl_missing=$(($_tl_missing+1))
+            echo "$_file" >>"$_tl_root/missing-$_coll"
+          fi
         done
         # extract formats
-        _fmts=`echo "$_split" | grep "execute AddFormat"` || true
         if [[ ! -z "$_fmts" ]]; then
           echo "$_fmts" | while read -r _fmt; do
             _name=`echo $_fmt | sed 's|.* name=\(\S*\).*|\1|'`
@@ -118,14 +183,12 @@ prepare() {
           done
         fi
         # extract maps
-        _maps=`echo "$_split" | grep -E "execute add(Kanji|Mixed|)Map"` || true
         if [[ ! -z "$_maps" ]]; then
           echo "$_maps" | while read -r _map; do
             grep "${_map/execute add/}" updmap.cfg >> $_coll.maps
           done
         fi
         # extract hyphen rules
-        _langs=`echo "$_split" | grep "execute AddHyphen"` || true
         if [[ ! -z "$_langs" ]]; then
           sed -e "0,/from ${_pkg}:/d;/\%/Q" language.dat >> $_coll.dat
           sed -re "0,/from ${_pkg}:/d;/(^--|^})/Q" language.dat.lua >> $_coll.dat.lua
@@ -133,7 +196,14 @@ prepare() {
         fi
         # extract linked scripts
         if [[ ${_pkg} != psutils && "$_split" == *${_pkg}.ARCH* ]]; then
-          _links=`sed -e "0,/^name ${_pkg}.x86_64-linux$/d;/^$/Q" tlpkg/texlive.tlpdb | grep "bin/x86_64-linux" | sed -e 's|bin/x86_64-linux||g'`
+          _x86=""
+          _x86_block="$_tl_root/blocks/${_pkg}.x86_64-linux"
+          [[ -r $_x86_block ]] && _x86=$(<"$_x86_block")
+          _links=""
+          while IFS= read -r _line; do
+            [[ $_line == *bin/x86_64-linux* ]] || continue
+            _links+=" ${_line//bin\/x86_64-linux/}"
+          done <<<"$_x86"
           for _link in $_links; do
             if [[ $(readlink -m x86_64-linux/$_link) == */scripts/* ]]; then
               mkdir -p ${_coll}-bin
@@ -144,8 +214,47 @@ prepare() {
         fi
       fi
     done
+    # Apply this collection's deferred renames: sorted by destination so one
+    # `mv -t` serves a whole directory, with all destination directories created
+    # by a single batched xargs run.
+    if [[ -s "$_tl_root/plan-$_coll" ]]; then
+      sort -k1,1 "$_tl_root/plan-$_coll" >"$_tl_root/plan-$_coll.sorted"
+      cut -f1 "$_tl_root/plan-$_coll.sorted" | uniq | xargs -r -d '\n' -n 100 mkdir -p --
+      _dest=""
+      _srcs=()
+      while IFS=$'\t' read -r _dest_next _src; do
+        if [[ -z "$_dest" || $_dest_next != "$_dest" || ${#_srcs[@]} -ge 500 ]]; then
+          if ((${#_srcs[@]})); then
+            mv -t "$_dest" "${_srcs[@]}" || true
+            _srcs=()
+          fi
+          _dest=$_dest_next
+        fi
+        _srcs+=("$_src")
+      done <"$_tl_root/plan-$_coll.sorted"
+      if ((${#_srcs[@]})); then
+        mv -t "$_dest" "${_srcs[@]}" || true
+      fi
+      rm -f -- "$_tl_root/plan-$_coll.sorted"
+    fi
     echo
   done
+
+  # Every runfiles entry must have been in the tree. A gap means texmf-dist was
+  # already split by an interrupted run: the packages would silently be missing
+  # files, so stop with the remedy rather than packaging them.
+  if ((_tl_missing > 0)); then
+    echo >&2
+    echo "==> ERROR: $_tl_missing of $_tl_planned runfiles are missing from texmf-dist." >&2
+    echo "    prepare() MOVES files out of texmf-dist, so this working copy has" >&2
+    echo "    already been split and cannot be split again in place; packages" >&2
+    echo "    built from it would silently lack files." >&2
+    echo "    Start from a clean tree:" >&2
+    echo "        rm -rf src && makepkg -f" >&2
+    head -5 -- "$_tl_root/missing-"* >&2 2>/dev/null
+    return 1
+  fi
+  rm -rf "$_tl_root"
 }
 
 _package() {
