@@ -5,6 +5,22 @@ automatic-parallelism build scheduler. The repo holds recipes and topology
 only — never upstream sources, package archives, downloaded signatures, PGP
 caches, or build output.
 
+## Relationship to the host's global instruction
+
+The host loads this file **before** its global agent instruction, so where the two overlap
+the global rule is the baseline and this file is its repo-specific refinement. Reviewed
+against the global rules on 2026-09-18: the shell-boundary hazard (fish login shell vs bash
+tool-call shells), the agent-shell git hardening (`GIT_CONFIG_COUNT=0` for bare-repo and
+makepkg VCS operations), the concurrency check before a heavy build, the validation standard,
+and the never-bypass-checksums-or-signatures rule all appear below in their concrete form
+here, and nothing in this file contradicts them.
+
+Two global rules are inherited unchanged because this repo has no variant of them: the commit
+routine (a completed task ends in its own descriptive commit, pushed, carrying the
+`Co-authored-by:` trailer the host specifies) and the workspace-isolation rule (canonical
+edits stay in this repository; scratch goes to `/tmp` or `~/Workspace/`, with fixture scratch
+kept in the harness's `$TMPDIR` trees instead).
+
 ## Read before changing anything
 
 | File | Role |
