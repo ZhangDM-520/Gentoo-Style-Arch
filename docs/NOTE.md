@@ -32,6 +32,31 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-18 — copilot-instructions told agents to commit, not to ask
+
+- **Symptom**: the agent instruction file stated that the host's commit routine
+  was inherited unchanged and that "a completed task ends in its own descriptive
+  commit, pushed". The host file at `~/.copilot/copilot-instructions.md` says
+  the opposite — always ask whether to commit, commit & push, or leave the tree
+  alone — so an agent reading only the repository instructions would commit and
+  push unprompted.
+- **Root cause**: commit 18d1011 added the host-comparison section and folded
+  the commit routine into the inherited-unchanged list while introducing it.
+  Nothing else in the file addressed committing, so the mischaracterisation
+  stood as the only statement on the subject.
+- **Fix**: the relationship section now claims workspace isolation alone as
+  inherited unchanged, and a new **Committing** convention under Conventions
+  restates the host rule concretely — ask first and let only the answer decide,
+  never treat a green fixture battery as consent, and carry the host's trailer
+  verbatim on a body shaped like the rest of the log.
+- **Validation**: the trailer string compares byte-for-byte identical to the
+  host file; `bash tests/run-all.sh` passes (16 fixtures) and no fixture reads
+  the instruction file, so the change is documentation-only; `docs/MEMORY.md`
+  carries no competing commit rule.
+- **Rule**: when this file classifies a host rule as inherited unchanged, read
+  the host wording first. An ask-first rule cannot be restated as an automatic
+  action, and a prompt is not a default.
+
 ## 2026-09-18 — logseq: pnpm installed the repo root instead of `static`
 
 - **Symptom**: after the Java-virtual fix (below) the build ran every bundle

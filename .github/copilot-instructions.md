@@ -15,11 +15,12 @@ makepkg VCS operations), the concurrency check before a heavy build, the validat
 and the never-bypass-checksums-or-signatures rule all appear below in their concrete form
 here, and nothing in this file contradicts them.
 
-Two global rules are inherited unchanged because this repo has no variant of them: the commit
-routine (a completed task ends in its own descriptive commit, pushed, carrying the
-`Co-authored-by:` trailer the host specifies) and the workspace-isolation rule (canonical
-edits stay in this repository; scratch goes to `/tmp` or `~/Workspace/`, with fixture scratch
-kept in the harness's `$TMPDIR` trees instead).
+One global rule is inherited unchanged because this repo has no variant of it: workspace
+isolation — canonical edits stay in this repository, scratch goes to `/tmp` or
+`~/Workspace/`, and fixture scratch stays in the harness's `$TMPDIR` trees instead. The
+commit routine also comes from the host's global instruction, but it is restated concretely
+under **Committing** in Conventions below, because the global wording asks for permission
+rather than granting it.
 
 ## Read before changing anything
 
@@ -312,6 +313,15 @@ change earns a dated `NOTE.md` section: symptom → root cause → fix →
 validation → durable rule. Update `MEMORY.md`'s maintainer rules when an
 operational contract changes. Keep private paths, credentials, host logs, and
 generated artifacts out of both.
+
+**Committing.** The host's commit rule is a prompt, not a default: once a change
+is finished, ask whether to commit, commit-and-push, or leave the tree alone,
+and let only that answer decide. A green fixture battery is evidence, not
+consent — never commit unprompted, including for documentation-only changes.
+Every commit carries the descriptive body the log already uses (what changed →
+why → how it was validated) plus the trailer
+`Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`, which
+the global instruction specifies verbatim.
 
 **ABI-coupled batches.** LLVM snapshots have no stable C++ ABI: after an
 `llvm-git` bump, rebuild Rust, Mesa, SPIR-V, libclc, OpenShadingLanguage and
