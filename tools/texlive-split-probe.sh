@@ -109,6 +109,7 @@ max_d=25
 max_psi_io=50
 min_mem_gib=2
 max_await=500
+max_dirty=8
 unsafe=0
 yes_unsafe=0
 full_farm=0
@@ -135,6 +136,7 @@ while (($#)); do
         --max-psi-io) max_psi_io=${2:?}; shift 2 ;;
         --min-mem) min_mem_gib=${2:?}; shift 2 ;;
         --max-await) max_await=${2:?}; shift 2 ;;
+        --max-dirty) max_dirty=${2:?}; shift 2 ;;
         --unsafe) unsafe=1; shift ;;
         --yes-unsafe) yes_unsafe=1; shift ;;
         --watch-cmd) watch_cmd=${2:?--watch-cmd needs a value}; shift 2 ;;
@@ -421,10 +423,14 @@ sample_line() { # sample_line <elapsed> -> TSV row, sets sample_* globals
     local util=$(awk -v t="$dtick" -v ms="$dt_ms" 'BEGIN { u=100*t/ms; if(u>100)u=100; printf "%.0f", u }')
     local await=$(awk -v q="$dq" -v d="$dio" 'BEGIN { printf "%.1f", (d > 0 ? q/d : 0) }')
 
-    local memavail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    read -r memavail dirty_kb writeback_kb < <(awk '
+        /^MemAvailable:/ { a = $2 }
+        /^Dirty:/        { d = $2 }
+        /^Writeback:/    { w = $2 }
+        END { printf "%s %s %s", a, d, w }' /proc/meminfo)
     local dcount=$(awk '{ i=index($0,")"); if (i>0 && substr($0,i+2,1)=="D") n++ } END { print n+0 }' /proc/[0-9]*/stat 2>/dev/null)
-    local xfs_xlog=$(awk '/^xlog / { s=0; for (i=2;i<=NF;i++) s+=$i; print s }' /proc/fs/xfs/stat 2>/dev/null)
-    local xfs_all=$(awk '{ for (i=2;i<=NF;i++) s+=$i } END { print s+0 }' /proc/fs/xfs/stat 2>/dev/null)
+    local dirty_mib=$(awk -v k="${dirty_kb:-0}" 'BEGIN { printf "%.0f", k/1024 }')
+    local writeback_mib=$(awk -v k="${writeback_kb:-0}" 'BEGIN { printf "%.0f", k/1024 }')
     local zram_mem=0
     [[ -r $zram_stat ]] && zram_mem=$(awk '{print $3}' "$zram_stat")
     local progress=$(tail -c 300 "$loop_out" 2>/dev/null | tr '\r' '\n' | grep -v '^$' | tail -1 | tr '\t' ' ' | cut -c1-60)
@@ -435,20 +441,21 @@ sample_line() { # sample_line <elapsed> -> TSV row, sets sample_* globals
     sample_mem_avail_kb=$memavail
     sample_zram_bytes=$zram_mem
     sample_await=$await
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    sample_dirty_mib=$dirty_mib
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$elapsed" "$dcount" "$psi_cpu" "$psi_io" "$psi_io_full" "$psi_mem" "$psi_mem_full" \
-        "$iops" "$mbps" "$util" "$await" "$inflight" "$(hf "$((memavail * 1024))")" "$(hf "$zram_mem")" "$progress" \
-        >>"$samples"
-    printf '\r[%4ss] D=%-3s psi_io=%-5s full=%-5s psi_mem_full=%-5s iops=%-6s MB/s=%-7s util=%-4s%% await=%-7s mem=%-6sG zram=%-5sG | %-60s' \
+        "$iops" "$mbps" "$util" "$await" "$inflight" "$(hf "$((memavail * 1024))")" "$(hf "$zram_mem")" \
+        "$dirty_mib" "$writeback_mib" "$progress" >>"$samples"
+    printf '\r[%4ss] D=%-3s psi_io=%-5s full=%-5s psi_mem=%-5s iops=%-6s MB/s=%-7s util=%-4s%% await=%-7s mem=%-6sG zram=%-5sG dirty=%-5sM wb=%-5sM | %-50s' \
         "$elapsed" "$dcount" "$psi_io" "$psi_io_full" "$psi_mem_full" "$iops" "$mbps" "$util" "$await" \
-        "$(hf "$((memavail * 1024))")" "$(hf "$zram_mem")" "$progress" >&2
+        "$(hf "$((memavail * 1024))")" "$(hf "$zram_mem")" "$dirty_mib" "$writeback_mib" "$progress" >&2
     sync "$samples" 2>/dev/null
 }
 
 # ─── Run it ────────────────────────────────────────────────────────────────
 {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        elapsed dstate psi_cpu psi_io psi_io_full psi_mem psi_mem_full iops mbps util await inflight mem_gib zram_gib progress
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        elapsed dstate psi_cpu psi_io psi_io_full psi_mem psi_mem_full iops mbps util await inflight mem_gib zram_gib dirty_mib wb_mib progress
 } >"$samples"
 
 # Prime the delta counters so the first sample is meaningful.
@@ -516,6 +523,7 @@ while kill -0 "$run_pid" 2>/dev/null; do
     [[ -z $reason ]] && (( sample_mem_avail_kb / 1048576 < min_mem_gib )) && reason="MemAvailable $(hf "$((sample_mem_avail_kb * 1024))")G < ${min_mem_gib}G"
     [[ -z $reason ]] && awk -v v="$sample_await" -v m="$max_await" 'BEGIN { exit !(v > m) }' && reason="device await ${sample_await}ms > ${max_await}ms"
     [[ -z $reason ]] && awk -v v="$sample_psi_mem_full" -v m="$max_psi_io" 'BEGIN { exit !(v > m) }' && reason="memory PSI full ${sample_psi_mem_full} > ${max_psi_io}"
+    [[ -z $reason ]] && awk -v v="$sample_dirty_mib" -v m="$((max_dirty * 1024))" 'BEGIN { exit !(v > m) }' && reason="dirty page backlog ${sample_dirty_mib}MiB > ${max_dirty}GiB"
     if [[ -n $reason ]]; then
         printf '%s\n' "$reason" >"$abort_reason"
         stop_run
@@ -570,6 +578,8 @@ awk -F'\t' '
         sum_pio += $4; sum_util += $10; sum_await += $11
         if (mem == "" || $13+0 < mem) mem = $13
         if ($14+0 > zram) zram = $14
+        if ($15+0 > dirty) dirty = $15
+        if ($16+0 > wb) wb = $16
     }
     END {
         if (n == 0) { print "probe: no samples recorded"; exit }
@@ -577,12 +587,13 @@ awk -F'\t' '
         printf "probe: peak iops=%d  MB/s=%s  util=%d%%  await=%sms\n", iops+0, mbps+0, util+0, await+0
         printf "probe: mean psi_io=%.1f util=%.0f%% await=%.1fms  min mem=%sG  peak zram=%sG  samples=%d\n",
             sum_pio/n, sum_util/n, sum_await/n, (mem == "" ? "?" : mem), zram+0, n
+        printf "probe: peak dirty=%dMiB  peak writeback=%dMiB\n", dirty+0, wb+0
     }
 ' "$samples"
 
 if ((aborted)); then
     printf 'probe: threat found — %s\n' "$exit_reason"
-    printf 'probe: last progress: %s\n' "$(tail -n 1 "$samples" | cut -f15)"
+    printf 'probe: last progress: %s\n' "$(tail -n 1 "$samples" | cut -f17)"
 elif ((workload_rc != 0)); then
     printf 'probe: workload exited rc=%s (see %s)\n' "$workload_rc" "$loop_out"
     tail -3 "$loop_out" >&2

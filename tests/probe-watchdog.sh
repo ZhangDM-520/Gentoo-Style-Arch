@@ -53,12 +53,12 @@ run=$(cat "$tmp/out-mem" | sed -n 's/^probe: kept //p' | head -1)
 [[ -n $run && -d $run ]] || fail "the probe did not keep its scratch dir for inspection"
 samples="$run/samples.tsv"
 [[ -s $samples ]] || fail "no samples were recorded"
-head -1 "$samples" | grep -qE '^elapsed	dstate	psi_cpu	psi_io	psi_io_full	psi_mem	psi_mem_full	iops	mbps	util	await	inflight	mem_gib	zram_gib	progress$' ||
+head -1 "$samples" | grep -qE '^elapsed	dstate	psi_cpu	psi_io	psi_io_full	psi_mem	psi_mem_full	iops	mbps	util	await	inflight	mem_gib	zram_gib	dirty_mib	wb_mib	progress$' ||
     fail "sample header changed: $(head -1 "$samples")"
 rows=$(($(wc -l <"$samples") - 1))
 (( rows >= 1 )) || fail "the sample log has no rows"
-awk -F'\t' -v rows="$rows" 'NF != 15 { bad++ } END { exit !(bad == 0) }' "$samples" ||
-    fail "a sample row does not have 15 columns"
+awk -F'\t' -v rows="$rows" 'NF != 17 { bad++ } END { exit !(bad == 0) }' "$samples" ||
+    fail "a sample row does not have 17 columns"
 grep -q '^probe: peak D-state=' "$tmp/out-mem" || fail "no summary was printed"
 
 printf 'probe watchdog fixture: PASS (2 abort paths, %s sample row(s), command killed)\n' "$rows"
