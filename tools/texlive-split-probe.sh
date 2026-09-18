@@ -63,7 +63,10 @@ Options:
   --limit-io MBps      hard read+write bandwidth cap on the root device, the
                        one control that actually bounds device pressure when
                        nothing else competes (default: 50)
-  --timeout SEC        wall-clock cap                   (default: 300)
+  --timeout SEC        wall-clock cap (default: 300 s for a farm run, 4 h in a
+                       watch mode). A farm abort kills its own workload; a watch
+                       abort only stops the sampling and leaves the watched
+                       command alone
   --sample-hz SEC      sampler interval                 (default: 1)
   --max-d N            abort above this D-state count    (default: 25)
   --max-psi-io PCT     abort above io PSI full avg10     (default: 50)
@@ -109,7 +112,7 @@ limit_mem_gib=4
 limit_cpu="400%"
 limit_io_weight=10
 limit_io_mbps=50
-timeout_s=300
+timeout_s=""          # resolved after parsing: farm runs 300 s, watch modes 4 h
 sample_hz=1
 max_d=25
 max_psi_io=50
@@ -158,6 +161,16 @@ while (($#)); do
 done
 
 case "$stage" in parse|move|full) ;; *) die "--stage must be parse, move or full" ;; esac
+
+# Farm runs own their workload, so an abort may kill it. Watch modes do not: the
+# command being measured is somebody's build, and a probe that kills it on a
+# timeout is worse than no probe. --watch-pid cannot kill it either way.
+kill_run=1
+if [[ -n $watch_cmd || -n $watch_pid ]]; then
+    kill_run=0
+    ((legacy_loop)) && printf 'probe: note: --legacy-loop only applies to farm runs; ignoring it\n' >&2
+fi
+timeout_s=${timeout_s:-$(( kill_run ? 300 : 14400 ))}
 [[ "$collections" =~ ^[a-z0-9]+(,[a-z0-9]+)*$ ]] || die "--collections must be a comma-separated list of collection names"
 
 # ─── Resolve the recipe (holds the PKGBUILD we extract the loop from) ────────
@@ -560,14 +573,14 @@ while kill -0 "$run_pid" 2>/dev/null; do
     [[ -z $reason ]] && awk -v v="$sample_dirty_mib" -v m="$((max_dirty * 1024))" 'BEGIN { exit !(v > m) }' && reason="dirty page backlog ${sample_dirty_mib}MiB > ${max_dirty}GiB"
     if [[ -n $reason ]]; then
         printf '%s\n' "$reason" >"$abort_reason"
-        stop_run
+        ((kill_run)) && stop_run
         aborted=1
         exit_reason="ABORTED: $reason"
         break
     fi
     if (( elapsed >= timeout_s )); then
         printf '%s\n' "wall-clock cap ${timeout_s}s" >"$abort_reason"
-        stop_run
+        ((kill_run)) && stop_run
         aborted=1
         exit_reason="ABORTED: wall-clock cap ${timeout_s}s"
         break
@@ -575,8 +588,14 @@ while kill -0 "$run_pid" 2>/dev/null; do
     sleep "$sample_hz"
 done
 
-wait "$run_pid" 2>/dev/null
-workload_rc=$?
+if ((aborted)) && ((!kill_run)); then
+    # A watch mode does not stop the command it measures, so it must not block on
+    # it either: report what was sampled and return.
+    workload_rc=0
+else
+    wait "$run_pid" 2>/dev/null
+    workload_rc=$?
+fi
 wall=$(( $(date +%s) - start_ts ))
 printf '\n' >&2
 
@@ -627,6 +646,11 @@ awk -F'\t' '
 
 if ((aborted)); then
     printf 'probe: threat found — %s\n' "$exit_reason"
+    if ((kill_run)); then
+        printf 'probe: workload stopped\n'
+    else
+        printf 'probe: sampling stopped; the watched command was left running\n'
+    fi
     printf 'probe: last progress: %s\n' "$(tail -n 1 "$samples" | cut -f17)"
 elif ((workload_rc != 0)); then
     printf 'probe: workload exited rc=%s (see %s)\n' "$workload_rc" "$loop_out"
