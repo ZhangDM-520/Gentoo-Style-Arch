@@ -12,7 +12,10 @@ set -euo pipefail
 #   * a FARM run stops its own workload (it is ours to stop);
 #   * a WATCH run leaves the command it measures alone (that command is somebody's
 #     build — a probe that kills it on a timeout is worse than no probe);
-#   * the sample log survives a failure, with the columns the analysis reads.
+#   * the sample log survives a failure, with the columns the analysis reads
+#     (which is why every probe call here passes --scratch "$tmp": a kept
+#     directory is the intended behaviour, and the fixture must not litter /tmp
+#     with them).
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 probe="$root/tools/texlive-split-probe.sh"
@@ -106,7 +109,7 @@ for f in language.dat language.dat.lua language.def; do : >"$tree/texmf-dist/tex
 
 rc=0
 "$probe" --tree "$tree" --recipe "$root/packages/git/texlive-texmf" \
-    --stage full --collections mini --sample-hz 1 --keep \
+    --stage full --collections mini --sample-hz 1 --keep --scratch "$tmp" \
     --max-await -1 --timeout 60 >"$tmp/out-farm" 2>"$tmp/err-farm" || rc=$?
 (( rc != 0 )) || fail "a farm run ignored an impossible await threshold (rc=0)"
 grep -q 'await' "$tmp/out-farm" ||
