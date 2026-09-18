@@ -46,8 +46,8 @@ usage() {
 
 Options:
   --tree DIR           populated texlive tree to borrow files from
-                       (default: $GSA_TEXLIVE_TREE, else the runtime clone,
-                       else this repo's packages/git/texlive-texmf)
+                       (default: $GSA_TEXLIVE_TREE, else the recipe directory,
+                       where makepkg's SRCDEST keeps it)
   --recipe DIR         recipe directory holding the PKGBUILD
                        (default: this repo's packages/git/texlive-texmf)
   --collections LIST   comma-separated collections to split
@@ -156,9 +156,11 @@ cwd_dir=$(cd "$cwd_dir" && pwd)
 
 # ─── Resolve the tree (borrowed read-only through hardlinks) ────────────────
 if [[ -z $tree_dir ]]; then
+    # A populated tree lives beside the recipe (makepkg's SRCDEST defaults to
+    # $startdir), so the recipe directory is the generic answer; GSA_TEXLIVE_TREE
+    # points at a checkout elsewhere — another clone, say.
     for candidate in \
         "${GSA_TEXLIVE_TREE:-}" \
-        "$HOME/Workspace/Gentoo-Style-Arch/packages/git/texlive-texmf" \
         "$recipe_dir"; do
         [[ -n $candidate && -d $candidate/texmf-dist ]] && tree_dir=$candidate && break
     done
