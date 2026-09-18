@@ -78,6 +78,12 @@ Options:
                        This is how the real build gets measured — e.g.
                        --watch-cmd 'makepkg -si' --cwd <recipe> --unsafe
   --cwd DIR            working directory for --watch-cmd (default: --recipe)
+  --legacy-loop        run the PRE-2026-09-18 split loop (frozen in
+                       tests/assets/texlive-split-legacy.sh) instead of the
+                       recipe's current one. This is the implementation that
+                       coincided with the machine freezes: ~6 minutes of steady
+                       renames instead of ~7 seconds, so it is the faithful
+                       reproducer and the harsher load test
   --full-farm          hardlink the whole tree instead of only the files this
                        run will move (more faithful directories, slower start)
   --rebuild-farm       rebuild the golden farm even if it exists
@@ -107,6 +113,7 @@ unsafe=0
 yes_unsafe=0
 full_farm=0
 rebuild_farm=0
+legacy_loop=0
 watch_cmd=""
 cwd_dir=
 
@@ -132,6 +139,7 @@ while (($#)); do
         --yes-unsafe) yes_unsafe=1; shift ;;
         --watch-cmd) watch_cmd=${2:?--watch-cmd needs a value}; shift 2 ;;
         --cwd) cwd_dir=${2:?--cwd needs a value}; shift 2 ;;
+        --legacy-loop) legacy_loop=1; shift ;;
         --full-farm) full_farm=1; shift ;;
         --rebuild-farm) rebuild_farm=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -197,14 +205,21 @@ fi
 # prepare() is taken from the recipe file itself, then trimmed to the split
 # loop, so this probe can never test a stale copy of the logic.
 if [[ -z $watch_cmd ]]; then
-loop_body=$(awk '
-    /^prepare\(\) *\{/ { inprep = 1; next }
-    inprep && /^\}/ { exit }
-    inprep { print }
-' "$recipe_dir/PKGBUILD" | awk '
-    /# Split files per package/ { keep = 1 }
-    keep { print }
-')
+if ((legacy_loop)); then
+    # The frozen pre-rewrite implementation, for reproducing the freezes.
+    legacy_asset="$SCRIPT_DIR/tests/assets/texlive-split-legacy.sh"
+    [[ -r $legacy_asset ]] || die "--legacy-loop needs $legacy_asset"
+    loop_body=$(<"$legacy_asset")
+else
+    loop_body=$(awk '
+        /^prepare\(\) *\{/ { inprep = 1; next }
+        inprep && /^\}/ { exit }
+        inprep { print }
+    ' "$recipe_dir/PKGBUILD" | awk '
+        /# Split files per package/ { keep = 1 }
+        keep { print }
+    ')
+fi
 [[ -n $loop_body ]] || die "could not extract the split loop from $recipe_dir/PKGBUILD (did prepare() change shape?)"
 grep -q '_collections' <<<"$loop_body" || die "extracted loop does not reference _collections"
 fi   # end of the loop extraction (skipped for --watch-cmd)
@@ -530,7 +545,8 @@ for _d in "$tree"/texlive-*; do
 done
 split_dirs=$(find "$tree" -maxdepth 1 -name 'texlive-*' -type d 2>/dev/null | wc -l)
 
-printf 'probe: stage=%s collections=%s tree=%s\n' "$stage" "$collections_in_plan" "$tree_dir"
+printf 'probe: stage=%s loop=%s collections=%s tree=%s\n' "$stage" \
+    "$((legacy_loop))" "$collections_in_plan" "$tree_dir"
 if [[ -n $watch_cmd ]]; then
     printf 'probe: watched command (cwd=%s): %s\n' "$cwd_dir" "$watch_cmd"
 else
