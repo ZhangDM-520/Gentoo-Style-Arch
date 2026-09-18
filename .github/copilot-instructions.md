@@ -19,12 +19,17 @@ caches, or build output.
 ## Commands
 
 Shells are split deliberately: **the builder and its CLI are fish**
-(`build-all.fish`); **the fixtures are bash**. A command handed to the user
-runs under fish, so wrap ad-hoc one-liners in `bash -c '...'` when they need
-bash syntax.
+(`build-all.fish`); **the fixtures are bash**. Tool-call shells here are bash,
+so bash syntax is fine inside a call — the hazard is crossing the boundary.
+A command handed to the user, or `!cmd`, runs under the login shell (fish
+4.9.3), so wrap ad-hoc one-liners in `bash -c '...'`. In a fish context: no
+`export`, no `[[ ]]`, arrays are 1-indexed, and an **unmatched glob is a fatal
+error that `2>/dev/null` does not suppress** — use `find -name`. Host aliases
+also change what a bare name does (`ls` → `eza -al`, `grep --color=auto`), so
+never assume a bare `ls`/`grep` flag works there.
 
 ```sh
-# Inspect (always do this before building; all three are read-only)
+# Inspect (always do this before building; all four are read-only)
 fish build-all.fish --help
 fish build-all.fish --list
 fish build-all.fish --audit          # needs ripgrep
@@ -58,9 +63,38 @@ fake build/install commands that asserts exit status, logs, and child-process
 cleanup. There is no CI workflow and no compilable language here — fixtures and
 `makepkg` are the entire verification surface.
 
+`tools/` is deliberately outside the battery: host-side diagnostics that are
+heavy and mutating (currently `tools/texlive-split-probe.sh`, a PSI/D-state/
+IO sampler). Its contract is still fixture-pinned by `tests/probe-watchdog.sh`
+at a reduced scale — a watch mode must never kill the process it samples, and
+an abort must leave the sample log behind.
+
 Agent shells inject git config (`safe.bareRepository=explicit`), which breaks
 bare-repo and makepkg VCS operations. Prefix those with `GIT_CONFIG_COUNT=0`
 (the committed fixtures that shell out to `makepkg` already do).
+
+### Selection semantics
+
+A bare package name is **not** a leaf build: it expands the whole transitive
+dependency chain, so `build-all.fish niri-spicy-git` also rebuilds llvm, rust,
+mesa and everything between. `--no-deps` is the only way to rebuild one package
+whose installed dependencies are known current.
+
+```sh
+fish build-all.fish --no-deps niri-spicy-git   # leaf rebuild only
+fish build-all.fish -g git 22..38              # index range from --list
+fish build-all.fish -s --install -g git        # resume: skip already-built archives
+```
+
+`-i` installs each package before its dependents compile (core selection turns
+it on automatically). `-ia`/`--installall` is the single-transaction escape
+hatch — it installs after everything is built, so it must never stand in for
+`-i` on a set whose members depend on each other. `-ccc`/`--nuclear` and
+`--link-sources` ask for confirmation; `--link-sources` must be run as the
+build user, not under a root supervisor. `--audit` and `--link-sources` are the
+only modes needing `rg`/`git`. `--allow-broken-rustc` bypasses the rustc
+sanity probe that guards against LLVM-snapshot ABI skew — it is an escape hatch
+for runs that compile no Rust, not a way past a real ABI mismatch.
 
 ## Architecture
 
@@ -73,8 +107,14 @@ Four modules, deliberately separated (`docs/architecture.md`):
    ID to a recipe path and is *the only* place that does so; the loader
    rejects any record that is not exactly `package-id|recipe-path`.
    `groups/{git,stable,core,misc,third-party}.list` define logical groups, and
-   `dependencies.conf` records local build-order edges. `build-defaults.conf`
-   holds the GiB-per-job baselines.
+   `dependencies.conf` records local build-order edges as
+   `package-id:dependency-id,dependency-id` (a lone `package-id:` is a
+   deliberate no-edge record). `build-defaults.conf` holds the GiB-per-job
+   baselines (`memory_per_job_gib`, `core_memory_per_job_gib`,
+   `reserved_memory_gib`) and the default `lanes`/`jobs`/`intensity`/`state_dir`.
+   Only those five group names are ever read, so any other file in
+   `config/groups/` is unreachable state that silently goes stale —
+   `tests/project-config.sh` fails on it.
 3. **Builder** — `build-all.fish` resolves IDs, expands and topologically sorts
    dependencies, dispatches isolated fish child processes as lanes, serializes
    pacman transactions, owns the dashboard, and reports per-package logs.
@@ -111,7 +151,17 @@ Consequences worth internalising:
 category, add one `packages.map` record, add the ID to the right group
 file(s), and add a `dependencies.conf` edge only after verifying the dependency
 against package metadata and a build-order reason. Every workspace `pkgname`
-must also appear in the host's `/etc/pacman.conf` `IgnorePkg` closure.
+must also appear in the host's `/etc/pacman.conf` `IgnorePkg` closure —
+cumulative repeated `IgnorePkg =` lines, all inside `[options]` (a line inside
+a repo section is silently dropped). Verify by unioning `pkgbase`+`pkgname[]`
+from every recipe and diffing against `pacman-conf IgnorePkg | sort -u` with
+`comm -23`; empty output means covered. A new edge's reason belongs in
+`docs/NOTE.md`, and a changed operational contract in `docs/MEMORY.md`.
+
+**Meson staleness.** Re-running `meson setup` over an existing build directory
+keeps stale option values. After *any* `meson-git` upgrade, purge every build
+dir whose `meson-info.json` version differs before rebuilding — build dirs sit
+at arbitrary depths, so a `maxdepth` sweep misses them.
 
 **Local assets and ignore rules.** Nine recipes default-deny with a bare `*`
 plus `!` negations, so a new file without a matching negation is silently
@@ -119,7 +169,14 @@ dropped from the commit while still building locally — a clean checkout then
 fails with "was not found in the build directory". Add the negation in the same
 change and confirm with `git check-ignore -v <asset>` (no output = visible).
 Never let a recipe `.gitignore` match itself. `tests/recipe-sources.sh` walks
-every recipe and enforces this repo-wide.
+every recipe and enforces this repo-wide. Preserve package-local attribution
+and licence material (`LICENSE`, `LICENSES/`, `REUSE.toml`): the root MIT
+licence covers the scheduler and project docs only, and does not relicense
+recipes or bundled upstream material.
+
+**Concurrency.** Check for running `makepkg` processes and for runtime log
+mtime changes before rebuilding a package that may already be in flight, and
+never run two heavy builds at once — the failure mode is an OOM, not a queue.
 
 **Provides discipline.** Toolchain `-git` packages carry *versioned* provides
 (`provides=("meson=${pkgver}")`) — an unversioned provide cannot satisfy a
