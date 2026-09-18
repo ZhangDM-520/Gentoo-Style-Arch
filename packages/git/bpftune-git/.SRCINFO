@@ -18,6 +18,12 @@ pkgbase = bpftune-git
 	conflicts = bpftune
 	options = strip
 	source = git+https://github.com/oracle-samples/bpftune
+	source = 50-bpftune-tuners-pre.hook
+	source = 95-bpftune-tuners-post.hook
+	source = bpftune-restart.script
 	md5sums = SKIP
+	md5sums = 0798e6254c576e9fc220f3ecd3e320e1
+	md5sums = b5a112e94e4ba2ccf2b3d30d46eee54c
+	md5sums = ec68bfa2db973bc9169f24d943f6f327
 
 pkgname = bpftune-git
