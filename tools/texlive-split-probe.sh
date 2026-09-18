@@ -161,14 +161,23 @@ if [[ -n $watch_cmd ]]; then
     tree_dir="(none)"
 else
     if [[ -z $tree_dir ]]; then
-        # A populated tree lives beside the recipe (makepkg's SRCDEST defaults to
-        # $startdir), so the recipe directory is the generic answer;
-        # GSA_TEXLIVE_TREE points at a checkout elsewhere — another clone, say.
-        for candidate in "${GSA_TEXLIVE_TREE:-}" "$recipe_dir"; do
+        # A populated tree lives beside its recipe, because makepkg's SRCDEST
+        # defaults to $startdir — so candidates are, in order: an explicit
+        # GSA_TEXLIVE_TREE, this repo's recipe directory, the recipe directory of
+        # a checkout you are standing in, and that checkout's root. The last two
+        # are what make `cd <runtime clone> && <this repo>/tools/...` work: this
+        # repo holds recipes only, so its own texmf-dist never exists.
+        for candidate in \
+            "${GSA_TEXLIVE_TREE:-}" \
+            "$recipe_dir" \
+            "$PWD/packages/git/texlive-texmf" \
+            "$PWD"; do
             [[ -n $candidate && -d $candidate/texmf-dist ]] && tree_dir=$candidate && break
         done
     fi
-    [[ -n $tree_dir && -d $tree_dir/texmf-dist ]] || die "no populated texmf-dist found; pass --tree"
+    if [[ -z $tree_dir || ! -d $tree_dir/texmf-dist ]]; then
+        die "no populated texmf-dist found (looked in ${GSA_TEXLIVE_TREE:-unset}, $recipe_dir, $PWD/packages/git/texlive-texmf, $PWD); pass --tree DIR or cd to the checkout that holds the tree"
+    fi
     tree_dir=$(cd "$tree_dir" && pwd)
 
     for needed in texmf-dist/web2c/fmtutil.cnf texmf-dist/web2c/updmap.cfg \
