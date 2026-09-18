@@ -126,6 +126,17 @@
     `validpgpkeys` with a role comment, and import the key. Never pass
     `--skippgpcheck` or drop `#signed`.
 
+16. **Bulk `prepare()` loops: batch them, and refuse incomplete inputs**
+    (09-18 texlive incident): a loop that shells out per file costs process
+    spawns, not bytes — the texlive split was 301k spawns and 4,115 full rescans
+    of an 18.7 MB tlpdb. Cut the input once, do the work with builtins, and
+    batch the syscalls per destination (`mv -t`, 500 files per call); the same
+    loop then costs ~10k spawns and the recipe's total exposure drops from ~8
+    minutes to under one. And a loop that *moves* its inputs must count what was
+    already consumed and stop, because the alternative is a package that is
+    quietly missing files. Pin both with a fixture that diffs the old and new
+    implementations (`tests/texlive-split.sh`, oracle in `tests/assets/`).
+
 ## 2. Workspace overview
 
 - The public tree is `Gentoo_Style_Arch/`; recipes live under
@@ -191,6 +202,11 @@ OpenShadingLanguage -> blender.
 - Qt private APIs and LLVM snapshots require consumer rebuild batches.
 - Shared mirrors must have the exact origin URL and a usable fetch refspec.
 - A populated non-Git source path is never replaced automatically.
+- `texlive-texmf`'s `prepare()` MOVES ~150k files out of `$srcdir/texmf-dist`,
+  so that tree is single-use: a resume over an already-split checkout fails on
+  purpose (13,870 of 150,746 runfiles were gone in this one) and needs
+  `rm -rf src`. It also needs ~38 GB on disk, not the ~3.5 GB of data, because
+  each SVN working copy keeps a 9.1 GB `.svn/pristine` shadow.
 
 ## 3. Stack facts
 
@@ -316,6 +332,18 @@ going stale.
   `rm` line and never recorded what it targeted. The current trim already drops
   pre-amdgpu `radeon` and the unused vendor directories, and upstream has no
   `legacy/` tree, so the item is either redundant or needs re-specifying.
+- **Hard freezes during texlive builds (2026-09-18, cause not yet proven)**:
+  the split loop is *exonerated* by measurement (105,846 renames: io PSI 0.00,
+  ≤2 D-state processes, ≤16 % device utilisation). Differential runs queued, in
+  this order: NVMe ASPM off (`pcie_aspm=powersave` is in `/etc/default/limine`
+  on a WD SN560 whose link has L1 + L1.2 enabled) → `ananicy-cpp` stopped → zram
+  resized (`zram-size = ram * 2.5` is 75 GB of RAM-backed swap on a 29 GiB
+  machine, which can never be used and removes the last reclaim fallback).
+  Two prerequisites done: `kernel.sysrq=1` (was `16`, i.e. no recovery keys, so
+  three freezes cost three hard resets — the drive reports 63 unsafe shutdowns)
+  and `tools/texlive-split-probe.sh` for sampling any command. Still to do:
+  make that sysrq value persistent, and drop `nowatchdog` so a future hang
+  panics and leaves a trace.
 - systemd is a separately coupled effort whenever its recipe changes.
 
 Deleted as done in this pass (each was verified, not assumed): the

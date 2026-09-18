@@ -102,6 +102,51 @@ lock is not removed automatically. Resume with the remaining package IDs
 printed by the failure summary, usually adding `--skip --install` after
 checking whether the archive was already produced.
 
+Per-package logs live in `.state/logs/` — Git-ignored, and removed with the
+state directory. If a run may need post-mortem forensics (a long build, a
+machine that stalls), put them somewhere durable first:
+
+```sh
+GSA_STATE_DIR="$HOME/.local/state/gentoo-style-arch" fish build-all.fish -g core -i
+```
+
+### When the machine freezes during a build
+
+A hard freeze leaves nothing in the per-package log, because the log is exactly
+what stops being written. Two things are worth knowing:
+
+**The journal is persistent, so the frozen boot is still readable after the
+reset.** `/var/log/journal` keeps every boot; `journalctl -b -1` shows the boot
+before the reset, and a boot whose last line is ordinary activity (rather than
+`Journal stopped`) is a boot that did not shut down. That is how the texlive
+freeze of 2026-09-18 was localised to a single second of one phase.
+
+**Switch the magic SysRq keys back on before you need them.** This host shipped
+with `kernel.sysrq=16` (only `sync` enabled), which disables every recovery key
+and makes a hard power cut the only option — after 63 of those the drive's
+unsafe-shutdown counter is the record of it. `sysctl -w kernel.sysrq=1` at
+runtime costs nothing and gives you, at a physical keyboard:
+`Alt+SysRq+R` (unraw the keyboard), `E` (SIGTERM everything), `I` (SIGKILL
+everything), `S` (sync), `U` (remount read-only), `B` (reboot). If the screen is
+dead but the box is alive, `Ctrl+Alt+F3` reaches a virtual console — and the
+kernel messages on it settle whether the kernel or only the display died.
+
+`tools/texlive-split-probe.sh` measures a build step with a sampler and a
+watchdog: it records PSI, D-state process counts, device utilisation and await,
+zram usage and XFS metadata counters once a second, prints them live, and kills
+the run when a threshold trips. It reproduces the texlive `prepare()` split loop
+on a hardlink farm (the real tree is never modified) so the loop can be measured
+without endangering anything, and `--watch-cmd` instruments any command instead:
+
+```sh
+tools/texlive-split-probe.sh --stage full --collections fontsrecommended   # farm, throttled
+tools/texlive-split-probe.sh --watch-cmd 'makepkg -si' --cwd packages/git/texlive-texmf --unsafe --yes-unsafe
+```
+
+It is a diagnostic, not a test: it is heavy and mutating, lives outside
+`tests/`, and `--unsafe` prints the SysRq runbook before it runs anything without
+cgroup limits.
+
 ### mkinitcpio and optional NvPCR definitions
 
 The package set disables systemd's bootloader integration because this project

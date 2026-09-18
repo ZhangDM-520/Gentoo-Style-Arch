@@ -96,6 +96,66 @@ dependency edges, and incident root causes are unaffected by the renames.
   creates no `node_modules` as the symptom, not the error from the command that
   later fails to find a binary.
 
+## 2026-09-18 — texlive prepare(): two hard freezes, and a split loop that lost 8 minutes
+
+- **Symptom**: building `texlive-texmf` froze the whole machine twice — once
+  during the source fetch (08:40:54), once 43 s into `prepare()`'s split loop
+  (10:41:38). The screen stopped, no CPU load was visible, and only a hard power
+  reset brought it back. There was no log: the run's own log lived in `.state/`,
+  which no longer exists, and nothing was captured before the reset.
+- **What the journal still had**: it is persistent, so the frozen boot survives.
+  Boots `-2` and `-1` are the only two of the last fourteen that end without a
+  shutdown message, and both end during the texlive build. Nothing else — no OOM
+  kill, no `systemd-oomd` action, no hung-task warning, no XFS error, no NVMe
+  error, no `Call Trace`. The journal simply stops mid-stream, which is what a
+  wedged device or a dead kernel looks like from outside. In the last run the
+  loop had moved basic/bibtexextra/binextra/context (9.3k files) and 4,521 files
+  into `fontsextra` when it died — ~14k renames and ~330 spawns/s, far too
+  little to kill a machine by saturation.
+- **Three configuration choices made it undiagnosable and unrecoverable**:
+  `/etc/default/limine` carries `nowatchdog` (no lockup detector, so a kernel
+  hang leaves no trace) and `loglevel=3` (warnings off the console), and
+  `kernel.sysrq=16` disables every SysRq recovery key — a hard reset was the only
+  way out. The drive reports **63 unsafe shutdowns**.
+- **What measurement ruled out** (new `tools/texlive-split-probe.sh`): the split
+  loop itself. The real loop, extracted from the PKGBUILD at run time, running on
+  a hardlink farm at full `fontsextra` scale — 105,846 files moved in 264 s —
+  produced **io PSI 0.00 throughout, at most 2 processes in D state, peak device
+  utilisation 16 %, memory flat, zram untouched**. The loop's work does not
+  saturate this machine; the trigger needs something that was present then (the
+  19 GB source fetch, a concurrent lane, or an intermittent device fault). Prime
+  suspect remains the NVMe link: ASPM L1 + L1.2 are enabled on a **WD SN560**
+  while the cmdline forces `pcie_aspm=powersave`; the differentials (ASPM off,
+  `ananicy-cpp` stopped, zram off) are queued for the maintainer to run.
+- **Fixed regardless — the loop was the recipe's hot path**: 4,115 full rescans
+  of the 18.7 MB tlpdb plus one `mkdir -p` + one `mv` per file (301k process
+  spawns). It now cuts the tlpdb into per-package sections in ONE awk pass,
+  extracts runfiles/formats/maps/hyphens with shell builtins, and issues the
+  renames per destination directory in batches. Fixture: **37 spawns vs 2,482**
+  (67x fewer). Real data: **0.94 s vs 13.79 s** for `fontsrecommended` (5,299
+  files, 14.7x). The whole split drops from ~8 minutes to well under a minute,
+  which shrinks the window in which a stall can happen at all.
+- **Also fixed — a silently broken package**: the loop MOVES files out of
+  `texmf-dist`, so a build resumed over an already-split tree produced packages
+  with files missing. In this checkout **13,870 of 150,746** planned runfiles were
+  already gone. `prepare()` now counts the gaps and refuses, printing the count,
+  the reason, up to five of the missing paths, and the remedy (`rm -rf src`).
+- **Validation**: `tests/texlive-split.sh` runs the previous implementation
+  (frozen as `tests/assets/texlive-split-legacy.sh`) and the live one over the
+  same synthetic tree and requires identical type/mode/path/symlink listings,
+  identical content hashes, identical `pkgdesc-*`/`depends-*`/`packages-*` and
+  `.fmts`/`.maps`/`.dat*`, plus the spawn reduction and the depletion refusal. On
+  real data both implementations produced 6,098 identical tree entries and 5,302
+  identical file hashes. The fixture earned its keep during the rewrite: an
+  accumulated `AddFormat` list that kept a trailing newline made the follow-up
+  `read` loop iterate once more and the `grep` match a second time.
+- **Rule**: a bulk `prepare()` that moves files must (a) refuse to run on
+  incomplete inputs instead of shipping a quietly broken package, and (b) be
+  batched — these loops cost process spawns, not bytes. And when a machine
+  hard-freezes with "no CPU load": read `journalctl -b -1` first (the frozen
+  boot's kernel log survives the reset), and switch `kernel.sysrq` back on before
+  blaming the workload.
+
 ## 2026-09-18 — logseq: a resumed build aborted on `opam switch create`
 
 - **Symptom**: found while validating the fix above. The first `makepkg` run in

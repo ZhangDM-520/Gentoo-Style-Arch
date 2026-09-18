@@ -47,6 +47,16 @@ fish build-all.fish --audit
 fish build-all.fish --dry-run --group git
 ```
 
+Validate a change with the fixture battery (`tests/`) — it is fast and
+non-mutating — and with `makepkg`'s own checks. `tools/` holds host-side
+diagnostics that are deliberately too heavy for that battery:
+
+```sh
+bash tests/run-all.sh                  # every fixture
+bash tests/run-all.sh recipe           # substring filter
+tools/texlive-split-probe.sh --help    # sample or watch a build step
+```
+
 Build a selected group or package. Selection is mandatory; a bare invocation
 never starts an unattended full rebuild:
 
