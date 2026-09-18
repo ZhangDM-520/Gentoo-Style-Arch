@@ -155,34 +155,39 @@ recipe_dir=$(cd "$recipe_dir" && pwd)
 cwd_dir=$(cd "$cwd_dir" && pwd)
 
 # ─── Resolve the tree (borrowed read-only through hardlinks) ────────────────
-if [[ -z $tree_dir ]]; then
-    # A populated tree lives beside the recipe (makepkg's SRCDEST defaults to
-    # $startdir), so the recipe directory is the generic answer; GSA_TEXLIVE_TREE
-    # points at a checkout elsewhere — another clone, say.
-    for candidate in \
-        "${GSA_TEXLIVE_TREE:-}" \
-        "$recipe_dir"; do
-        [[ -n $candidate && -d $candidate/texmf-dist ]] && tree_dir=$candidate && break
-    done
-fi
-[[ -n $tree_dir && -d $tree_dir/texmf-dist ]] || die "no populated texmf-dist found; pass --tree"
-tree_dir=$(cd "$tree_dir" && pwd)
+# --watch-cmd measures somebody else's command and needs none of this, so the
+# tree is only resolved for the farm workload.
+if [[ -n $watch_cmd ]]; then
+    tree_dir="(none)"
+else
+    if [[ -z $tree_dir ]]; then
+        # A populated tree lives beside the recipe (makepkg's SRCDEST defaults to
+        # $startdir), so the recipe directory is the generic answer;
+        # GSA_TEXLIVE_TREE points at a checkout elsewhere — another clone, say.
+        for candidate in "${GSA_TEXLIVE_TREE:-}" "$recipe_dir"; do
+            [[ -n $candidate && -d $candidate/texmf-dist ]] && tree_dir=$candidate && break
+        done
+    fi
+    [[ -n $tree_dir && -d $tree_dir/texmf-dist ]] || die "no populated texmf-dist found; pass --tree"
+    tree_dir=$(cd "$tree_dir" && pwd)
 
-for needed in texmf-dist/web2c/fmtutil.cnf texmf-dist/web2c/updmap.cfg \
-              texmf-dist/web2c/texmf.cnf texmf-dist/tex/generic/config/language.dat \
-              texmf-dist/tex/generic/config/language.dat.lua \
-              texmf-dist/tex/generic/config/language.def; do
-    [[ -f $tree_dir/$needed ]] || die "tree is missing $needed (wrong --tree?)"
-done
-tlpdb=""
-for candidate in "$tree_dir/tlpkg/texlive.tlpdb" "$tree_dir/src/tlpkg/texlive.tlpdb"; do
-    [[ -f $candidate ]] && tlpdb=$candidate && break
-done
-[[ -n $tlpdb ]] || die "no tlpkg/texlive.tlpdb in $tree_dir"
+    for needed in texmf-dist/web2c/fmtutil.cnf texmf-dist/web2c/updmap.cfg \
+                  texmf-dist/web2c/texmf.cnf texmf-dist/tex/generic/config/language.dat \
+                  texmf-dist/tex/generic/config/language.dat.lua \
+                  texmf-dist/tex/generic/config/language.def; do
+        [[ -f $tree_dir/$needed ]] || die "tree is missing $needed (wrong --tree?)"
+    done
+    tlpdb=""
+    for candidate in "$tree_dir/tlpkg/texlive.tlpdb" "$tree_dir/src/tlpkg/texlive.tlpdb"; do
+        [[ -f $candidate ]] && tlpdb=$candidate && break
+    done
+    [[ -n $tlpdb ]] || die "no tlpkg/texlive.tlpdb in $tree_dir"
+fi
 
 # ─── Extract the loop from the PKGBUILD (single source of truth) ────────────
 # prepare() is taken from the recipe file itself, then trimmed to the split
 # loop, so this probe can never test a stale copy of the logic.
+if [[ -z $watch_cmd ]]; then
 loop_body=$(awk '
     /^prepare\(\) *\{/ { inprep = 1; next }
     inprep && /^\}/ { exit }
@@ -193,6 +198,7 @@ loop_body=$(awk '
 ')
 [[ -n $loop_body ]] || die "could not extract the split loop from $recipe_dir/PKGBUILD (did prepare() change shape?)"
 grep -q '_collections' <<<"$loop_body" || die "extracted loop does not reference _collections"
+fi   # end of the loop extraction (skipped for --watch-cmd)
 
 run_id="texlive-split-probe.$$.$(date +%s)"
 scratch="$scratch_parent/$run_id"

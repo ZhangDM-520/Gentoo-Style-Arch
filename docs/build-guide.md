@@ -145,7 +145,9 @@ tools/texlive-split-probe.sh --watch-cmd 'makepkg -si' --cwd packages/git/texliv
 
 It is a diagnostic, not a test: it is heavy and mutating, lives outside
 `tests/`, and `--unsafe` prints the SysRq runbook before it runs anything without
-cgroup limits.
+cgroup limits. `tests/probe-watchdog.sh` pins the abort paths it depends on
+(wall-clock cap and a resource threshold both stop the run, name themselves, and
+kill the wrapped command).
 
 ### mkinitcpio and optional NvPCR definitions
 
