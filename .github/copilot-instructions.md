@@ -9,12 +9,17 @@ caches, or build output.
 
 | File | Role |
 | --- | --- |
+| `README.md` | Group sizes and each group's purpose; the fresh-checkout install and build path. |
 | `docs/MEMORY.md` | The operational contract: golden rules, current stack shape, pitfall digest. Rules cite real breakage. |
-| `docs/NOTE.md` | Chronological incident journal, one `## YYYY-MM-DD` section per incident. Opens with a naming-history table — entries predating 2026-09-15 use `.Static/.Heavy/.Heavyweight/.3rdP` paths and `static/heavy/critical/rocm` group names. |
+| `docs/NOTE.md` | Chronological incident journal, one `## YYYY-MM-DD` section per incident. Opens with a naming-history table — entries predating 2026-09-15 use `.Static/.Heavy/.Heavyweight/.3rdP` paths and `static/heavy/critical/rocm` group names, and flags since removed (`-si`/`--sepinstall` went 2026-09-17). Prefer `--help` over the journal for current flags. |
 | `docs/build-guide.md` | Install modes, `--cleanup`/`--nuclear`, sudo-keepalive behaviour, PGO/Meson reconfigure procedure. |
 | `docs/architecture.md` | The four-module split and the scheduler's implicit invariants. |
+| `docs/maintainer-guide.md` | Adding a recipe, coupled-stack updates, the `NOTE.md` entry format. |
+| `docs/package-policy.md` | What a recipe directory may hold versus what is fetched at build time. |
+| `docs/source-sharing.md` | The `--link-sources` contract and what qualifies as a valid canonical mirror. |
+| `docs/portability.md` | Intensity profiles and their formulas, `GSA_*` overrides, CPU-tuning policy. |
 | `CONTRIBUTING.md` | Recipe-change checklist, trimming standard, source-verification rules. |
-| `docs/portability.md` | Intensity profiles, `GSA_*` overrides, CPU-tuning policy. |
+| `SECURITY.md` | Trust model (a recipe executes arbitrary shell), safe-operation rules, what must never be committed. |
 
 ## Commands
 
@@ -42,11 +47,22 @@ bash tests/recipe-sources.sh         # run one fixture directly
 ```
 
 `tests/run-all.sh` discovers `tests/*.sh` and needs no edit for a new fixture.
+The filter is a plain substring of the filename, so `pgo` runs the whole PGO
+family; `texlive`, `recipe`, `project`, `scheduler`, `sudo` and `probe` each
+narrow to one area.
+
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
 on builder output), and print a reason to stderr. **Run the whole battery, not
 just the fixture near your change** — a `config/packages.map` format change
 was once caught by an unrelated recipe fixture.
+
+Two harness conventions worth copying rather than reinventing: a fixture that
+applies to many packages takes its package/project as `$1`/`$2`
+(`tests/pgo-transition.sh`; the five six-line `*-pgo-transition.sh` files are
+wrappers that `exec` it with their package pair), and `tests/assets/` is *not* discovered —
+it holds frozen reference material such as the previous split-loop
+implementation, so nothing there runs standalone.
 
 Validation for a change:
 
@@ -95,6 +111,18 @@ build user, not under a root supervisor. `--audit` and `--link-sources` are the
 only modes needing `rg`/`git`. `--allow-broken-rustc` bypasses the rustc
 sanity probe that guards against LLVM-snapshot ABI skew — it is an escape hatch
 for runs that compile no Rust, not a way past a real ABI mismatch.
+
+The remaining build-time flags: `-c`/`--clean` (wipe artifacts first),
+`-s`/`--skip` (skip a package whose `.pkg.tar.zst` is newer than its
+`PKGBUILD` — the resume idiom), `--no-sync` (stop auto-updating stable
+versions from the repos), `--intensity LEVEL`, `--lanes`, `--jobs`. Note the
+short-flag overloads: `-s` is *not* install, `-l` is `--list`, `-n` is
+`--dry-run`, and `-c`/`-cc`/`-ccc` are three different strengths of wipe.
+Installs run in the lanes as `sudo -n`, so the dispatcher keeps a credential
+warm and refuses to start a long run when installs are impossible; `sudo fish
+build-all.fish …` starts a root supervisor while `makepkg` still runs as the
+invoking user. Interactive terminals get a dashboard, pipes get plain output —
+parse the latter.
 
 ## Architecture
 
@@ -163,16 +191,21 @@ keeps stale option values. After *any* `meson-git` upgrade, purge every build
 dir whose `meson-info.json` version differs before rebuilding — build dirs sit
 at arbitrary depths, so a `maxdepth` sweep misses them.
 
-**Local assets and ignore rules.** Nine recipes default-deny with a bare `*`
-plus `!` negations, so a new file without a matching negation is silently
-dropped from the commit while still building locally — a clean checkout then
-fails with "was not found in the build directory". Add the negation in the same
-change and confirm with `git check-ignore -v <asset>` (no output = visible).
-Never let a recipe `.gitignore` match itself. `tests/recipe-sources.sh` walks
-every recipe and enforces this repo-wide. Preserve package-local attribution
-and licence material (`LICENSE`, `LICENSES/`, `REUSE.toml`): the root MIT
-licence covers the scheduler and project docs only, and does not relicense
-recipes or bundled upstream material.
+**Local assets and ignore rules.** Two ignore layers must both pass. Nine
+recipes default-deny with a bare `*` plus `!` negations, so a new file without
+a matching negation is silently dropped from the commit while still building
+locally — a clean checkout then fails with "was not found in the build
+directory". Separately, the *root* `.gitignore` denies `packages/*/*/*/`, i.e.
+**every new subdirectory** under a recipe, and negates only `LICENSES/`; a
+recipe that needs a directory of its own (not just a file) needs the negation
+added to the root file too, since most recipes ship no local ignore file at
+all. Add the negation in the same change and confirm with
+`git check-ignore -v <asset>` (no output = visible). Never let a recipe
+`.gitignore` match itself. `tests/recipe-sources.sh` walks every recipe and
+enforces this repo-wide. Preserve package-local attribution and licence
+material (`LICENSE`, `LICENSES/`, `REUSE.toml`): the root MIT licence covers
+the scheduler and project docs only, and does not relicense recipes or bundled
+upstream material.
 
 **Concurrency.** Check for running `makepkg` processes and for runtime log
 mtime changes before rebuilding a package that may already be in flight, and
@@ -199,6 +232,10 @@ house idiom is a runtime `command -v mold` guard. Meson recipes use
 both compiler and linker argument caches, and the symbol-level
 instrumentation check (`readelf -sW <lib> | grep -E '__gcov_|__llvm_profile'`
 must be empty) are documented in `docs/build-guide.md` and `MEMORY.md` §4/§6.
+The builder exports `GSA_BUILD_JOBS` to every lane and rewrites `MAKEFLAGS`/
+`NINJAFLAGS` without discarding the caller's other flags, so a recipe that
+wants the lane's job count should read `GSA_BUILD_JOBS` rather than calling
+`nproc` or hard-coding `-j`.
 
 **Trimming.** Remove dead docs, man pages, tests, split packages, `depends`,
 `makedepends`, `_pick` paths, and install/check paths *together*; a feature
