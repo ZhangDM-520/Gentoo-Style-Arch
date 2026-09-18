@@ -269,6 +269,19 @@ install history lives in `NOTE.md`.
   logseq-desktop-git additionally bundles `master` (2.x) which embeds an
   OCaml/Melange CLI runtime — the opam switch lives under `$srcdir` and pins
   OCaml 5.1.1 to match upstream CI.
+  Its `cli/` and `static/` installs MUST pass `--ignore-workspace`: the tree's
+  root `pnpm-workspace.yaml` has no `packages:` field, so a bare `pnpm install`
+  from a subdirectory resolves the ROOT project, exits 0 and creates no
+  `node_modules` — `static/` then failed with
+  `Command "electron-builder" not found` (2026-09-18, NOTE.md). Related: with
+  the flag, pnpm also skips the allowlisted dependency build scripts and
+  `shamefully-hoist`, which is harmless here only because electron-builder
+  fetches the Electron distribution itself and the static `postinstall`
+  rebuilds `keytar`.
+  Its opam switch is created only when absent: `build()` restarts from the top
+  while `$srcdir` persists, and `opam switch create` exits 2 on an installed
+  switch, which errexit turns into an abort before the first bundle (same date,
+  NOTE.md).
 - **TeX Live data packages** (texlive-texmf): `arch=(any)`, so there is no
   compiler and no ISA/LTO/PGO phase at all. The recipe keeps upstream's
   `!strip`, which also skips the strip/debug tidy pass, and optimises by scope

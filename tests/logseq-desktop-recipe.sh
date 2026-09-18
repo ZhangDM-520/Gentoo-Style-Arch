@@ -74,6 +74,23 @@ for stage in "${stages[@]}"; do
     last=$line
 done
 
+# The recipe tree carries pnpm-workspace.yaml at its root with no `packages:`
+# field, so a bare `pnpm install` run from a subdirectory resolves the ROOT
+# project: it exits 0 without creating that subdirectory's node_modules, and the
+# subsequent `pnpm exec` cannot find its locally installed binary. The static
+# packaging step aborted on exactly that (2026-09-18); the cli install carries
+# the guard too.
+static_block=$(sed -n '/^  ( cd static$/,/executableName=logseq/p' "$pkgbuild")
+grep -Fq 'pnpm install --frozen-lockfile --ignore-workspace' <<<"$static_block" ||
+    fail "static install is not isolated from the repo-root pnpm workspace"
+
+# $srcdir/opam-root survives a failed run, so build() must tolerate an existing
+# switch: `opam switch create` exits 2 when the switch is already installed and
+# makepkg's errexit turns that into an abort before the first bundle is built
+# (2026-09-18).
+grep -Fq 'opam switch list --short' "$pkgbuild" ||
+    fail "opam switch creation is not guarded for a resumed build"
+
 # Optimisation standard: no hard-coded host ISA or optimisation level, and the
 # Electron exceptions are declared explicitly.
 if grep -Eq -- '-march=|-mtune=|-O[0-9]' "$pkgbuild"; then

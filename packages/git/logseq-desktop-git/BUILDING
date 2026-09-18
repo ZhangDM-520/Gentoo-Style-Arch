@@ -35,6 +35,17 @@ Heavy build dependencies, and why they are unavoidable:
 
 Notes:
 
+  * `cli/` and `static/` install with `--ignore-workspace`. The tree carries
+    `pnpm-workspace.yaml` at its root with no `packages:` field, so a bare
+    `pnpm install` run inside a subdirectory resolves the ROOT project instead:
+    it exits 0 without creating that subdirectory's `node_modules`. For
+    `static/` that silently left `electron-builder` unresolvable and aborted
+    the build (2026-09-18). Do not drop the flag.
+  * The opam switch is created only when absent. `makepkg` enables errexit for
+    `build()` while `$srcdir/opam-root` survives a failed run, so an
+    unconditional `opam switch create` aborts every retry with "There already
+    is an installed switch" (2026-09-18). Anything else added to `build()` must
+    also tolerate a populated `$srcdir`.
   * Electron is bundled from the version pinned in `resources/package.json`
     rather than taken from the repositories. The app ships its own
     `chrome-sandbox` helper (installed setuid root) and is packaged as an

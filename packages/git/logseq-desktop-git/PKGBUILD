@@ -137,7 +137,17 @@ build() {
   # Upstream pins OCaml 5.1.1 in the release workflow; Melange tracks the
   # version it was released against, so use the same compiler rather than the
   # repositories' newer one.
-  opam switch create "${OPAMSWITCH}" ocaml-base-compiler.5.1.1 -y
+  #
+  # Re-runnable guard: $srcdir/opam-root survives a failed or interrupted run,
+  # so a resumed makepkg restarts build() with the switch already installed —
+  # and `opam switch create` then exits 2 ("There already is an installed
+  # switch named ..."), which makepkg's errexit turns into an abort before the
+  # first bundle is built (2026-09-18). Creating it only when absent keeps
+  # first-run behaviour identical and reuses the pinned compiler that the
+  # interrupted run already installed. `opam init` above is already idempotent.
+  if ! opam switch list --short 2>/dev/null | grep -Fxq "${OPAMSWITCH}"; then
+    opam switch create "${OPAMSWITCH}" ocaml-base-compiler.5.1.1 -y
+  fi
   ( cd cli && opam install . --deps-only --with-test --yes )
 
   ## Frontend, worker, and CLI bundles (upstream build-desktop-release.yml)
@@ -155,7 +165,15 @@ build() {
   ## pkgver is <version>.r<count>.g<hash>; electron-builder validates the app
   ## version, so stamp the version the tree carries, as upstream does.
   ( cd static
-    pnpm install --frozen-lockfile
+    # --ignore-workspace is load-bearing, not cosmetic. The tree carries
+    # pnpm-workspace.yaml at its root with no `packages:` field, so a bare
+    # `pnpm install` from this subdirectory resolves the ROOT project: it
+    # installs the (already satisfied) root tree, exits 0 in under a second,
+    # and never creates static/node_modules — after which `pnpm exec
+    # electron-builder` has no local .bin entry to run and the build aborts
+    # with ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL (2026-09-18). This is the same
+    # guard the cli install above uses.
+    pnpm install --frozen-lockfile --ignore-workspace
     sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${pkgver%%.r*}\"/" package.json
     pnpm exec electron-builder --config electron-builder.yml --publish never \
       --dir -c.executableName=logseq

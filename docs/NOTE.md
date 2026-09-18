@@ -32,6 +32,104 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-18 — logseq: pnpm installed the repo root instead of `static`
+
+- **Symptom**: after the Java-virtual fix (below) the build ran every bundle
+  stage successfully — webpack app build, `desktop:prepare-runtime-js` — and
+  then aborted in the Electron packaging step:
+  `ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL Command "electron-builder" not found`,
+  followed by `==> ERROR: A failure occurred in build()`. Nothing in the log
+  named the install that was supposed to provide that binary.
+- **Root cause**: the upstream tree carries `pnpm-workspace.yaml` at **its**
+  root — since pnpm 10 that file holds non-auth settings, and this tree's copy
+  declares `shamefullyHoist` plus `allowBuilds` but **no `packages:` field** —
+  so `static/` is not a workspace member. pnpm 10.33 therefore resolved a
+  `pnpm install` run from inside `static/` to the **workspace root** (the repo
+  root) as the project to install. The root tree was already satisfied, so the
+  command installed nothing, printed `Done` and exited **0** in about half a
+  second; `static/node_modules` was never created and `pnpm exec
+  electron-builder` had no local `.bin` entry to run. `--frozen-lockfile` could
+  not catch this: the install *succeeded*, it just installed the wrong project,
+  and the missing `node_modules` is only discovered one step later by an
+  unrelated command whose error names the binary rather than the cause. The
+  recipe already carried the guard for its other subdirectory install —
+  `pnpm --dir cli install --frozen-lockfile --ignore-workspace` — so the hazard
+  was known and had simply not been applied to `static/`.
+- **Verification loop**: the exact recipe command, run in the `static/`
+  directory, reproduced the failure byte for byte — `rc=0`, no `static/node_modules`,
+  and `Progress: resolved 1, reused 1, downloaded 0, added 1, done`. The
+  decisive evidence is pnpm's reporter label `..`: the project path relative to
+  the working directory, i.e. the parent directory, i.e. the repo root. After
+  adding `--ignore-workspace` the same command installed the real tree in
+  14.7 s (`electron-builder 26.8.2`, `electron 42.3.0`,
+  `@zvec/bindings-linux-x64`) and `static/node_modules/.bin/electron-builder`
+  existed; `pnpm exec electron-builder --config electron-builder.yml
+  --publish never --dir -c.executableName=logseq` then exited 0 and produced
+  `static/dist/linux-unpacked/logseq` (209 853 656 bytes) with `chrome-sandbox`,
+  `resources/app.asar`, `resources/app.asar.unpacked/node_modules/{keytar,@zvec}`,
+  `resources/sidecar` and `resources/.agents/skills/logseq-cli/SKILL.md` all in
+  place.
+- **Fix**: the static packaging install became
+  `pnpm install --frozen-lockfile --ignore-workspace`, with a comment recording
+  why the flag is load-bearing. No metadata, dependency, or scheduler change was
+  needed — `makepkg --printsrcinfo` reproduces the committed `.SRCINFO`
+  byte-identically.
+- **Two side effects were checked rather than assumed**, because
+  `--ignore-workspace` also detaches the install from the root `.npmrc` and
+  `pnpm-workspace.yaml`: pnpm consequently ignores the `allowBuilds` /
+  `onlyBuiltDependencies` allowlists and does not populate
+  `node_modules/electron/dist`, and it drops `shamefully-hoist` for this tree.
+  Both are harmless here — electron-builder downloads the Electron 42.3.0
+  distribution itself (observed: 119 MB, 8.3 s) and the static package's own
+  `postinstall` (`install-app-deps`) rebuilds `keytar` for Electron
+  (`preparing`/`finished moduleName=keytar`), while the packer falls back to
+  `using manual traversal of node_modules to build dependency tree` and produced
+  the complete payload above.
+- **Tests**: `tests/logseq-desktop-recipe.sh` now extracts the `( cd static … )`
+  block and requires the install line to carry `--ignore-workspace`. The
+  assertion was red-verified (fails with the flag removed, passes with it) and
+  the full battery passes (15 fixtures).
+- **Rule**: a `pnpm install` run inside a subdirectory of a tree whose root has
+  a `pnpm-workspace.yaml` must pass `--ignore-workspace` unless that
+  subdirectory is a declared workspace member — otherwise the install silently
+  targets the root project and reports success. Treat a successful install that
+  creates no `node_modules` as the symptom, not the error from the command that
+  later fails to find a binary.
+
+## 2026-09-18 — logseq: a resumed build aborted on `opam switch create`
+
+- **Symptom**: found while validating the fix above. The first `makepkg` run in
+  that clone completed the opam stage, so `$srcdir/opam-root/logseq-cli`
+  existed; re-running the build — the normal action after any failure —
+  aborted with `[ERROR] There already is an installed switch named logseq-cli`
+  and `==> ERROR: A failure occurred in build()`, before a single bundle was
+  rebuilt. Every retry failed the same way, so the recipe was effectively
+  single-shot per clean source tree, and the fix above would never have
+  produced a package on the state the checkout was actually in.
+- **Root cause**: `build()` assumed a pristine `$srcdir`. `opam switch create`
+  exits **2** when the switch is already installed (measured), and makepkg's
+  `run_function_safe` enables `shopt -o -s errexit errtrace` (line 397 of
+  `/usr/bin/makepkg`), so a non-zero mid-`build()` command aborts the whole
+  run. The `opam init` on the preceding line is idempotent (rc=0 against an
+  initialized root, measured), which is why only this call was a problem.
+- **Fix**: create the switch only when it is absent —
+  `if ! opam switch list --short 2>/dev/null | grep -Fxq "${OPAMSWITCH}";
+  then opam switch create "${OPAMSWITCH}" ocaml-base-compiler.5.1.1 -y; fi`.
+  First-run behaviour is identical, and a resumed run reuses the pinned
+  OCaml 5.1.1 switch the interrupted run already installed instead of redoing
+  the opam work.
+- **Validation**: the guard was exercised both ways against the real opam root
+  — `logseq-cli` reports "exists, skip create", a bogus name reports "would
+  create". `tests/logseq-desktop-recipe.sh` asserts the guard is present and
+  was red-verified with a syntax-preserving mutation (the assertion fails while
+  `bash -n` still passes). The resumed full build completed with the switch
+  already in place, which is the same path a maintainer retry takes.
+- **Rule**: `build()` restarts from the top on every invocation while `$srcdir`
+  persists, so every step must be idempotent — `opam switch create`, `mkdir`,
+  `patch`, a bare `git clone`. errexit turns any of their non-zero exits into a
+  hard abort, and the error names the guard-less command rather than the reason
+  the tree is not pristine.
+
 ## 2026-09-18 — logseq: a concrete Java dependency demanded the removal of the JDK
 
 - **Symptom**: `makepkg -si` in `logseq-desktop-git` aborted before fetching
