@@ -47,6 +47,13 @@
    - provides live in .PKGINFO: any provides change needs a real rebuild
      (`makepkg -Rf` repackages without rebuilding).
    - verify artifacts: `tar -xOf pkg.tar.zst .PKGINFO | grep provides`.
+   - the mirror image applies to dependencies: request a capability through
+     its VIRTUAL, never through one concrete provider. `jre-openjdk` conflicts
+     with `jdk-openjdk` (and both conflict with a headless JRE), so naming one
+     can make pacman demand the removal of a package the dependency graph
+     needs; `java-runtime` is provided by every JDK and every full JRE. Same
+     rule for `java-environment` (JDK), `libgl` (libglvnd), `cron`, etc.
+     The 2026-09-18 logseq incident is the worked example.
 5. **Qt private-API coupling**: qt6/qt5-base-git update ⇒ rebuild ALL coupled
    all coupled Qt modules in the SAME pass; verify private tags
    (`nm -D --undefined-only | grep QtPrivate_`); never `-Syu` fresh base-git

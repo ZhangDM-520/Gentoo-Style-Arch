@@ -41,9 +41,18 @@ grep -Fq 'src/main/frontend/version.cljs' "$pkgbuild" ||
 
 # The desktop bundle embeds the ClojureScript frontend and the OCaml/Melange
 # CLI runtime; both toolchains must stay declared.
-for dep in clojure jre-openjdk ocaml opam nodejs pnpm; do
+for dep in clojure java-runtime ocaml opam nodejs pnpm; do
     has makedepends "$dep" || fail "missing makedepend: $dep"
 done
+
+# Java must be requested through the `java-runtime` virtual. A concrete
+# jre-*/jdk-* package is not just narrower, it is unusable: jre-openjdk
+# conflicts with jdk-openjdk, which `clojure` requires through
+# java-environment, so pacman aborted the transaction demanding the removal of
+# an installed JDK (2026-09-18).
+if grep -Eq "^[[:space:]]*'(jre|jdk)[a-z0-9_.+-]*'" "$pkgbuild"; then
+    fail "depends on a concrete jdk/jre package instead of java-runtime: $(grep -E "^[[:space:]]*'(jre|jdk)[a-z0-9_.+-]*'" "$pkgbuild")"
+fi
 
 # The desktop bundle is only produced by this sequence, in this order
 # (upstream .github/workflows/build-desktop-release.yml).

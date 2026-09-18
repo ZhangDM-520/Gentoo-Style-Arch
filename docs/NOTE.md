@@ -32,6 +32,44 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-18 — logseq: a concrete Java dependency demanded the removal of the JDK
+
+- **Symptom**: `makepkg -si` in `logseq-desktop-git` aborted before fetching
+  anything:
+  `jre-openjdk-26.0.2.u10-2 and jdk-openjdk-26.0.2.u10-2 are in conflict. Remove
+  jdk-openjdk? [y/N]` — then `failed to prepare transaction (conflicting
+  dependencies)` and `Missing dependencies: clojure, jre-openjdk, ocaml, opam`.
+- **Root cause**: the recipe's `makedepends` named the concrete package
+  `jre-openjdk` to satisfy "shadow-cljs needs a JVM". Arch's OpenJDK packages
+  are mutually exclusive — `jre-openjdk` conflicts with `jdk-openjdk` (and both
+  conflict with `jre-openjdk-headless`) — while `clojure`, which the same
+  `makedepends` requires, itself depends on `java-environment`, i.e. on a JDK.
+  So the recipe asked for a package that cannot coexist with the package the
+  recipe's own dependency graph installs, and pacman's only way to satisfy both
+  was to remove the JDK. The JRE entry was redundant as well: nothing in the
+  build compiles Java (shadow-cljs emits JavaScript).
+- **Verification loop**: `pacman -T` over the recipe's `depends` + `makedepends`
+  is precisely makepkg's own gate (`check_deps()` → `run_pacman -T`, and only
+  the resulting *missing* list is installed). Before the fix it printed
+  `clojure jre-openjdk ocaml opam`, matching the user's log byte for byte;
+  after it prints `clojure ocaml opam`. `pacman -Sp clojure java-runtime ocaml
+  opam` also resolves with no conflict prompt.
+- **Fix**: `'jre-openjdk'` → `'java-runtime'`. Every JDK and every full JRE
+  provides that virtual, so any installed Java satisfies it (`pacman -T
+  java-runtime` → rc=0 on the host) and nothing extra is downloaded; a
+  headless-only JRE would still be satisfied by the JDK that `clojure`
+  requires anyway. Upstream is consistent with this: its release workflow uses
+  `actions/setup-java` (a JDK), and nothing in the tree invokes `javac` or
+  reads `JAVA_HOME`.
+- **Tests**: `tests/logseq-desktop-recipe.sh` now requires `java-runtime` and
+  fails on any `'(jre|jdk)…'` entry in the recipe (both branches red-verified),
+  and `.SRCINFO` was regenerated — the fixture's parity check caught the stale
+  file immediately.
+- **Rule**: request a capability through its virtual, never through one
+  concrete provider (golden rule 4). A concrete provider can be *mutually
+  exclusive* with another package the same dependency graph needs, at which
+  point the graph is unsatisfiable rather than merely narrow.
+
 ## 2026-09-17 — sudo keepalive stopped runs for nothing, then spammed
 
 - **Symptom** (screenshot from a `-i` run): a three-line block — "sudo timestamp

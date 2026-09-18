@@ -16,8 +16,14 @@ supported way to produce a desktop bundle at the moment:
 Heavy build dependencies, and why they are unavoidable:
 
   * `pnpm` + `nodejs` (>= 22.20) drive every JavaScript bundle.
-  * `clojure` + a JRE compile the ClojureScript frontend and the Electron main
-    process. The Maven and git dependencies are fetched on first build.
+  * `clojure` + a Java runtime compile the ClojureScript frontend and the
+    Electron main process. The Maven and git dependencies are fetched on first
+    build. Java is requested as the `java-runtime` virtual, so any installed
+    JDK or JRE satisfies it; upstream CI also uses a JDK (`setup-java`, Java
+    21), and `clojure` itself requires `java-environment`. Naming a concrete
+    package here is not merely narrower: `jre-openjdk` conflicts with
+    `jdk-openjdk`, so it demanded the removal of the JDK the build needs
+    (2026-09-18).
   * `ocaml` + `opam` build the CLI runtime. Upstream removed the ClojureScript
     CLI and bundles `cli/` with Melange (`cli/dune`) before Vite packages it.
     The recipe creates its own switch under `$srcdir/opam-root`, so the

@@ -60,9 +60,15 @@ makedepends=(
   # Node toolchain: pnpm drives every JavaScript bundle
   'nodejs'
   'pnpm'
-  # shadow-cljs frontend and webpack app bundles
+  # shadow-cljs frontend and webpack app bundles.
+  # Java is declared through the `java-runtime` virtual, never a concrete
+  # jre-*/jdk-* package: jre-openjdk CONFLICTS with jdk-openjdk, so naming one
+  # made pacman demand the removal of the JDK that `clojure` itself requires
+  # (`clojure` depends on java-environment) and refused to resolve the
+  # transaction. Every JDK and every full JRE provides java-runtime, so any
+  # installed Java satisfies this and nothing is installed twice.
   'clojure'
-  'jre-openjdk'
+  'java-runtime'
   # OCaml/Melange CLI bundle (cli/): a private opam switch is created in
   # $srcdir, so the build never touches the builder's ~/.opam
   'ocaml'
