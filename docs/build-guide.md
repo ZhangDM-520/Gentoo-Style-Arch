@@ -131,23 +131,48 @@ everything), `S` (sync), `U` (remount read-only), `B` (reboot). If the screen is
 dead but the box is alive, `Ctrl+Alt+F3` reaches a virtual console — and the
 kernel messages on it settle whether the kernel or only the display died.
 
-`tools/texlive-split-probe.sh` measures a build step with a sampler and a
-watchdog: it records PSI, D-state process counts, device utilisation and await,
-zram usage and XFS metadata counters once a second, prints them live, and kills
-the run when a threshold trips. It reproduces the texlive `prepare()` split loop
-on a hardlink farm (the real tree is never modified) so the loop can be measured
-without endangering anything, and `--watch-cmd` instruments any command instead:
+**Measure it instead of guessing.** `tools/texlive-split-probe.sh` samples the
+machine once a second — PSI, D-state process counts, device utilisation and
+await, dirty/writeback backlog, zram, XFS counters — prints the same line live,
+and reports the peaks when the run ends. The last frame on screen is evidence if
+the box dies. Four ways to point it at something:
 
 ```sh
-tools/texlive-split-probe.sh --stage full --collections fontsrecommended   # farm, throttled
-tools/texlive-split-probe.sh --watch-cmd 'makepkg -si' --cwd packages/git/texlive-texmf --unsafe --yes-unsafe
+# a build step it owns: the texlive split loop, on a hardlink farm
+# (the real tree is never touched), inside a cgroup
+tools/texlive-split-probe.sh --stage full --collections fontsrecommended
+tools/texlive-split-probe.sh --legacy-loop --collections fontsextra   # pre-rewrite loop
+
+# somebody else's command — including a build you started by hand
+tools/texlive-split-probe.sh --watch-cmd 'makepkg -si' --cwd <recipe> --unsafe --yes-unsafe
+tools/texlive-split-probe.sh --watch-pid <pid>          # attach to a running build
 ```
 
-It is a diagnostic, not a test: it is heavy and mutating, lives outside
-`tests/`, and `--unsafe` prints the SysRq runbook before it runs anything without
-cgroup limits. `tests/probe-watchdog.sh` pins the abort paths it depends on
-(wall-clock cap and a resource threshold both stop the run, name themselves, and
-kill the wrapped command).
+Rules it follows, learned the hard way:
+
+* **A watch mode never kills what it watches.** `--watch-cmd`/`--watch-pid`
+  sample somebody's build; an abort or timeout stops the sampling and says so,
+  and the build keeps running. Only a farm run, whose workload the probe owns,
+  is stopped by an abort.
+* **Evidence outlives a failure.** A run that aborts or fails always keeps its
+  scratch directory and prints the path (`--keep` extends that to clean runs).
+  Do not delete those directories by glob while a run is in flight — that has
+  already cost one experiment's samples.
+* The default wall-clock cap is 300 s for a farm run and 4 h in a watch mode, so
+  a measurement window cannot cut a real build short by accident.
+* `--unsafe` drops the cgroup limits (needed when the machine has no user
+  manager, as on a bare console) and prints the SysRq runbook first.
+
+It is a diagnostic, not a test: heavy, mutating, host-side, deliberately outside
+`tests/`. `tests/probe-watchdog.sh` pins its contract — watch aborts leave the
+command alone, farm aborts stop it, the sample log survives, and the columns keep
+their shape.
+
+**What it found here**: at full real scale (105,846 renames in 264 s) the texlive
+split moved io PSI 0.00 with ≤2 processes in D state and ≤16 % device
+utilisation, and the two freezes have not recurred across two further
+full-weight runs (one console-only, one a complete `makepkg -si`). The loop was
+not the cause.
 
 ### mkinitcpio and optional NvPCR definitions
 

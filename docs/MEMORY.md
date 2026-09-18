@@ -202,6 +202,12 @@ OpenShadingLanguage -> blender.
 - Qt private APIs and LLVM snapshots require consumer rebuild batches.
 - Shared mirrors must have the exact origin URL and a usable fetch refspec.
 - A populated non-Git source path is never replaced automatically.
+- Build in the runtime clone, never in this repository. A run started here left
+  24 GB of SVN checkout, split tree and packaging state inside the published
+  repository's directory (recovered by `rm -rf` on the four ignored paths). The
+  recipes are ignored-safe, but nothing about a build belongs here — and
+  `.state/` logs are Git-ignored too, so a run's forensics die with the clone
+  unless `GSA_STATE_DIR` points somewhere durable.
 - `texlive-texmf`'s `prepare()` MOVES ~150k files out of `$srcdir/texmf-dist`,
   so that tree is single-use: a resume over an already-split checkout fails on
   purpose (13,870 of 150,746 runfiles were gone in this one) and needs
@@ -332,18 +338,26 @@ going stale.
   `rm` line and never recorded what it targeted. The current trim already drops
   pre-amdgpu `radeon` and the unused vendor directories, and upstream has no
   `legacy/` tree, so the item is either redundant or needs re-specifying.
-- **Hard freezes during texlive builds (2026-09-18, cause not yet proven)**:
-  the split loop is *exonerated* by measurement (105,846 renames: io PSI 0.00,
-  ≤2 D-state processes, ≤16 % device utilisation). Differential runs queued, in
-  this order: NVMe ASPM off (`pcie_aspm=powersave` is in `/etc/default/limine`
-  on a WD SN560 whose link has L1 + L1.2 enabled) → `ananicy-cpp` stopped → zram
-  resized (`zram-size = ram * 2.5` is 75 GB of RAM-backed swap on a 29 GiB
-  machine, which can never be used and removes the last reclaim fallback).
-  Two prerequisites done: `kernel.sysrq=1` (was `16`, i.e. no recovery keys, so
-  three freezes cost three hard resets — the drive reports 63 unsafe shutdowns)
-  and `tools/texlive-split-probe.sh` for sampling any command. Still to do:
-  make that sysrq value persistent, and drop `nowatchdog` so a future hang
-  panics and leaves a trace.
+- **Hard freezes during texlive builds (2026-09-18): no longer reproducible, so
+  the cause is unproven and the device is still suspect.** Two freezes, then
+  three full-weight runs without one: the probe's throttled farm run (105,846
+  renames, io PSI 0.00, ≤2 D-state, ≤16 % device utilisation), the maintainer's
+  console-only run of the pre-rewrite loop, and a complete `makepkg -si` that
+  built and installed all 23 packages from a fresh 19 GB checkout. The split
+  loop is therefore *not* the cause, and by elimination an intermittent device
+  or kernel fault is what remains — the freezes bracketed the SVN write path
+  (boot `-2` died during the checkout, boot `-1` 58 s after it finished), which
+  no successful run has yet reproduced at the same moment. Differential runs,
+  in this order: NVMe ASPM off (`pcie_aspm=powersave` is in
+  `/etc/default/limine` on a WD SN560 whose link runs L1 + L1.2) → `ananicy-cpp`
+  stopped → zram resized (`zram-size = ram * 2.5` is 75 GB of RAM-backed swap on
+  a 29 GiB machine: unusable, and it removes the last reclaim fallback). A
+  phase-free test is cheaper than any of those: a plain 20 GB write burst under
+  `tools/texlive-split-probe.sh --watch-cmd`. Done already: `kernel.sysrq=1`
+  (was `16` — no recovery keys, so three freezes cost three hard resets; the
+  drive reports 63 unsafe shutdowns), and the probe itself. Still to do: make
+  that sysrq value persistent, and drop `nowatchdog` so a future hang panics
+  and leaves a trace.
 - systemd is a separately coupled effort whenever its recipe changes.
 
 Deleted as done in this pass (each was verified, not assumed): the

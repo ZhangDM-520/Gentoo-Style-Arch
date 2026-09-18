@@ -149,6 +149,25 @@ dependency edges, and incident root causes are unaffected by the renames.
   identical file hashes. The fixture earned its keep during the rewrite: an
   accumulated `AddFormat` list that kept a trailing newline made the follow-up
   `read` loop iterate once more and the `grep` match a second time.
+- **Outcome (same day, resolved as "not the recipe")**: the maintainer ran the
+  frozen pre-rewrite loop at full `fontsextra` weight from a console with no
+  compositor and it **completed**; then built the package for real with
+  `makepkg -si` in the desktop session and it **built and installed** (23
+  archives, `texlive-meta` 2026.1-1 at 13:10, ~4 min of split on a fresh 19 GB
+  checkout). So two independent full-weight runs of the exact workload that was
+  mid-flight both freezes have since finished. A workload that resolves the
+  symptom does not reproduce it, which leaves an intermittent device or kernel
+  fault as the remaining explanation, and the ASPM/zram/ananicy differentials in
+  `MEMORY.md` §5 as the next step. Nothing was changed on the host to make the
+  builds succeed.
+- **The part worth keeping: the freezes were diagnosable only by luck.** The
+  journal was persistent, so `journalctl -b -1` still held the dead boot's kernel
+  log; the recipe's own log did not exist (`.state/` was gone), and no lockup
+  detector was armed (`nowatchdog`), no recovery key worked (`kernel.sysrq=16`),
+  and a wildcard `rm -rf /tmp/texlive-split-probe.*` deleted the samples of a run
+  that was still in flight — a probe now keeps its evidence whenever a run does
+  not finish cleanly, and nobody should clean `/tmp` by glob while they are
+  sampling a live build.
 - **Rule**: a bulk `prepare()` that moves files must (a) refuse to run on
   incomplete inputs instead of shipping a quietly broken package, and (b) be
   batched — these loops cost process spawns, not bytes. And when a machine
