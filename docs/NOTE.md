@@ -32,6 +32,89 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — kernel: the build freezes were CVE-2026-90432; recipe moved to the CachyOS RC channel
+
+- **Symptom**: any build could hard-freeze the machine — last frame stuck, no
+  keyboard or mouse, hard power-off the only recovery — and it was independent
+  of build weight. Nothing was ever recorded: no panic, oops, MCE, RCU stall,
+  hung-task report or OOM in any retained journal.
+- **Root cause**: `CVE-2026-90432`, "sched_ext: Abort directly from the
+  hardlockup handler" (Tejun Heo, 2026-07-27; `Fixes: bd2d76455b65 "sched_ext:
+  Defer scx_hardlockup() out of NMI"`). `scx_hardlockup()` deferred the abort to
+  an `irq_work`, and *"the perf watchdog fires on the hard-locked CPU itself,
+  where a queued irq_work never runs with IRQs off"* — so a stalled sched_ext
+  scheduler left that CPU hard-locked for good. The same commit notes the
+  handler *"used to return %true whenever sched_ext was loaded, suppressing the
+  kernel's hardlockup report even when the abort was refused"*, which is why
+  every journal was blank. Affected `7.1 <= v < 7.2.6`; fixed in 7.2.6+ /
+  7.3-rc1+. Stable backport `4d6270bbb…`, upstream `3c4b38064…`, file
+  `kernel/sched/ext/ext.c`.
+- **Why it was hard to see**: every crash kernel (7.2.2-1, 7.2.3-ck1-1,
+  7.2.4-ck1-1, 7.2.4-1.1, 7.2.5-1) lies inside the affected range, so the earlier
+  "six kernel packages crashed, therefore not a kernel regression" reading was
+  wrong; the one kernel never booted during a crash (`linux-cachyos-lts` 6.18.52)
+  is the one outside the range. The trigger is a fork/exec + I/O storm — i.e.
+  any build — which is why build weight never mattered. Upstream's own analysis
+  (`sched-ext/scx#3687`, closed 2026-08-18) describes the same framework-side
+  fault affecting **all** sched_ext schedulers, with the same workload shape
+  ("fork/exec-heavy I/O load", "concurrent fsync, `O_DIRECT` and fork-mode I/O"),
+  and measured 1 unrecoverable freeze in 30 induced stall runs on a 12-CPU guest
+  — this host has 24 threads. Field report `sched-ext/scx#3667` names
+  `scx_pandemonium` directly. The 2026-09-18 texlive freezes are the same fault:
+  that workload is the same fork/exec + I/O pattern, so the NVMe-ASPM /
+  `ananicy-cpp` / zram leads are retired.
+- **Why nothing was captured**: besides the CVE suppressing the report, the host
+  had `nowatchdog` (so `nmi_watchdog=0`), `hardlockup_panic=0`,
+  `panic=0`/`panic_on_oops=0`, `kernel.sysrq=16` (sync only) and a 5-minute
+  journald `SyncIntervalSec`. It was configured to be undiagnosable. The chain is
+  now armed — see `MEMORY.md` §5.
+- **Fix**: `packages/misc/linux-cachyos` moved from the 7.2 stable channel to the
+  CachyOS RC channel — `_major=7.3`, `_rcver=rc3`, `_tagrel=4`,
+  `pkgver=${_major}.${_rcver}` = `7.3.rc3`, `_srctag=cachyos-7.3-rc3-4`.
+- **Version-sensitive follow-on**: `_patchsource` is scoped by `_major`, so one
+  bump invalidates every patch filename. The 7.3 set has no
+  `misc/0001-rt-i915.patch` (CachyOS added it to 7.2 on 2026-06-29 and never
+  carried it forward; it touches `drivers/gpu/drm/i915/` and `kernel/ksysfs.c`,
+  so its absence affects Intel GPUs only), no `sched/0001-prjc-cachy.patch` and
+  no `misc/0001-hardened.patch`, and the nvidia patches renumber
+  (`0002`/`0003` → `0001`/`0002`, plus a new `0003-Pass-dmem_cgroup_init…`).
+  CachyOS's own 7.3 RC PKGBUILD still names rt-i915, but only in a branch its
+  default `_cpusched=cachyos` cannot reach — dead code there, a 404 here.
+  `config` was replaced with `linux-cachyos-rc/config`: 185 lines differ from the
+  7.2 rt-bore config, 12 of them tool versions and the rest symbol churn, while
+  `PREEMPT`/`PREEMPT_DYNAMIC`/`HZ=300`/`NO_HZ_FULL`/`RCU_BOOST` are identical and
+  the variant identity is applied by `scripts/config` anyway. `_nv_ver` also
+  moved 610.57.04 → 615.71.09 to match upstream.
+- **Trap worth remembering**: the recipe's startdir *is* `SRCDEST`, and the
+  tracked patch files sitting there are what makepkg actually uses — so
+  `updpkgsums` printed "Found <file>" and re-summed the stale 7.2
+  `0001-bore-cachy.patch` (40,750 B) instead of fetching the 7.3 one (42,503 B).
+  Green sums, wrong patch. Replaced by hand; `0001-rt-i915.patch` deleted as
+  unreferenced.
+- **Validation**: tarball signature `Good signature from "Peter Jung
+  <admin@ptr1337.dev>"`, fingerprint
+  `E8B9AA39F054E30E8290D492C3C4820857F654FE` — matching `validpgpkeys`, so no
+  `--skippgpcheck`; both patches apply cleanly to the extracted
+  `cachyos-7.3-rc3-4` tree (`patch -Np1 --dry-run`); `PREEMPT_RT`, `SCHED_BORE`
+  and `CACHY` still exist in the new tree, so no silent variant loss;
+  `bash tests/run-all.sh` PASS (20 fixtures), including the repo-wide
+  `srcinfo-freshness` (126 recipes); `--audit`, `--list` and `--dry-run -g misc`
+  clean. The earlier 6-minute `-c --no-deps bettbox` rebuild passed (Tctl 91 °C)
+  but ran with sched_ext unloaded, so it is a smoke test, not a control.
+  The hand-holding this bump needed is now pinned by
+  `tests/kernel-recipe-version.sh`: the tarball URL must name `pkgver`, and every
+  `_patchsource` URL must sit under the `pkgver`'s major. Verified red on both —
+  a hardcoded `_srcname` and a patch set scoped to `master/7.2` each fail with a
+  named reason, and both were reverted before the run.
+- **Still open**: the 2026-09-01 cluster — four unclean shutdowns inside 27
+  minutes, the first ten minutes after `ryzenadj` + `ryzen_smu-dkms-git` were
+  installed and **before `scx-scheds-git` existed** — cannot be this CVE. See
+  `MEMORY.md` §5.
+- **Rule**: before blaming a workload for a hard freeze, check the build host's
+  kernel against the sched_ext abort/lockup CVEs; and when a freeze leaves *no*
+  trace at all, suspect a handler that suppresses the report rather than an
+  absence of faults.
+
 ## 2026-09-19 — bettbox: a host freeze corrupted the Go module cache
 
 - **Symptom**: `fish build-all.fish -g third-party` failed inside bettbox's

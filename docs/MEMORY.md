@@ -338,50 +338,51 @@ going stale.
   `rm` line and never recorded what it targeted. The current trim already drops
   pre-amdgpu `radeon` and the unused vendor directories, and upstream has no
   `legacy/` tree, so the item is either redundant or needs re-specifying.
-- **Hard freezes during texlive builds (2026-09-18): no longer reproducible, so
-  the cause is unproven and the device is still suspect.** Two freezes, then
-  three full-weight runs without one: the probe's throttled farm run (105,846
-  renames, io PSI 0.00, ≤2 D-state, ≤16 % device utilisation), the maintainer's
-  console-only run of the pre-rewrite loop, and a complete `makepkg -si` that
-  built and installed all 23 packages from a fresh 19 GB checkout. The split
-  loop is therefore *not* the cause, and by elimination an intermittent device
-  or kernel fault is what remains — the freezes bracketed the SVN write path
-  (boot `-2` died during the checkout, boot `-1` 58 s after it finished), which
-  no successful run has yet reproduced at the same moment. Differential runs,
-  in this order: NVMe ASPM off (`pcie_aspm=powersave` is in
-  `/etc/default/limine` on a WD SN560 whose link runs L1 + L1.2) → `ananicy-cpp`
-  stopped → zram resized (`zram-size = ram * 2.5` is 75 GB of RAM-backed swap on
-  a 29 GiB machine: unusable, and it removes the last reclaim fallback). A
-  phase-free test is cheaper than any of those: a plain 20 GB write burst under
-  `tools/texlive-split-probe.sh --watch-cmd`. Done already: `kernel.sysrq=1`
-  (was `16` — no recovery keys, so three freezes cost three hard resets; the
-  drive reports 63 unsafe shutdowns), and the probe itself.
-- **Capture chain armed, and the history is much longer (2026-09-19).** The
-  outstanding item above — persistent `kernel.sysrq` and no `nowatchdog` — is
-  done, with the rest of the chain: `/etc/sysctl.d/99-diagnostic.conf`
-  (`watchdog_thresh=30`, watchdog plus both lockup detectors,
-  `softlockup_panic`/`hardlockup_panic`/`softlockup_all_cpu_backtrace`/
-  `hung_task_panic`/`panic_on_oops`=1, `panic=10`, `sysrq=1`, re-applied every
-  boot); `nowatchdog` removed from `/etc/default/limine` and the matching
-  `*_panic=1`/`panic=10` parameters added; journald `SyncIntervalSec=1s` +
-  `SystemMaxUse=1G` in `/etc/systemd/journald.conf.d/10-diagnostic.conf`; and
-  `gsa-heartbeat.service`, a 5 s timestamp to `/var/log/heartbeat.log` and the
-  journal that separates a dead kernel from a dead display. `efi_pstore` was
-  **disabled by default** (`pstore_disable=Y`), so `/sys/fs/pstore` could never
-  have received anything; set to `N`, the chain was validated with a deliberate
-  `Alt+SysRq+c` — the panic landed in pstore in 17 compressed records and the
-  machine self-rebooted in 27 s, and **never reached the journal**. `last -x`
-  over the whole wtmp (machine installed 2026-08-31 15:20) then showed ~23
-  unclean shutdowns beginning **2026-09-01 00:37**, ten minutes after
-  `ryzenadj` + `ryzen_smu-dkms-git` were installed and before `scx-scheds-git`
-  existed, continuing across four kernel packages — chronic, not a 09-18
-  episode, and not a kernel regression. So the `ryzenadj` undervolt applied at
-  every login joins `scx_pandemonium` and the NVMe lead as a live hypothesis
-  (its per-core `--set-coper` half is unverifiable: CO cannot be read back and
-  the script discards ryzenadj's exit status). The AER counters are all zero on
-  both the NVMe device and its root port, so the link fault remains absence of
-  evidence. One full-length 6-minute rebuild (Tctl 91 °C) has since passed with
-  no freeze — but with sched_ext unloaded, so it is not a control.
+- **Build freezes: root cause identified — CVE-2026-90432, carried by our own
+  kernel recipe (2026-09-19).** `scx_hardlockup()` deferred the sched_ext abort
+  to an `irq_work`; on a hard-locked CPU with IRQs off that work never runs, so
+  a scheduler stall wedged the machine instead of recovering. The handler also
+  returned `%true` whenever sched_ext was loaded, **suppressing the kernel's own
+  hardlockup report** — which is why no journal ever held a trace. Affected
+  7.1 ≤ v < 7.2.6; fixed in 7.2.6+ and 7.3-rc1+. Every crash kernel (7.2.2,
+  7.2.3-ck1, 7.2.4-ck1, 7.2.5) sits inside the affected range, and the one
+  kernel never booted during a crash (`linux-cachyos-lts` 6.18.52) is the one
+  outside it. The trigger is a fork/exec + I/O storm — i.e. any build — which is
+  why build weight never mattered; upstream's own analysis (`sched-ext/scx#3687`)
+  measured 1 freeze in 30 induced stall runs on a 12-CPU guest, and this host
+  has 24 threads. That also retires the 2026-09-18 texlive leads recorded here
+  before (NVMe ASPM, `ananicy-cpp`, zram, a 20 GB write burst): a texlive build
+  is the same fork/exec + I/O pattern, so those freezes were this fault. Fix:
+  `packages/misc/linux-cachyos` moved onto the CachyOS RC channel
+  (`cachyos-7.3-rc3-4`) — recipe done, build/install pending. The evidence is
+  upstream-documented plus circumstantial; the confirming A/B was skipped by
+  decision, so read "identified" as strong, not proven.
+- **Capture chain armed (2026-09-19) — keep it, it is what makes a future freeze
+  readable.** `/etc/sysctl.d/99-diagnostic.conf` (`watchdog_thresh=30`, watchdog
+  plus both lockup detectors, `softlockup_panic`/`hardlockup_panic`/
+  `softlockup_all_cpu_backtrace`/`hung_task_panic`/`panic_on_oops`=1, `panic=10`,
+  `sysrq=1`, re-applied every boot); `nowatchdog` removed from
+  `/etc/default/limine` with the matching `*_panic=1`/`panic=10` parameters
+  added; journald `SyncIntervalSec=1s` + `SystemMaxUse=1G` in
+  `/etc/systemd/journald.conf.d/10-diagnostic.conf`; and `gsa-heartbeat.service`,
+  a 5 s timestamp to `/var/log/heartbeat.log` and the journal that separates a
+  dead kernel from a dead display. `efi_pstore` was **disabled by default**
+  (`pstore_disable=Y`), so `/sys/fs/pstore` could never have received anything;
+  set to `N`, the chain was validated with a deliberate `Alt+SysRq+c` — the
+  panic landed in pstore in 17 compressed records and the machine self-rebooted
+  in 27 s, and **never reached the journal**. pstore is the channel for a hard
+  crash, not journald; do not read an empty journal as "nothing happened".
+- **Still open: the 2026-09-01 cluster.** `last -x` over the whole wtmp (machine
+  installed 2026-08-31 15:20) shows ~23 unclean shutdowns, but the first four
+  are a separate event: inside 27 minutes, the first ten minutes after
+  `ryzenadj` + `ryzen_smu-dkms-git` were installed, and **before
+  `scx-scheds-git` existed** (first installed 2026-09-03 17:52) — so the CVE
+  above cannot explain them. Prime suspect is the `ryzenadj` undervolt applied
+  at every login: its per-core `--set-coper` half is unverifiable, because CO
+  cannot be read back and the script discards `ryzenadj`'s exit status. All AER
+  counters are zero on both the NVMe device and its root port, so the link-fault
+  lead is still absence of evidence. One full-length 6-minute rebuild (Tctl
+  91 °C) passed with no freeze — with sched_ext unloaded, so it is not a control.
 - systemd is a separately coupled effort whenever its recipe changes.
 
 Deleted as done in this pass (each was verified, not assumed): the
@@ -413,6 +414,26 @@ recipe).
   previous hash. Only three fixtures checked `.SRCINFO` (each its own recipe);
   `tests/srcinfo-freshness.sh` now regenerates and diffs every recipe listed in
   `config/packages.map` (~32 s at `-P 8`, `GSA_SRCINFO_JOBS` to override).
+- **The kernel patch set is version-scoped, and `updpkgsums` prefers a cached
+  copy over the URL** (2026-09-19, `linux-cachyos`): `_patchsource` is
+  `.../kernel-patches/master/${_major}`, so one version bump invalidates *every*
+  patch filename at once. The 7.3 set carries only `sched/0001-bore-cachy.patch`,
+  `misc/dkms-clang.patch` and `misc/nvidia/`: `misc/0001-rt-i915.patch`,
+  `sched/0001-prjc-cachy.patch` and `misc/0001-hardened.patch` no longer exist,
+  and the nvidia patches renumber (`0002`/`0003` → `0001`/`0002`). Worse, the
+  recipe's startdir *is* `SRCDEST`, and the tracked patch files sitting there are
+  the ones makepkg actually uses — so `updpkgsums` prints "Found <file>" and
+  re-sums the stale local copy rather than fetching the new one. The sums stay
+  green while the build applies the previous kernel's patch (7.3's
+  `0001-bore-cachy.patch` is 42,503 B against 7.2's 40,750 B). Refresh the
+  tracked copies by hand (or delete them) before trusting the sums, then prove
+  each one with `patch -Np1 --dry-run` against the extracted tarball. Related:
+  `scripts/config` sets symbols blindly and `olddefconfig` then drops the
+  unknown ones, so a symbol that vanished upstream is a **silent** feature loss —
+  check the ones that carry the variant's identity (`PREEMPT_RT`, `SCHED_BORE`)
+  still exist in the new tree. `tests/kernel-recipe-version.sh` now pins the part
+  that is checkable offline: the tarball URL must name `pkgver`, and every
+  `_patchsource` URL must sit under the `pkgver`'s major.
 - **Soname provides — the full mechanism** (libunwind/wireplumber/gegl/babl):
   pacman 7.1 does NOT derive soname provides at `-U` time and makepkg does
   NOT synthesize them for undeclared libs (`autodeps` is config-only and
