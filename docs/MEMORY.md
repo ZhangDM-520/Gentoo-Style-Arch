@@ -355,9 +355,33 @@ going stale.
   phase-free test is cheaper than any of those: a plain 20 GB write burst under
   `tools/texlive-split-probe.sh --watch-cmd`. Done already: `kernel.sysrq=1`
   (was `16` — no recovery keys, so three freezes cost three hard resets; the
-  drive reports 63 unsafe shutdowns), and the probe itself. Still to do: make
-  that sysrq value persistent, and drop `nowatchdog` so a future hang panics
-  and leaves a trace.
+  drive reports 63 unsafe shutdowns), and the probe itself.
+- **Capture chain armed, and the history is much longer (2026-09-19).** The
+  outstanding item above — persistent `kernel.sysrq` and no `nowatchdog` — is
+  done, with the rest of the chain: `/etc/sysctl.d/99-diagnostic.conf`
+  (`watchdog_thresh=30`, watchdog plus both lockup detectors,
+  `softlockup_panic`/`hardlockup_panic`/`softlockup_all_cpu_backtrace`/
+  `hung_task_panic`/`panic_on_oops`=1, `panic=10`, `sysrq=1`, re-applied every
+  boot); `nowatchdog` removed from `/etc/default/limine` and the matching
+  `*_panic=1`/`panic=10` parameters added; journald `SyncIntervalSec=1s` +
+  `SystemMaxUse=1G` in `/etc/systemd/journald.conf.d/10-diagnostic.conf`; and
+  `gsa-heartbeat.service`, a 5 s timestamp to `/var/log/heartbeat.log` and the
+  journal that separates a dead kernel from a dead display. `efi_pstore` was
+  **disabled by default** (`pstore_disable=Y`), so `/sys/fs/pstore` could never
+  have received anything; set to `N`, the chain was validated with a deliberate
+  `Alt+SysRq+c` — the panic landed in pstore in 17 compressed records and the
+  machine self-rebooted in 27 s, and **never reached the journal**. `last -x`
+  over the whole wtmp (machine installed 2026-08-31 15:20) then showed ~23
+  unclean shutdowns beginning **2026-09-01 00:37**, ten minutes after
+  `ryzenadj` + `ryzen_smu-dkms-git` were installed and before `scx-scheds-git`
+  existed, continuing across four kernel packages — chronic, not a 09-18
+  episode, and not a kernel regression. So the `ryzenadj` undervolt applied at
+  every login joins `scx_pandemonium` and the NVMe lead as a live hypothesis
+  (its per-core `--set-coper` half is unverifiable: CO cannot be read back and
+  the script discards ryzenadj's exit status). The AER counters are all zero on
+  both the NVMe device and its root port, so the link fault remains absence of
+  evidence. One full-length 6-minute rebuild (Tctl 91 °C) has since passed with
+  no freeze — but with sched_ext unloaded, so it is not a control.
 - systemd is a separately coupled effort whenever its recipe changes.
 
 Deleted as done in this pass (each was verified, not assumed): the
@@ -371,6 +395,24 @@ recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
+- **An unclean shutdown zeroes freshly written files** (2026-09-19, bettbox):
+  XFS log recovery restores metadata without the data of the last seconds, so a
+  file keeps its size and mtime with zeroed content — undetectable by any size
+  check. It broke `go mod tidy` (`zip: not a valid zip file`) while the recipe
+  was correct, and it zeroed the agent's own session `plan.md` mid-write. For a
+  Go recipe the red signal is `go mod verify` in the module's directory, and the
+  repair after a hard freeze is `go clean -modcache` (a targeted purge cannot see
+  the size-preserving class). `tools/go-modcache-check.sh` detects the four
+  detectable classes read-only; `tests/modcache-check.sh` pins it. Generally:
+  after any hard power-off, verify the *consumer* of the file before blaming the
+  recipe or the tool.
+- **A version bump must regenerate `.SRCINFO`** (2026-09-19, bettbox): it pins
+  pkgver, provides, the source URL and sha256sums, so a stale copy makes anything
+  consuming the recipe build the wrong sources against the wrong sums —
+  silently. bettbox's PKGBUILD was 1.19.2 while `.SRCINFO` was 1.19.1 with the
+  previous hash. Only three fixtures checked `.SRCINFO` (each its own recipe);
+  `tests/srcinfo-freshness.sh` now regenerates and diffs every recipe listed in
+  `config/packages.map` (~32 s at `-P 8`, `GSA_SRCINFO_JOBS` to override).
 - **Soname provides — the full mechanism** (libunwind/wireplumber/gegl/babl):
   pacman 7.1 does NOT derive soname provides at `-U` time and makepkg does
   NOT synthesize them for undeclared libs (`autodeps` is config-only and

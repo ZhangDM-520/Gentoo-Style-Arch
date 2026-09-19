@@ -32,6 +32,129 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — bettbox: a host freeze corrupted the Go module cache
+
+- **Symptom**: `fish build-all.fish -g third-party` failed inside bettbox's
+  `build()` — `run go mod tidy` →
+  `verifying github.com/xyproto/randomstring@v1.0.5: zip: not a valid zip file` →
+  `Unhandled exception: go mod tidy error` (`setup.dart:167`). The recipe was not
+  at fault.
+- **Root cause**: the host had hard-frozen and been powered back on at 12:28. XFS
+  log recovery restored metadata without the data of the last seconds, so files
+  existed with plausible sizes and mtimes and **zeroed content**. In `~/go`: 17
+  module zips of size 0, 19 `.ziphash` files of the correct length but entirely
+  NUL, 32 of 149 extracted trees holding zero-length files, 17 zero-length
+  `~/.cache/go-build` entries. The all-NUL hashes are the dangerous half — Go
+  caches "verified" there, so it never re-downloads the module and the failure
+  surfaces later (`zip has been modified`) or not at all.
+- **Not the recipe, not the network**: the tarball's sha256 matched the PKGBUILD
+  (`7e6ed765…`), `proxy.golang.org` served the module, the vendored
+  `core/Clash.Meta` tree was complete (1035 files, 7.4 MB), and the Flutter/pub
+  caches were clean. `bettbox` is the repo's only Go recipe.
+- **Red signal**: `cd .../Bettbox-1.19.2/core && go mod verify` — seconds,
+  read-only, and it named every damaged module.
+- **Fix**: `go clean -modcache && go clean -cache` — a deliberately blunt purge,
+  because the damage class is "size preserved, content zeroed" and a surgical
+  purge cannot see all of it. The rebuild then re-downloaded all 149 modules and
+  completed: `✓ bettbox (5m56s)`, archive `bettbox-1.19.2-1-x86_64.pkg.tar.zst`
+  (50 MB), and `go mod verify` → `all modules verified`.
+- **A second, unrelated break found while fixing it**: the committed `.SRCINFO`
+  was still at 1.19.1 with the *previous* tarball's sha256 while the PKGBUILD was
+  1.19.2 — a version bump that never re-ran `--printsrcinfo`. Only three fixtures
+  checked `.SRCINFO`, each its own recipe, so the other 123 were unchecked; a
+  recipe consumed through `.SRCINFO` would have built the wrong sources against
+  the wrong sums.
+- **New tooling**: `tools/go-modcache-check.sh` — read-only detector for the four
+  detectable damage classes (zero-length zip, all-NUL `.ziphash`, zero-length
+  record, zero-length `.go` inside an extracted tree; `.lock` is legitimately
+  empty and is skipped), with `--purge` to remove the affected module's record and
+  tree. `tests/modcache-check.sh` drives it against a synthetic cache and keeps a
+  damaged **decoy** cache it is never pointed at, which must survive untouched.
+  `tests/srcinfo-freshness.sh` generalises the per-recipe `.SRCINFO` check across
+  all 126 recipes from `config/packages.map` (~32 s at `-P 8`;
+  `GSA_SRCINFO_JOBS` overrides the parallelism).
+- **Validation**: `go mod verify` clean, `✓ bettbox (5m56s)` with the archive
+  produced, `bash tests/run-all.sh` → **PASS (19 fixtures)**.
+- **Rule**: after any unclean shutdown, treat freshly written files as suspect and
+  verify the consumer before blaming the recipe — for Go, `go mod verify`, and
+  `go clean -modcache` whenever a file could have kept its size. A version bump
+  must regenerate `.SRCINFO` in the same commit, and a repo-wide fixture now
+  enforces that.
+
+## 2026-09-19 — hard freezes: the capture chain is armed, and the history is longer
+
+- **Symptom (restated)**: a build kick-off freezes the whole machine — last frame
+  stuck, no keyboard or mouse input, only a hard power-off recovers it. Two more
+  this session (11:55:48→12:01:07, 12:28:03→12:43:03). It also zeroed the
+  authoring session's own `plan.md`, the same write-loss that corrupted the Go
+  cache above, and zeroed a restored copy of the bettbox plan.
+- **New: the freeze is chronic, not a 2026-09-18 episode.** `last -x` over the
+  whole wtmp (the machine was installed 2026-08-31 15:20) shows ~23 unclean
+  shutdowns, and the *first* is **2026-09-01 00:37 — ten minutes after
+  `ryzenadj` and `ryzen_smu-dkms-git` were installed at 00:33/00:36**, with four
+  inside 27 minutes. They continue on 09-05, 07, 08, 09, 10 (six), 11, 14, 17, 18
+  (three) and 19 (two), across **four** kernel packages (`7.2.2-1-cachyos`
+  bore-lto, `7.2.3-ck1-1`, `7.2.4-ck1-1.1`, `7.2.5-1` rt-bore-lto) — so it is not
+  a kernel-version regression. `scx-scheds-git` was not installed until 09-03
+  17:52, so sched_ext cannot explain the first night.
+- **Why every freeze was silent, and what changed.** The configuration forbade
+  evidence: `nowatchdog` on the cmdline (`nmi_watchdog=0`, `watchdog=0`), every
+  `*_panic` sysctl 0 including `panic`/`panic_on_oops`, `kernel.sysrq=16` (sync
+  only — no recovery key worked), and journald's 5-minute default flush losing the
+  final seconds every time. The 2026-09-18 entry left "make sysrq persistent and
+  drop `nowatchdog`" outstanding; that is now done, plus:
+  - `/etc/sysctl.d/99-diagnostic.conf` — `watchdog_thresh=30`, watchdog and both
+    lockup detectors enabled, `softlockup_panic`/`hardlockup_panic`/
+    `softlockup_all_cpu_backtrace`/`hung_task_panic`/`panic_on_oops`=1, `panic=10`,
+    `sysrq=1`, re-applied every boot.
+  - `/etc/default/limine` — `nowatchdog` removed and
+    `hardlockup_panic=1 softlockup_panic=1 softlockup_all_cpu_backtrace=1
+    hung_task_panic=1 hung_task_timeout_secs=120 panic_on_oops=1 panic=10
+    efi_pstore.pstore_disable=N` added; `limine-update` regenerated all three boot
+    entries.
+  - `/etc/systemd/journald.conf.d/10-diagnostic.conf` — `SyncIntervalSec=1s` (was
+    the 5-minute default) and `SystemMaxUse=1G`, overriding the vendor 50 MB cap.
+  - `gsa-heartbeat.service` — a timestamp to `/var/log/heartbeat.log` and the
+    journal every 5 s, which separates "the kernel died" from "the display died".
+- **`efi_pstore` was disabled by default** (`pstore_disable=Y`), so
+  `/sys/fs/pstore` had never been able to receive anything despite being mounted
+  and empty since installation. Set to `N`, the chain was validated at 13:09 with
+  a deliberate `Alt+SysRq+c`: `Kernel panic - not syncing: sysrq triggered crash`
+  landed in pstore in 17 compressed records and the machine self-rebooted in 27 s
+  on `panic=10`. **The panic never reached the journal** — pstore is the channel
+  that survives, which is exactly why it had to be enabled first.
+- **One full-length rebuild has since passed**: bettbox, 6 minutes, 149 modules
+  re-downloaded, Tctl peaking at 91 °C against a 92 °C limit — no freeze. That run
+  had the undervolt applied but `sched_ext` unloaded (`/etc/scx_loader.toml` was
+  rewritten at 13:00:46 without `default_sched`; `dmesg` shows pandemonium
+  unregistering at uptime 965 s), so it is an sched_ext-free data point, **not** a
+  control.
+- **Hypotheses, none confirmed**: (a) the `ryzenadj` undervolt applied at every
+  login — present at *every* crash including the four that predate scx, though the
+  maintainer's counter-evidence is that a −14 global offset survived single-core
+  builds; the untested half is the per-core `--set-coper` path, whose
+  `core<<20 | offset` packing is hand-rolled, whose CO value cannot be read back
+  (`--dump-table` has no CO field), and whose `ryzenadj` exit status the script
+  discards; (b) `scx_pandemonium` under a fork/exec storm; (c) the pre-existing
+  NVMe ASPM/device lead. On (c): the link does run ASPM L1 + L1.2 (`LnkCtl: ASPM
+  L1 Enabled`, `L1SubCtl1: PCI-PM_L1.2+ ASPM_L1.2+`) with the policy now
+  `default`, but **all AER counters are zero** on both the device and its root
+  port, the NVMe error log is empty and SMART reports 0 media errors — absence of
+  evidence, not evidence.
+- **Still queued**: a real ASPM-off differential (removing `pcie_aspm=powersave`
+  only moved the policy to `default`, which still enables L1 — it needs
+  `pcie_aspm=off`), `ananicy-cpp` (still active), the zram resize
+  (`zram-size = ram * 2.5` = 74.9 GB of RAM-backed swap on a 29 GiB machine, and
+  with `zswap.enabled=0` it is the only swap), and the phase-free 20 GB write
+  burst under `tools/texlive-split-probe.sh --watch-cmd`.
+- **Rule**: arm the capture chain *before* investigating a hard freeze — lockup
+  detectors with `*_panic=1` so a wedge panics and reboots leaving a trace,
+  `kernel.sysrq=1` so `Alt+SysRq`+`l`/`w`/`b` can dump and sync, a 1 s journal
+  flush, a heartbeat witness, and pstore (check `pstore_disable`; it defaults to
+  `Y`). And count crashes from `last -x` over the whole wtmp rather than the
+  retained journals — journald keeps about a day, which hides how long a problem
+  has existed.
+
 ## 2026-09-18 — copilot-instructions told agents to commit, not to ask
 
 - **Symptom**: the agent instruction file stated that the host's commit routine
