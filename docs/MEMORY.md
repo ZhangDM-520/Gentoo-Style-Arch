@@ -331,49 +331,48 @@ going stale.
 
 ### Queued (claim by editing this section)
 
-- **Rebuild `cmake-git` and `xorg-xwayland-git`: the installed binaries are PGO
-  phase-1 instrumented (found 2026-09-19).** `/usr/bin/cmake` (cmake-git
-  4.4.3.936, built 2026-09-07) and `/usr/bin/Xwayland` (built 2026-09-16) each
-  carry hundreds of **absolute** `.gcda` paths baked in — 431 and 348
-  respectively, from the pre-2026-09-15 layout
-  (`~/Projects/.Heavyweight/cmake-git/src/cmake/…`,
-  `~/Projects/xorg-xwayland-git/src/build/…`). libgcov `mkdir -p`s those paths
-  on **every invocation**, so the two directories reappear as 779 `.gcda` files
-  the moment anything runs `cmake` or starts Xwayland. Proven by deleting both
-  trees twice and re-creating all 779 files with one `cmake --version` and one
-  `Xwayland` call. Both installed builds **predate** the recipes' current
-  phase-2 `-fprofile-use` logic (which landed 2026-09-16), so this is a stale
-  install rather than a broken recipe — but a plain `-Syu` will not fix it,
-  because both package names are `IgnorePkg`-locked; it needs
-  `build-all.fish --no-deps --install` on each. Until then, deleting the two
-  directories is futile and their reappearance is not new debris.
-- **The instrumentation guard is a false negative on installed packages
-  (2026-09-19).** `verify_no_profile_instrumentation()` in the
-  `xorg-xwayland-git` recipe — and the same check quoted in
-  `.github/copilot-instructions.md` and §6 below — tests
-  `readelf -sW <bin> | grep -Eq '__gcov_|__llvm_profile'`. Run against the
-  **installed** `/usr/bin/Xwayland` it reports *clean*, because makepkg strips
-  the binary and `readelf` then has 883 symbol entries and no match, while
-  `strings -a` finds the 348 `.gcda` paths. The check is sound where the recipe
-  calls it (inside `package()`, before makepkg's strip step) but must never be
-  trusted against an installed or otherwise stripped binary; use
-  `strings -a <bin> | grep -c '\.gcda'` there. Add that form to the digest.
+- **Rebuild `cmake-git` and `xorg-xwayland-git` — a recurrence of the
+  2026-09-16 PGO leak, on the two packages that fix did not cover (found
+  2026-09-19).** A full sweep of `/usr/bin`, `/usr/lib` and `/usr/lib32` for an
+  absolute `.gcda` destination returns **exactly five files in two packages**:
+  `cmake`, `ccmake`, `cpack` and `ctest` (431/432/438/481 baked paths) from
+  `cmake-git` 4.4.3.936, and `Xwayland` (348) from `xorg-xwayland-git`
+  24.1.13.r1181. Everything else is clean — `glib2-git` and `cairo-git` both
+  return 0, so the 2026-09-16 fix held for the packages it touched. Both of
+  these are **stale installs that predate their recipes' current logic**
+  (cmake-git built 2026-09-07, Xwayland 2026-09-16), so this is not a broken
+  recipe — but a plain `-Syu` will not fix it, because both names are
+  `IgnorePkg`-locked; it needs `build-all.fish --no-deps --install` on each.
+  Until then the two trees under `~/Projects` are re-created in full (779
+  `.gcda` files) by one `cmake --version` and one `Xwayland` call, so deleting
+  them is futile and their reappearance is not new debris.
+- **Implement the whole documented verification, not half of it (2026-09-19).**
+  The 2026-09-16 entry on this same defect already prescribes *two* checks —
+  "`readelf -sW` on the installed libraries must find no `__gcov_` or
+  `__llvm_profile` symbols, **and `strings` must contain no legacy `.gcda`
+  destinations**" — but the digest line below and
+  `verify_no_profile_instrumentation()` in the `xorg-xwayland-git` recipe
+  implement only the first. Against a stripped binary that half-check is a
+  **false negative**: `readelf -sW /usr/bin/Xwayland` reports *clean* (883
+  symbol entries, no match) while `strings -a` finds all 348 `.gcda` paths.
+  The check is sound where the recipe calls it — inside `package()`, before
+  makepkg strips — so the recipe is not wrong, it is incomplete. Use
+  `strings -a <bin> | grep -c '\.gcda'` for any installed binary.
 
-- **`IgnorePkg` closure is 32 names short (found 2026-09-19).** Golden rule 9
-  says the closure diff must be empty; it is not. `comm -23` of the committed
-  `.SRCINFO` pkgname set (218 names) against `pacman-conf IgnorePkg` (221
-  entries, **no globs** — checked) leaves unprotected: the three
-  `linux-cachyos-rt-bore-lto*` outputs, all 30 `texlive-*` splits, and
+- **`IgnorePkg` closure is complete again (audited 2026-09-19, fixed same
+  day).** The closure had drifted **32 names short**: `comm -23` of the
+  committed `.SRCINFO` pkgname set (218) against `pacman-conf IgnorePkg` left
+  the three `linux-cachyos-rt-bore-lto*` outputs, all 30 `texlive-*` splits,
   `autofdo-git`, `bpftune-git`, `logseq-desktop-git`, `mkinitcpio`,
-  `openshadinglanguage`, `vscodium-insiders-git`. Most are latent today —
-  installed version equals or exceeds the repo's (`mkinitcpio` 42-2 vs 42-1,
-  `texlive-basic` 2026.1-1 on both sides) — but the 2026-09-04 `hip-runtime`
-  incident is precisely this failure mode: as soon as a stock version moves
-  ahead, `-Syu` replaces the house build with no warning. Note `linux-` is
-  variable-derived (`pkgbase="linux-$_pkgsuffix"`), so the closure check must
-  read `.SRCINFO`; a `PKGBUILD` grep reports a literal `linux-` and hides the
-  real names. Fix by one-line `IgnorePkg =` insertions inside `[options]`
-  after backing the file up, then re-run the `comm -23`.
+  `openshadinglanguage` and `vscodium-insiders-git` unprotected — latent, but
+  the 2026-09-04 `hip-runtime` incident is exactly this failure mode. They were
+  added as three new one-line `IgnorePkg =` entries inside `[options]` after
+  backing the file up; `comm -23` is empty again (221 → 253 entries, all in
+  `[options]`). **The audit must read `.SRCINFO`, not `PKGBUILD`**: the kernel's
+  `pkgbase="linux-$_pkgsuffix"` makes a `PKGBUILD` grep report a literal
+  `linux-` and hide the real names. Also note `pacman -Sy` cannot be used to
+  validate this while a build holds the database lock — `pacman-conf IgnorePkg`
+  reads the file directly and needs no lock.
 
 - **ROCm is half-removed**: `hsa-rocr` 7.2.4-1.1, `rocm-llvm` 2:7.2.4-2.1 and
   `comgr` 2:7.2.4-2.1 are installed again (the 2026-09-06 collective removal was
@@ -662,10 +661,10 @@ recipe).
 - **PGO operational**: root-owned gcda appears if instrumented daemons are
   installed mid-iteration (→ sudo rm -rf src, avoid installing); gcda
   verification via `find <dir>`; MT trainers need `-fprofile-update=atomic`;
-  an instrumented **installed** binary bakes the absolute `.gcda` paths into
-  itself, so it re-creates the whole `src/` tree on every run — check a shipped
-  binary with `strings -a <bin> | grep -c '\.gcda'`, **not** `readelf -sW`, which
-  is a false negative on anything makepkg has stripped (2026-09-19);
+  an instrumented **installed** binary bakes absolute `.gcda` destinations into
+  itself and re-creates the whole tree on every run, so check a shipped binary
+  with `strings -a <bin> | grep -c '\.gcda'` — `readelf -sW` alone is a **false
+  negative** on anything makepkg has stripped (2026-09-19);
   a Meson PGO reconfigure must replace `c_args`, `cpp_args`, `c_link_args`,
   and `cpp_link_args` together so phase-1 `-fprofile-generate` cannot remain;
   profile-use configure probes need `-Wno-error=missing-profile`; verify the

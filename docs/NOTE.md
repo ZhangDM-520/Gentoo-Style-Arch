@@ -32,6 +32,59 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — two orphan trees under `~/Projects` were instrumented binaries, and the IgnorePkg closure had drifted
+
+- **Symptom**: `~/Projects/.Heavyweight/cmake-git/src/cmake/` and
+  `~/Projects/xorg-xwayland-git/src/build/` kept reappearing — 779 files, every
+  one a `.gcda`, with no `PKGBUILD`, no `.SRCINFO` and no `.git` anywhere inside.
+  They were first read as debris from an old `makepkg` run under the pre-2026-09-15
+  layout. They are not.
+- **Root cause**: a recurrence of the 2026-09-16 defect, on the two packages that
+  fix did not cover. The **installed** `/usr/bin/cmake` (cmake-git 4.4.3.936,
+  built 2026-09-07) and `/usr/bin/Xwayland` (built 2026-09-16) are PGO phase-1
+  builds that were packaged, so each carries hundreds of *absolute* `.gcda`
+  destinations baked into the executable — 431 in `cmake`, plus 432/438/481 in
+  `ccmake`/`cpack`/`ctest`, and 348 in `Xwayland`. libgcov `mkdir -p`s those
+  paths at process exit, which is why deleting the trees achieved nothing.
+- **How it was proven, not inferred**: the trees were deleted twice, and one
+  `cmake --version` plus one `Xwayland` call re-created **all 779 files**. The
+  mechanism was then isolated by running `cmake --version` alone and watching the
+  mtime of a single `.gcda` advance from `00:13:02` to `00:19:05`, and by
+  `strings -a /usr/bin/cmake | grep -c 'Heavyweight.*\.gcda'` → 431.
+- **The verification in this journal was half-implemented**: the 2026-09-16 entry
+  prescribes both `readelf -sW` (no `__gcov_`/`__llvm_profile` symbols) **and**
+  `strings` (no legacy `.gcda` destinations), but the digest line and
+  `verify_no_profile_instrumentation()` in the `xorg-xwayland-git` recipe implement
+  only the first. On a stripped binary that half-check is a false negative:
+  `readelf -sW /usr/bin/Xwayland` reports clean while `strings -a` finds all 348
+  paths. The recipe is incomplete rather than wrong — inside `package()` the
+  binaries are not yet stripped, so the check does work there.
+- **Sweep**: every installed file under `/usr/bin`, `/usr/lib` and `/usr/lib32`
+  was tested for an absolute `.gcda` destination. Exactly five files in two
+  packages match. `glib2-git` and `cairo-git` return 0, so the 2026-09-16 fix held
+  for the packages it touched.
+- **Fix**: queued, not applied — a rebuild of `cmake-git` and `xorg-xwayland-git`
+  via `--no-deps --install`. Neither name can be fixed by `-Syu`, because both are
+  `IgnorePkg`-locked, which is the protection working as intended.
+- **Second finding, same session**: the `IgnorePkg` closure golden rule was **32
+  names short**. `comm -23` of the committed `.SRCINFO` pkgname set (218) against
+  `pacman-conf IgnorePkg` (221, no globs) left the three
+  `linux-cachyos-rt-bore-lto*` outputs, all 30 `texlive-*` splits, `autofdo-git`,
+  `bpftune-git`, `logseq-desktop-git`, `mkinitcpio`, `openshadinglanguage` and
+  `vscodium-insiders-git` unprotected. The audit must read `.SRCINFO`: the kernel's
+  `pkgbase="linux-$_pkgsuffix"` makes a `PKGBUILD` grep report a literal `linux-`.
+- **Fix applied**: the 32 names were appended as three new one-line `IgnorePkg =`
+  entries inside `[options]`, after backing `/etc/pacman.conf` up to
+  `/etc/pacman.conf.bak-20260919`. The existing 221 entries were not regenerated.
+- **Verification**: `comm -23` is empty; `pacman-conf IgnorePkg` parses and reports
+  253 entries, all lines still inside `[options]`; no duplicate names introduced.
+  `pacman -Sy` was **not** usable as a check while a build held the database lock —
+  `pacman-conf` reads the file directly and needs no lock.
+- **Rule**: an installed binary that writes `.gcda` is not "debris in a stale
+  directory", it is a packaging failure with a self-healing symptom. Delete the
+  tree only after the package is rebuilt, and verify the rebuild with `strings`,
+  never with `readelf` alone.
+
 ## 2026-09-19 — a mistyped package name said nothing useful, and `-g gti` said nothing at all
 
 - **Symptom**: `fish build-all.fish mesa-gti` printed
