@@ -1289,10 +1289,16 @@ for _p in "${pkgname[@]}"; do
     }"
 done
 
-# NOTE: after switching _cpusched, run 'updpkgsums' once - makepkg fails the
-# integrity check until the sums match the new source set. b2sums is a flat
-# list that has to line up with source[] for the *selected* scheduler, so a
-# switch changes its length as well as its contents.
+# b2sums is a flat list with one entry per source, so it can only ever match one
+# combination of the four knobs that change the source set: _cpusched (the
+# scheduler patch), _build_zfs, _build_nvidia_open and _build_r8125. Measured:
+# cachyos/eevdf/rt drop the one patch, zfs adds one source, r8125 adds one,
+# nvidia-open adds four - and _use_llvm_lto, _build_debug, _autofdo, _propeller,
+# _capture_chain, _hardened and _host_tune change nothing. The literal below is
+# the combination this file's defaults select, so any other combination needs
+# `updpkgsums` once. Per-knob sums would not survive that: updpkgsums rewrites
+# this assignment as a whole on every version bump, so a second array kept in
+# sync by hand would drift at the first bump.
 #
 # This block used to be preceded by a `_sums_sched` array, described as being
 # "expanded into b2sums below". Nothing ever read it - b2sums has always been
@@ -1305,3 +1311,21 @@ b2sums=('b4ce3fd6c277876399f02930628e90a823bfd48184f43c16d1b0a897371ea044a409cf4
         '63a34e61c50d9a914f9b95089b48db4c394d908cc3dd33f2c2addc818268e478c810c8a7406181dbf6be6af54c0d04d6cccdfd4e2faf3314a4f542e97cbb4d85'
         'c992567bd7dd8553432be496ffa1c17e2f5ebe9c7edb51945cf977e1b742dd6517c210d8843bb82744ca705efd07f8027cd7dde41b50215ebd707a34aa81462e'
         'acaf7cab034098f8728089921ce7ccadd66157e28d6910063e62df59f1fec11546909c36b2cfbde5d3673529d937f40e0b7d38427e64d11dacc33e73c0e3b6d8')
+
+# The mismatch the comment above describes is fatal, but makepkg only notices it
+# after "Retrieving sources", and reports it as "Integrity checks (b2) differ in
+# size from the source array" - naming neither the knob nor the remedy. Check
+# the pair here instead, at parse time, so the failure costs nothing and says
+# what to run.
+#
+# `updpkgsums` runs `makepkg -g`, which has to source this file to do its job,
+# and the whole point of running it is that the sums do not match yet. makepkg
+# sets GENINTEG=1 for that mode and sources the PKGBUILD into its own shell, so
+# the mode is visible here; without the exemption the guard would make its own
+# remedy impossible to run.
+if [ "${GENINTEG:-0}" -eq 0 ] && [ "${#b2sums[@]}" -ne "${#source[@]}" ]; then
+    _die "b2sums has ${#b2sums[@]} entries but source[] has ${#source[@]} for this knob set.
+b2sums is sized for this file's default combination, and these four knobs change
+the source set: _cpusched=${_cpusched}, _build_zfs=${_build_zfs:-unset}, _build_nvidia_open=${_build_nvidia_open}, _build_r8125=${_build_r8125}.
+Run 'updpkgsums' in ${startdir} to regenerate b2sums for the current set, then build again."
+fi

@@ -32,6 +32,64 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — the knob switch died in makepkg's integrity check
+
+- **Symptom**: a build of the recipe with `_cpusched=cachyos` — every other knob
+  at its default — aborted before `prepare()`:
+
+  ```
+  ==> ERROR: Integrity checks (b2) differ in size from the source array.
+  ```
+
+  Nothing in the recipe mentioned sums, and the failure arrived after
+  "Retrieving sources", so it looked like a corrupt download or a tampered
+  source rather than a bookkeeping mismatch.
+- **Root cause**: `source[]` is assembled from four knobs, `b2sums` is a single
+  flat literal, and makepkg requires exactly one integrity entry per source.
+  Measured by sourcing the PKGBUILD per knob set: `_cpusched=cachyos|eevdf|rt`
+  drops the one scheduler patch (4 sources), `_build_zfs=yes` adds one,
+  `_build_r8125=yes` adds one, `_build_nvidia_open=yes` adds four — and
+  `_use_llvm_lto`, `_build_debug`, `_autofdo`, `_propeller`, `_capture_chain`,
+  `_hardened` and `_host_tune` change nothing. The committed literal is sized
+  for the defaults (5), so it is correct for exactly one combination out of the
+  reachable ones. The recipe's own NOTE said to run `updpkgsums` after a
+  `_cpusched` switch, but nothing enforced it and makepkg's message names
+  neither the knob nor the remedy.
+- **Why the obvious fix is wrong**: per-knob sums (`b2sums+=('…')` next to each
+  `source+=`) make every combination build, but `updpkgsums` rewrites the whole
+  `b2sums=(…)` assignment as a literal on every version bump, so the appends
+  would double-count at the first bump — a silent break in the tool the version
+  bump depends on. Upstream avoids the problem by shipping one PKGBUILD per
+  scheduler (`linux-cachyos`, `-bmq`, `-eevdf`, `-rt-bore`, `-hardened`, `-lts`,
+  `-rc`), each with sums sized for its own default; a merged recipe cannot.
+- **Fix**: the PKGBUILD now checks the pair itself, at parse time, before
+  anything is fetched or written:
+  ```sh
+  if [ "${GENINTEG:-0}" -eq 0 ] && [ "${#b2sums[@]}" -ne "${#source[@]}" ]; then
+      _die "b2sums has N entries but source[] has M for this knob set. … Run 'updpkgsums' in ${startdir} …"
+  fi
+  ```
+  The `GENINTEG` exemption is the load-bearing part: `updpkgsums` runs
+  `makepkg -g`, which has to source the PKGBUILD to do its job, and the whole
+  point of running it is that the sums do not match yet — an unguarded abort
+  would make the remedy impossible to run. makepkg sets `GENINTEG=1` during
+  option parsing and sources the PKGBUILD into its own shell, so the mode is
+  visible to it (measured on pacman 7.x; no `/proc` poking needed).
+- **Validation**: the guard refuses `_cpusched=cachyos` and
+  `_build_nvidia_open=yes` by name; accepts the default set and the six knobs
+  measured to be source-neutral; `makepkg --printsrcinfo` on the pristine recipe
+  is byte-identical to the committed `.SRCINFO`; and the remedy was run
+  end-to-end in a scratch copy — `_cpusched=cachyos updpkgsums` regenerated
+  `b2sums` to 4 entries, after which the `cachyos` set parsed clean and
+  `rt-bore` was the set that got refused. `tests/kernel-recipe-sums.sh` pins all
+  of it and is red on four mutations: guard removed, guard unconditional,
+  `GENINTEG` exemption removed, and a default set edited away from the shipped
+  sums (the drift case the 7.3 move hit when `misc/0001-rt-i915.patch` was
+  dropped).
+- **Durable rule**: a `b2sums` literal is sized for one knob combination. Either
+  keep the source set knob-independent, or make the recipe refuse the
+  combination it cannot serve *and* keep the sum-generation path runnable.
+
 ## 2026-09-19 — the recipes were reporting on my laptop
 
 - **Symptom**: `CONTRIBUTING.md` scopes a contribution to "a clean Arch

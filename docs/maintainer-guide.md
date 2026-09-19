@@ -19,6 +19,15 @@ Do not copy the upstream Git checkout into the project. A VCS `source=`
 entry, a pinned tag/commit, and a local patch are enough to reproduce the
 recipe.
 
+`b2sums` is a flat list with one entry per source, so it can only match one
+combination of a recipe's knobs. Keep the source set knob-independent where you
+can. Where you cannot, make the recipe refuse the combinations it cannot serve
+*and* keep the sum-generation path runnable — `packages/misc/linux-cachyos`
+does both, and `tests/kernel-recipe-sums.sh` pins it. Never grow `b2sums` with
+per-knob `b2sums+=(…)` appends next to each `source+=(…)`: `updpkgsums`
+rewrites the whole assignment as a literal on every version bump, so the
+appends double-count at the first bump.
+
 ## Updating coupled stacks
 
 LLVM snapshots have no stable C++ ABI. Rebuild Rust, Mesa, SPIR-V, libclc,

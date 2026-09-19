@@ -474,6 +474,23 @@ recipe).
   still exist in the new tree. `tests/kernel-recipe-version.sh` now pins the part
   that is checkable offline: the tarball URL must name `pkgver`, and every
   `_patchsource` URL must sit under the `pkgver`'s major.
+- **A `b2sums` literal serves one knob combination, and makepkg's error for the
+  rest names nothing** (2026-09-19, `linux-cachyos`): `source[]` is assembled
+  from `_cpusched`, `_build_zfs`, `_build_nvidia_open` and `_build_r8125`
+  (measured — `_use_llvm_lto`, `_build_debug`, `_autofdo`, `_propeller`,
+  `_capture_chain`, `_hardened` and `_host_tune` change nothing), while
+  `b2sums` is one flat literal sized for the defaults. Switching a
+  source-affecting knob therefore aborted *after* "Retrieving sources" with
+  "Integrity checks (b2) differ in size from the source array" — naming neither
+  the knob nor the remedy, and reading like a bad download. The recipe now
+  checks the pair at parse time, names both counts and the knob values, and
+  exempts `makepkg -g` (`GENINTEG=1`): without that exemption `updpkgsums` —
+  the remedy itself — could not run. Do **not** "fix" it with per-knob
+  `b2sums+=(…)` next to each `source+=(…)`; `updpkgsums` rewrites the whole
+  assignment on every version bump, so the appends double-count. Upstream
+  sidesteps this by shipping one PKGBUILD per scheduler; a merged recipe cannot.
+  `tests/kernel-recipe-sums.sh` pins the guard, its exactness and the
+  exemption.
 - **A `scripts/config` write is not evidence, and `!SYM` ≠ `SYM=n`**
   (2026-09-19, `linux-cachyos`): the recipe's `_hugepage` knob had never worked
   — `mm/Kconfig` gates the THP menu on `!PREEMPT_RT` and `_cpusched=rt-bore`
