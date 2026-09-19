@@ -42,6 +42,12 @@ rather than granting it.
 than reading it end to end, and remember its naming-history table when an old
 entry mentions paths that no longer exist.
 
+`docs/MEMORY.md` §5 **Queued (claim by editing this section)** is the project's
+work queue: check it before starting unrelated work, and claim an item by
+editing that section. Its convention is that finished items are *deleted*
+rather than ticked, because an unchecked list reads as authority while going
+stale; §5 is re-verified against the host rather than assumed.
+
 ## Commands
 
 Shells are split deliberately: **the builder and its CLI are fish**
@@ -70,7 +76,8 @@ bash tests/recipe-sources.sh         # run one fixture directly
 `tests/run-all.sh` discovers `tests/*.sh` and needs no edit for a new fixture.
 The filter is a plain substring of the filename, so `pgo` runs the whole PGO
 family; `texlive`, `recipe`, `project`, `scheduler`, `sudo` and `probe` each
-narrow to one area.
+narrow to one area, and `mkinitcpio`/`bpftune` isolate the two single-recipe
+hook fixtures.
 
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
@@ -108,8 +115,14 @@ Validation for a change:
 fish -n build-all.fish                                  # parse the scheduler
 bash -n packages/<category>/<pkg>/PKGBUILD              # parse a recipe
 makepkg --printsrcinfo --dir packages/<category>/<pkg> > packages/<category>/<pkg>/.SRCINFO
+fish build-all.fish --audit && fish build-all.fish --list
+fish build-all.fish --dry-run --group git            # repeat for stable, core
 bash tests/run-all.sh
 ```
+
+The `--audit`/`--list`/three-dry-run sweep is `CONTRIBUTING.md`'s submission
+checklist and the cheapest way to prove a topology edit did not break the
+loader: every one of them re-validates the whole map, graph and sort.
 
 Never use a real rebuild as a syntax check. For changes to scheduling,
 installation, cleanup, source sharing, or signals, add a focused fixture with
@@ -140,13 +153,21 @@ fish build-all.fish -g git 22..38              # index range from --list
 fish build-all.fish -s --install -g git        # resume: skip already-built archives
 ```
 
+`-g` takes repeats or commas (`-g git -g core` / `-g git,core`) and dedupes the
+union, so group *and* explicit package selections can be combined in one run.
+Ranges index the `--list` order and may be open-ended (`22..`, `..15`), but a
+range still needs a `-g` or package selection to anchor it.
+
 `-i` installs each package before its dependents compile (core selection turns
-it on automatically). `-ia`/`--installall` is the single-transaction escape
-hatch — it installs after everything is built, so it must never stand in for
-`-i` on a set whose members depend on each other. `-ccc`/`--nuclear` and
-`--link-sources` ask for confirmation; `--link-sources` must be run as the
-build user, not under a root supervisor. `--audit` and `--link-sources` are the
-only modes needing `rg`/`git`. `--allow-broken-rustc` bypasses the rustc
+it on automatically), through `pacman -U --noconfirm --ask 4`, and an install
+failure aborts the whole run rather than continuing to build dependents.
+`-ia`/`--installall` is the single-transaction escape hatch — it installs after
+everything is built, so it must never stand in for `-i` on a set whose members
+depend on each other; it forwards trailing arguments to pacman
+(`-ia --overwrite '*'`). `-ccc`/`--nuclear` and `-ln`/`--link-sources` ask for
+confirmation; `--link-sources` must be run as the build user, not under a root
+supervisor. `--audit` and `--link-sources` are the only modes needing
+`rg`/`git`. `--allow-broken-rustc` bypasses the rustc
 sanity probe that guards against LLVM-snapshot ABI skew — it is an escape hatch
 for runs that compile no Rust, not a way past a real ABI mismatch.
 
