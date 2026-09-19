@@ -87,10 +87,18 @@ build() {
   local no_lto_cxxflags="${CXXFLAGS//-flto=auto/} -fno-lto"
   local lld_flags="-fuse-ld=lld ${LDFLAGS//-fuse-ld=mold/}"
 
+  # BUILD_SHARED is autofdo's own switch. BUILD_SHARED_LIBS has to be seeded on
+  # the command line, because autofdo adds third_party/glog before it adds the
+  # LLVM subdirectory, and glog's `option(BUILD_SHARED_LIBS ON)` *creates* that
+  # cache entry when it is undefined. Left undefined, every LLVM component
+  # library, autofdo's own protobuf libraries and glog itself build shared, the
+  # executable gets a RUNPATH into the build directory, and package() - which
+  # installs the tool alone - ships a binary that cannot start anywhere.
   rm -rf build-with-llvm
   cmake -G Ninja -S "$srcdir/${_pkgname}" -B build-with-llvm \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED=On \
+    -DBUILD_SHARED_LIBS=Off \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DBUILD_TESTING=OFF \
     -DABSL_BUILD_TESTING=OFF \
