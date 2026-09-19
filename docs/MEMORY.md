@@ -357,6 +357,15 @@ going stale.
   (`cachyos-7.3-rc3-4`) — recipe done, build/install pending. The evidence is
   upstream-documented plus circumstantial; the confirming A/B was skipped by
   decision, so read "identified" as strong, not proven.
+- **Decision needed at the next `linux-cachyos` rebuild: AutoFDO + Propeller
+  (2026-09-19).** The installed 7.2.5 kernel was built with `AUTOFDO_CLANG=y`
+  and `PROPELLER_CLANG=y`; the recipe defaults `_autofdo` and `_propeller` to
+  `no`, so the first default rebuild replaces an AutoFDO+Propeller-optimised
+  kernel with a plain one — a real optimisation loss that warns nowhere. Either
+  put `afdo.prof` and the two `propeller_*.txt` profiles beside the PKGBUILD and
+  set both knobs, or accept the plain kernel deliberately. `prepare()` asserts
+  the off state either way, so the swap shows up in the log rather than passing
+  unnoticed.
 - **Capture chain armed (2026-09-19) — keep it, it is what makes a future freeze
   readable.** `/etc/sysctl.d/99-diagnostic.conf` (`watchdog_thresh=30`, watchdog
   plus both lockup detectors, `softlockup_panic`/`hardlockup_panic`/
@@ -434,6 +443,25 @@ recipe).
   still exist in the new tree. `tests/kernel-recipe-version.sh` now pins the part
   that is checkable offline: the tarball URL must name `pkgver`, and every
   `_patchsource` URL must sit under the `pkgver`'s major.
+- **A `scripts/config` write is not evidence, and `!SYM` ≠ `SYM=n`**
+  (2026-09-19, `linux-cachyos`): the recipe's `_hugepage` knob had never worked
+  — `mm/Kconfig` gates the THP menu on `!PREEMPT_RT` and `_cpusched=rt-bore`
+  sets `PREEMPT_RT=y`, so `scripts/config` wrote the symbol and the next
+  `olddefconfig` deleted it without a word. Two more knobs were dead the same
+  way (`_use_kcfi` wrote two names that no longer exist; `cachyos`/`eevdf` wrote
+  `SCHED_BORE`, which only the BORE patch adds). The recipe now builds an
+  expectation list beside each write and `prepare()` verifies the *resolved*
+  `.config` against it via `packages/misc/linux-cachyos/verify-config.sh`,
+  aborting with a named reason (`tests/kernel-config-verify.sh` pins it). Two
+  rules fall out. (a) Only the post-`make prepare` file is evidence. (b) `!SYM`
+  and `SYM=n` are different claims: a `choice` member whose prompt is hidden by
+  a false `if` (`bool "Cubic" if TCP_CONG_CUBIC=y`) vanishes from `.config`
+  entirely, while a merely unselected member is written `# CONFIG_X is not set`
+  — in the same choice, `DEFAULT_RENO` is `n` and `DEFAULT_CUBIC` is absent, so
+  assert `!SYM` for these. Related trap, found by the new fixture: an
+  unconditional `!SYM` in an invariants list must not contradict a toggle's
+  `-e SYM` — `!AUTOFDO_CLANG` alongside `_autofdo=yes` made the AutoFDO path
+  unbuildable.
 - **Soname provides — the full mechanism** (libunwind/wireplumber/gegl/babl):
   pacman 7.1 does NOT derive soname provides at `-U` time and makepkg does
   NOT synthesize them for undeclared libs (`autodeps` is config-only and

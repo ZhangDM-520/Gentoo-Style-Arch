@@ -32,6 +32,103 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — `linux-cachyos`: the config toggles were a wish list, not a contract
+
+- **Symptom**: three of the recipe's knobs did nothing, and nothing anywhere said
+  so. The installed 7.2.5 kernel and the freshly resolved 7.3-rc3 `.config` both
+  carry **no `TRANSPARENT_HUGEPAGE` at all** — not `=n`, *absent* — although the
+  shipped `config` file asks for `madvise` and the recipe's `_hugepage` default
+  is `madvise`. THP has never been enabled on this host.
+- **Root cause — three independent ones, all silent:**
+  1. **`_hugepage` is dead code.** `mm/Kconfig:844` gates the whole
+     `menuconfig TRANSPARENT_HUGEPAGE` on `!PREEMPT_RT`, and `_cpusched=rt-bore`
+     writes `PREEMPT_RT=y`. `scripts/config` sets the symbol without consulting
+     Kconfig, the next `olddefconfig` deletes it, and the log prints neither.
+     The same gate removes `NUMA_BALANCING` and `QUEUED_RWLOCKS` from the
+     shipped config (15 symbols in total are `!PREEMPT_RT`-gated).
+  2. **`_use_kcfi` is dead code.** 7.3's user-selectable symbol is `CONFIG_CFI`
+     (`arch/Kconfig:954`); `ARCH_SUPPORTS_CFI_CLANG` no longer exists and
+     `CFI_CLANG` is a promptless `transitional` symbol kept only to migrate an
+     old `.config`. Measured: the recipe's three-name write leaves `CONFIG_CFI`
+     **unset**, while `-e CFI` selects it.
+  3. **`cachyos`/`eevdf` wrote a symbol that cannot exist.** `SCHED_BORE` is
+     *added* to `init/Kconfig` by `sched/0001-bore-cachy.patch`, and the source
+     case only fetched that patch for `bore|hardened|rt-bore`. Verified: upstream
+     `linux-cachyos` and `linux-cachyos-rc` have the identical gap, so this is
+     **not** a local divergence — the fix records the fact (`!SCHED_BORE`)
+     instead of pretending to fix it.
+  Plus two ordering faults: `_use_current` (`zcat /proc/config.gz > .config`) and
+  `_localmodcfg` (`make localmodconfig`) ran *after* the entire toggle block and
+  discarded it, and `_preempt` under `rt*` was skipped without a word.
+- **Fix**: the knobs become a *resolved, verified* contract — every expectation
+  either holds in the final `.config` or `prepare()` aborts in seconds with a
+  named reason.
+  - New `verify-config.sh` (recipe-local; bash + coreutils only) takes
+    `<config-file> <expectation>...` in five forms — `SYM=v`, `SYM`, `!SYM`,
+    `SYM!=v`, `SYM>=N` — prints **every** failure as `SYMBOL: expected X, got Y`,
+    and exits 1 on any unmet expectation (2 on misuse). It reports `absent`
+    separately from `n` on purpose: `n` means "fix the dependency", `absent`
+    means "the symbol was renamed or removed, fix the name".
+  - `prepare()` builds `_config_wants` beside each write and runs the check right
+    after `make prepare` / `make config`; failure is a named `_die`. The default
+    run asserts **84** expectations.
+  - Base-config selection moved **ahead** of every toggle, so the explicit knobs
+    always win whatever base was chosen.
+  - Parse-time gates (a `_die` before any write, so they cost seconds, not a
+    patch run): `bmq` and `hardened` (the 7.3 patch set ships neither), `muqss`
+    (the local patch still targets 7.2), `_hugepage` or `_preempt` explicitly set
+    under `rt*`, `_build_zfs=yes` under `rt*`.
+  - New knobs: `_capture_chain` (yes — the config now argues *for* the crash
+    chain that was assembled entirely outside the recipe), `_host_tune` (yes,
+    `_nr_cpus=64`), `_hardened` (no), `_rt_feature_drops` (`abort|accept`).
+    `_tcp_bbr3` renamed to `_tcp_bbr` with a warned legacy alias: it enables plain
+    BBR + FQ, and `CONFIG_TCP_CONG_BBR3` no longer exists in 7.3 at all.
+  - Deleted the dead `_sums_sched` array (nothing consumed it, and its
+    `rt|rt-bore` entry still pointed at the removed `misc/0001-rt-i915.patch`).
+- **Validation**: new `tests/kernel-config-verify.sh` covers every engine form,
+  the absent-vs-`n` distinction, multi-failure counting, misuse exit 2, and
+  structural assertions on the PKGBUILD (base-config selection precedes the first
+  `scripts/config`; every documented `_cpusched` value is handled by all three
+  `case` blocks; no unconditional `!SYM` in the invariants array contradicts a
+  toggle's `-e SYM`). Real seam, `makepkg --nobuild` against the real 7.3-rc3
+  tree: default 84, `_hardened=yes` 85, `_hugepage=always
+  _rt_feature_drops=accept` 84 (warns), `_autofdo=yes` 84, `_use_llvm_lto=none`
+  83, `_host_tune=no` 80 — all rc=0; and all seven contradiction cases abort with
+  their named reason. Full fixture battery 21/21.
+- **Durable rules**:
+  - **A `scripts/config` write is not evidence.** An unknown symbol is a no-op
+    and a gated symbol is written and then deleted. Only the resolved `.config`
+    *after* `make prepare` is evidence, which is why the check reads the file
+    instead of trusting the write.
+  - **`!SYM` and `SYM=n` are different claims.** A `choice` member whose prompt
+    is hidden — `bool "Cubic" if TCP_CONG_CUBIC=y` in `net/ipv4/Kconfig`, with
+    `TCP_CONG_CUBIC=m` here — **disappears from `.config` entirely** (absent),
+    while a merely unselected member is emitted `# CONFIG_X is not set` (`n`);
+    `DEFAULT_RENO` in the same choice is `n` while `DEFAULT_CUBIC` is absent.
+    Assert `!SYM` for such members. This cost one wrong table entry, caught only
+    by the real-seam run. (The `IOMMU_DEFAULT_*` choice members do emit `n`, so
+    it is per-symbol — measure, do not generalise.)
+  - **An invariant must not contradict its own toggle.** `!AUTOFDO_CLANG` sat in
+    the unconditional invariants array while `_autofdo=yes` wrote
+    `-e AUTOFDO_CLANG`, which made the AutoFDO path unbuildable; the same shape
+    was waiting on the `_hardened` trio. Guard such an assertion on the knob,
+    outside the array. The fixture now enforces this class directly.
+  - **Validate the copy you edited, on a clean `src/`.** The seam scratch tree
+    holds a *copy* of the recipe, and two validation rounds silently tested the
+    stale copy and reported a contradiction that had already been fixed. And
+    makepkg re-applies patches to an existing `src/`, so every case that reaches
+    `prepare()` needs a clean `src/` or it fails on an already-patched tree — a
+    harness fault that looks exactly like a recipe fault.
+  - **AutoFDO/Propeller drift is a decision, not a default.** The installed
+    7.2.5 kernel was built with `AUTOFDO_CLANG=y` and `PROPELLER_CLANG=y`; the
+    recipe defaults both to `no`, so the first default rebuild replaces an
+    optimised kernel with a plain one and warns nowhere. The header records it
+    and `prepare()` asserts the off state, so the swap is at least visible.
+  - **A verification failure is fatal on purpose.** Shipping a kernel whose
+    options silently differ from the recipe's own declaration is worse than not
+    shipping one — the whole point of the exercise is that the recipe cannot
+    lie about itself.
+
 ## 2026-09-19 — kernel: the build freezes were CVE-2026-90432; recipe moved to the CachyOS RC channel
 
 - **Symptom**: any build could hard-freeze the machine — last frame stuck, no
