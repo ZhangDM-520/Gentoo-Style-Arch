@@ -491,6 +491,26 @@ recipe).
   sidesteps this by shipping one PKGBUILD per scheduler; a merged recipe cannot.
   `tests/kernel-recipe-sums.sh` pins the guard, its exactness and the
   exemption.
+- **A diagnostic on a captured stdout is swallowed, and a range indexes the
+  selection, not the whole set** (2026-09-19, `build-all.fish`): `resolve_group`
+  wrote "unknown group 'gti'" to stdout while `main` read the group with a
+  command substitution, so `-g gti` exited 1 having printed nothing — the exit
+  status was the only evidence. Put diagnostics on stderr. The same change
+  added the reference forms a user actually has in hand: recipe ID and recipe
+  path always worked, and now so do a case-variant ID (`MESA-GIT`) and a pacman
+  `pkgname` including a split output (`zen-browser` → `zen-browser-pgo`,
+  `libstdc++-snapshot` → `gcc-snapshot`), each announced by `_ref_form_note`.
+  The index comes from the committed `.SRCINFO` files (218 names, none shared by
+  two recipes, no unexpanded variables), never from PKGBUILD evaluation. A
+  **typo is never auto-corrected** — a wrong guess builds a whole dependency
+  chain — it is reported with up to three candidates, ranked by an awk
+  Levenshtein sweep (fish costs ~0.4 s per token for the same answer).
+  Separately: a **range indexes the selection**, so read `-l -g GROUP` before
+  choosing one — `-l` now honours the selection and `-n` with none covers the
+  whole set. Out-of-bounds ranges name the selection size, clamped bounds warn,
+  and `..` is refused. `tests/project-cli-hints.sh` pins all of it (red on five
+  mutations, including one that reverted the `>&2` and was only caught because
+  the assertion checks the *channel* rather than the merged text).
 - **A `scripts/config` write is not evidence, and `!SYM` ≠ `SYM=n`**
   (2026-09-19, `linux-cachyos`): the recipe's `_hugepage` knob had never worked
   — `mm/Kconfig` gates the THP menu on `!PREEMPT_RT` and `_cpusched=rt-bore`

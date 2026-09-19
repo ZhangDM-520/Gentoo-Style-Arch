@@ -1406,8 +1406,175 @@ function print_log_tail -a log_file
     tail -n 15 "$log_file" 2>/dev/null | sanitize_log_stream | sed 's/^/    /'
 end
 
-# Normalize package references to package IDs. Both IDs and relative recipe
-# paths are accepted so resumed commands remain easy to translate.
+# ─── Package reference resolution and name hints ─────────────────────────────
+# Accepted reference forms, in priority order:
+#   1. recipe ID             mesa-git
+#   2. recipe path           packages/git/mesa-git   (or ./packages/…)
+#   3. case-variant ID       MESA-GIT
+#   4. pacman package name   zen-browser             (including a split output)
+# Tiers 3-4 are exact lookups, never guesses: recipe IDs are lower-case and the
+# .SRCINFO name index is collision-free (no name is shared by two recipes), so
+# neither can select the wrong recipe, and _ref_form_note announces every
+# substitution. A typo is deliberately NOT auto-corrected — a wrong guess would
+# build a whole dependency chain — it is reported with _report_unknown_ref.
+
+# "name|recipe-id" for every pacman package name the recipes build, read from
+# the committed .SRCINFO files. Committed metadata means no PKGBUILD
+# evaluation: `makepkg --printsrcinfo` has already expanded every variable, and
+# tests/srcinfo-freshness.sh keeps it in step with the recipes. A recipe without
+# .SRCINFO (the synthetic fixture workspaces) contributes nothing — fewer hints,
+# never an error.
+function _pkgname_index
+    if not set -q _PKGNAME_INDEX
+        set -g _PKGNAME_INDEX
+        for entry in $_PACKAGE_MAP
+            set -l fields (string split '|' -- "$entry")
+            set -l srcinfo "$SCRIPT_DIR/$fields[2]/.SRCINFO"
+            test -f "$srcinfo"; or continue
+            for name in (sed -n 's/^pkgname = //p' "$srcinfo" 2>/dev/null)
+                set -a _PKGNAME_INDEX "$name|$fields[1]"
+            end
+        end
+    end
+    test (count $_PKGNAME_INDEX) -gt 0; and printf '%s\n' $_PKGNAME_INDEX
+end
+
+# Recipe ID that builds a given pacman package name, or nothing.
+function _pkgname_owner -a name
+    for entry in (_pkgname_index)
+        set -l fields (string split '|' -- "$entry")
+        if test "$fields[1]" = "$name"
+            echo "$fields[2]"
+            return 0
+        end
+    end
+    return 1
+end
+
+# Announce a substitution canonicalize_pkg_ref made, so a reference never
+# silently means something else. An already-canonical reference (ID) needs no
+# note, and neither does a recipe path: the caller typed the recipe itself.
+function _ref_form_note -a given resolved
+    test "$given" = "$resolved"; and return 0
+    if test (string lower -- "$given") = (string lower -- "$resolved")
+        ui_info "matched recipe '$resolved' — recipe IDs are case-sensitive"
+        return 0
+    end
+    set -l owner (_pkgname_owner "$given")
+    test -n "$owner"; and ui_info "pacman package '$given' is built by recipe '$owner'"
+end
+
+# Candidate lines within `max` edits of TOKEN on stdin, as "distance line",
+# nearest first. awk keeps this to one process for the whole candidate list; the
+# same sweep in fish costs ~0.4s, which a hint is not worth.
+function _nearest_lines -a token max
+    awk -v tok="$token" -v max="$max" '
+        function dist(a, b,   la, lb, i, j, prev, cur, ca, cb, cost, best) {
+            la = length(a); lb = length(b)
+            for (j = 0; j <= lb; j++) prev[j] = j
+            for (i = 1; i <= la; i++) {
+                cur[0] = i
+                ca = substr(a, i, 1)
+                for (j = 1; j <= lb; j++) {
+                    cb = substr(b, j, 1)
+                    cost = (ca == cb) ? 0 : 1
+                    best = prev[j] + 1
+                    if (cur[j-1] + 1 < best) best = cur[j-1] + 1
+                    if (prev[j-1] + cost < best) best = prev[j-1] + cost
+                    cur[j] = best
+                }
+                for (j = 0; j <= lb; j++) prev[j] = cur[j]
+            }
+            return prev[lb]
+        }
+        { d = dist(tok, $0); if (d <= max) print d " " $0 }'
+end
+
+# Up to three candidate recipe IDs for an unresolvable reference, as
+# "id reason" lines, most specific first.
+function _suggest_refs -a token
+    set -l out
+    set -l lowered (string lower -- "$token")
+
+    # 1. exact pacman package name
+    for entry in (_pkgname_index)
+        set -l fields (string split '|' -- "$entry")
+        test "$fields[1]" = "$token"; and set -a out "$fields[2] pkgname"
+    end
+
+    # 2. case variant of a recipe ID
+    contains "$lowered" $_PACKAGE_IDS; and set -a out "$lowered case"
+
+    # 3. substring, either direction. Literal matching in awk, so a token
+    #    containing glob characters cannot turn into a pattern.
+    if test (count $out) -lt 3
+        for id in (printf '%s\n' $_PACKAGE_IDS | \
+            awk -v tok="$lowered" 'index($0, tok) > 0 || index(tok, $0) > 0')
+            test (count $out) -ge 3; and break
+            set -a out "$id substring"
+        end
+    end
+
+    # 4. near miss (transposition, one wrong character)
+    if test (count $out) -lt 3
+        for id in (printf '%s\n' $_PACKAGE_IDS | _nearest_lines "$lowered" 2 \
+            | sort -n | cut -d' ' -f2-)
+            test (count $out) -ge 3; and break
+            set -a out "$id typo"
+        end
+    end
+
+    set -l seen
+    for line in $out
+        set -l id (string split ' ' -- "$line")[1]
+        contains "$id" $seen; and continue
+        set -a seen "$id"
+        echo "$line"
+    end
+end
+
+# Nearest known long option to a mistyped flag, or nothing. Only long options
+# are hinted — a one-letter flag is a different flag rather than a typo, and the
+# usage dump that follows lists them all. No first-character prefilter: with 18
+# options, distance <= 2 yields a single candidate for every typo measured and a
+# prefilter only cost true positives (`--xanels` -> `--lanes`).
+function _suggest_option -a given
+    string match -qr '^--' -- "$given"; or return 0
+    set -l options --install --clean --skip --no-sync --lanes --jobs --intensity \
+        --allow-broken-rustc --no-deps --dry-run --list --group --help \
+        --installall --cleanup --nuclear --link-sources --audit
+    set -l hit (printf '%s\n' $options | _nearest_lines "$given" 2 \
+        | sort -n | head -1 | cut -d' ' -f2-)
+    test -n "$hit"; and echo "  Did you mean '$hit'?"
+end
+
+# The single place an unresolvable package reference is reported, so the two
+# selection paths (group branch and package-only branch) cannot drift apart.
+function _report_unknown_ref -a token
+    ui_error "package recipe not found: '$token'"
+    set -l hints (_suggest_refs "$token")
+    if test (count $hints) -gt 0
+        echo "  Did you mean:"
+        for line in $hints
+            set -l parts (string split ' ' -- "$line")
+            switch $parts[2]
+                case pkgname
+                    echo "    $parts[1]  (pacman package '$token' is built by this recipe)"
+                case case
+                    echo "    $parts[1]  (recipe IDs are case-sensitive)"
+                case substring
+                    echo "    $parts[1]  (contains '$token')"
+                case typo
+                    echo "    $parts[1]  (closest match)"
+            end
+        end
+    end
+    echo "  Run 'build-all.fish -l' to list all "(count $_PACKAGE_IDS)" packages (or '-l -g GROUP')."
+end
+
+# Normalize package references to package IDs. IDs, relative recipe paths,
+# case-variant IDs and pacman package names are accepted so resumed commands
+# remain easy to translate.
 function canonicalize_pkg_ref -a pkg
     if contains "$pkg" $_PACKAGE_IDS
         echo "$pkg"
@@ -1426,6 +1593,17 @@ function canonicalize_pkg_ref -a pkg
             echo "$id"
             return 0
         end
+    end
+    # Tiers 3-4: exact lookups against the committed index (see the header).
+    set -l lowered (string lower -- "$pkg")
+    if test "$lowered" != "$pkg"; and contains "$lowered" $_PACKAGE_IDS
+        echo "$lowered"
+        return 0
+    end
+    set -l owner (_pkgname_owner "$pkg")
+    if test -n "$owner"
+        echo "$owner"
+        return 0
     end
     echo "$pkg"
 end
@@ -2548,8 +2726,12 @@ function usage
     echo "                    e.g. -g git -g core  /  -g git,core"
     echo "                    core = heavyweight, source-heavy, ABI-critical, and ROCm packages;"
     echo "                    auto-enables -i (installs immediately, rule 11)"
-    echo "  -l, --list        List all packages and their dependency order"
-    echo "  -n, --dry-run     Show build order without building"
+    echo "  -l, --list        List packages and their dependency order. Honours a"
+    echo "                    selection: '-l -g git' prints the 56 git packages, and"
+    echo "                    the indices it prints are exactly what a range selects."
+    echo "                    With no selection it lists all packages."
+    echo "  -n, --dry-run     Show build order without building. Honours a selection,"
+    echo "                    and with none it shows the full order."
     echo "  -ia, --installall Install ALL built packages in the workspace (pacman -U);"
     echo "                    extra args are passed through to pacman, e.g.:"
     echo "                      build-all.fish -ia --overwrite '*'"
@@ -2600,10 +2782,23 @@ function usage
     echo "               GSA_CPU_THREADS, GSA_MEMORY_GIB, GSA_TARGET_CPU"
     echo "               override runtime state, parallelism, and optional CPU tuning."
     echo ""
+    echo "Package references (a bare name is not a leaf build — it expands the"
+    echo "whole dependency chain; use --no-deps for one package):"
+    echo "  mesa-git              Recipe ID"
+    echo "  packages/git/mesa-git Recipe path"
+    echo "  MESA-GIT              Case-variant ID (matched, and reported)"
+    echo "  zen-browser           pacman package name, including a split output"
+    echo "                        (built by recipe zen-browser-pgo) — also matched"
+    echo "                        and reported. A typo is never auto-corrected;"
+    echo "                        unknown names are reported with suggestions."
+    echo ""
     echo "Range syntax (requires a -g group or package selection):"
-    echo "  22..38            Build packages 22 through 38 from the sorted list"
+    echo "  22..38            Build packages 22 through 38 of the SELECTION"
     echo "  22..              Build from package 22 to the end"
     echo "  ..15              Build from the start through package 15"
+    echo "  Indices address the selection in dependency order — the list"
+    echo "  'build-all.fish -l -g GROUP' prints, not the whole-set order that a"
+    echo "  bare '-l' prints."
     echo ""
     echo "Examples:"
     echo "  build-all.fish -g git               Build top-level -git packages in dep order"
@@ -2612,6 +2807,8 @@ function usage
     echo "  build-all.fish -g git -i            Same, installing each package as it finishes"
     echo "  build-all.fish -g git --lanes 2     Two parallel makepkg lanes over the git group"
     echo "  build-all.fish -g git --lanes 2 -i  Parallel lanes + immediate installs"
+    echo "  build-all.fish -l -g git            List the git group with the indices that"
+    echo "                                      its ranges address"
     echo "  build-all.fish --no-deps niri-spicy-git"
     echo "                                      Rebuild ONE package, skip its dep chain"
     echo "  build-all.fish niri-spicy-git       Rebuild it + its whole dep chain (llvm, rust,"
@@ -2635,19 +2832,29 @@ function usage
 end
 
 # ─── List packages ───────────────────────────────────────────────────────────
-function list_packages
-    echo "All packages in dependency order:"
+# Print a selection in dependency order. The first argument is the whole-set
+# flag: 1 is the `-l` with no selection listing, which keeps the original
+# heading and group footer byte-for-byte. Otherwise the selection is named, and
+# the footer states what the printed indices are for — a range indexes THIS
+# list, not the whole set. Remaining arguments are the packages, in order.
+function list_packages -a all_flag
+    set -l sorted_list $argv[2..-1]
+    if test "$all_flag" = 1
+        echo "All packages in dependency order:"
+    else
+        echo "Selected packages in dependency order ("(count $sorted_list)"):"
+    end
     echo ""
-    set -l all_grouped (printf '%s\n' \
-        $_GROUP_git $_GROUP_stable $_GROUP_core $_GROUP_misc $_GROUP_third_party \
-        | awk '!seen[$0]++')
-    set -l all_pkgs (topo_sort (string join ' ' $all_grouped))
     set -l i 1
-    for pkg in $all_pkgs
+    for pkg in $sorted_list
         printf "  %2d. %s\n" $i $pkg
         set i (math $i + 1)
     end
     echo ""
+    if test "$all_flag" != 1
+        echo "Ranges index this list: e.g. '22..38' selects entries 22-38 above."
+        return 0
+    end
     echo "Groups:"
     echo "  git:      "(count $_GROUP_git)" packages"
     echo "  stable:   "(count $_GROUP_stable)" packages"
@@ -2673,8 +2880,14 @@ function resolve_group -a grp
         case third-party third_party 3rdp
             printf '%s\n' $_GROUP_third_party
         case '*'
-            ui_error "unknown group '$grp'"
-            echo "Available groups: git, stable, core, misc, third-party"
+            # This function's stdout is a data channel — the caller captures it
+            # with a command substitution — so diagnostics must go to stderr or
+            # they vanish silently (they did: `-g gti` exited 1 saying nothing).
+            ui_error "unknown group '$grp'" >&2
+            set -l near (printf '%s\n' git stable core misc third-party \
+                | _nearest_lines "$grp" 2 | sort -n | head -1 | cut -d' ' -f2-)
+            test -n "$near"; and echo "  Did you mean '$near'?" >&2
+            echo "Available groups: git, stable, core, misc, third-party" >&2
             return 1
     end
     return 0
@@ -2688,6 +2901,7 @@ function main
     set -l no_sync_flag 0
     set -l no_deps_flag 0
     set -l dry_run 0
+    set -l list_flag 0
     set -l lane_count "$_DEFAULT_LANES"
     set -l jobs_override "$_DEFAULT_JOBS"
     set -l intensity_level "$_DEFAULT_INTENSITY"
@@ -2758,8 +2972,10 @@ function main
             case -n --dry-run
                 set dry_run 1
             case -l --list
-                list_packages
-                return 0
+                # Deferred: the listing is printed from the resolved selection
+                # (see the pipeline below), so `-l -g git` shows the indices a
+                # range would select instead of ignoring the selection.
+                set list_flag 1
             case -g --group
                 if test (count $args) -lt 2
                     ui_error "--group requires an argument"
@@ -2803,6 +3019,7 @@ function main
                 return
             case '-*'
                 ui_error "unknown option: $args[1]"
+                _suggest_option "$args[1]"
                 usage
                 return 1
             case '*..*'
@@ -2814,14 +3031,26 @@ function main
         set -e args[1]
     end
 
-    # Determine packages to build — a selection is MANDATORY. The old default
-    # (no options = build everything) was removed 2026-09-07: an unattended
-    # full rebuild is exactly how the rust/llvm ABI break happened.
+    # Determine packages to build — a selection is MANDATORY for a build. The
+    # old default (no options = build everything) was removed 2026-09-07: an
+    # unattended full rebuild is exactly how the rust/llvm ABI break happened.
+    # The read-only actions (-l, -n) are exempt: they build nothing, so "no
+    # selection" covers the whole set there (which is what --help advertises).
+    set -l selection_given 0
+    if test (count $packages) -gt 0 -o (count $groups) -gt 0
+        set selection_given 1
+    end
+    # What was asked for, before dependency expansion. `$sorted` minus this set
+    # is what the expansion added, reported for builds and dry runs: a bare name
+    # can silently become a 40-package run.
+    set -l requested
     set -l build_list
     if test (count $packages) -gt 0
         set -l canonical_packages
         for pkg in $packages
-            set -a canonical_packages (canonicalize_pkg_ref "$pkg")
+            set -l resolved (canonicalize_pkg_ref "$pkg")
+            _ref_form_note "$pkg" "$resolved"
+            set -a canonical_packages "$resolved"
         end
         set packages $canonical_packages
     end
@@ -2837,17 +3066,22 @@ function main
                 # Rule 11: core rebuilds are only sound with immediate
                 # installs — later packages must compile against freshly
                 # installed core dependencies, not old ABIs in the system.
+                # A listing installs nothing, so it is not warned about.
                 set install_flag 1
-                ui_warning "-g core: enabling -i (immediate per-package install) — core rebuilds without installs compile against old ABIs"
+                if test "$list_flag" != 1
+                    ui_warning "-g core: enabling -i (immediate per-package install) — core rebuilds without installs compile against old ABIs"
+                end
             end
             set build_list $build_list $gl
+            set -a requested $gl
         end
         # Positional packages may be combined with groups
         if test (count $packages) -gt 0
+            set -a requested $packages
             for pkg in $packages
                 set -l pkg_path (package_path "$pkg")
                 if test -z "$pkg_path"; or not test -f "$pkg_path/PKGBUILD"
-                    ui_error "package recipe not found for ID '$pkg'"
+                    _report_unknown_ref "$pkg"
                     return 1
                 end
             end
@@ -2867,12 +3101,13 @@ function main
         for pkg in $packages
             set -l pkg_path (package_path "$pkg")
             if test -z "$pkg_path"; or not test -f "$pkg_path/PKGBUILD"
-                ui_error "package recipe not found for ID '$pkg'"
+                _report_unknown_ref "$pkg"
                 return 1
             end
         end
         # Expand to include transitive local dependencies — unless --no-deps:
         # build exactly the named packages (leaf rebuild with known-current deps).
+        set -a requested $packages
         if test $no_deps_flag -eq 1
             set build_list $packages
         else
@@ -2882,9 +3117,15 @@ function main
             end
             set build_list $expanded
         end
+    else if test "$list_flag" = 1 -o "$dry_run" = 1
+        # Read-only action with no selection: cover the whole set rather than
+        # demanding one (see the header above).
+        set build_list $_GROUP_git $_GROUP_stable $_GROUP_core $_GROUP_misc $_GROUP_third_party
+        set build_list (printf '%s\n' $build_list | awk '!seen[$0]++')
     else
         ui_error "no packages selected — pass -g GROUP and/or package names"
         echo "Groups: git, stable, core, misc, third-party   (see -h for examples)"
+        echo "Read-only: -l lists packages, -n shows the build order without building."
         return 1
     end
 
@@ -2898,9 +3139,10 @@ function main
         return 1
     end
 
-    # Apply range filters (e.g. 22..38, 22.., ..15)
-    set -l range_offset 0
-    set -l range_end 0
+    # Apply range filters (e.g. 22..38, 22.., ..15). Indices address the
+    # SELECTION in dependency order — the list `-l -g GROUP` prints, which is
+    # not the whole-set order a bare `-l` prints. Naming the bounds on a miss is
+    # the difference between a typo and an unexplained empty build.
     if test (count $ranges) -gt 0
         set -l total (count $sorted)
         set -l indices
@@ -2908,17 +3150,39 @@ function main
             set -l parts (string split '..' $range)
             set -l start $parts[1]
             set -l end $parts[2]
+            if test (count $parts) -ne 2; or not string match -qr '^[0-9]*$' -- "$start$end"; or test -z "$start$end"
+                ui_error "invalid range '$range' — expected N..M, N.., or ..M (e.g. 22..38)"
+                return 1
+            end
             if test -z "$start"
                 set start 1
             end
             if test -z "$end"
                 set end $total
             end
-            # Clamp to valid range
+            set start (math $start)
+            set end (math $end)
+            if test $start -gt $total; or test $end -lt 1
+                ui_error "range $range is outside the $total-package selection (valid: 1..$total)"
+                set -l list_args -l
+                for g in $groups
+                    set -a list_args -g $g
+                end
+                set -a list_args $packages
+                echo "  Indices address the selection in dependency order; see them with:"
+                echo "    build-all.fish "(string join ' ' -- $list_args)
+                return 1
+            end
+            if test $start -gt $end
+                ui_error "range $range is empty — the start is past the end"
+                return 1
+            end
             if test $start -lt 1
+                ui_warning "range $range: start clamped to 1 (selection has $total packages)"
                 set start 1
             end
             if test $end -gt $total
+                ui_warning "range $range: end clamped to $total (the selection size)"
                 set end $total
             end
             for i in (seq $start $end)
@@ -2928,9 +3192,6 @@ function main
         # Deduplicate indices and sort
         set -l unique_indices (printf '%s\n' $indices | sort -nu)
         set -l filtered
-        # Track offset and end for resume suggestions
-        set range_offset (math (printf '%s\n' $unique_indices | head -1) - 1)
-        set range_end (printf '%s\n' $unique_indices | tail -1)
         for i in $unique_indices
             set -a filtered $sorted[$i]
         end
@@ -2940,6 +3201,24 @@ function main
     if test (count $sorted) -eq 0
         ui_error "selection resolved to no packages"
         return 1
+    end
+
+    # List — read-only, and deliberately AFTER the range filter: the printed
+    # indices are the ones a range selects, which is the whole point of `-l -g`.
+    if test "$list_flag" = 1
+        list_packages (test "$selection_given" = 0; and echo 1; or echo 0) $sorted
+        return 0
+    end
+
+    # How much of this selection came from dependency expansion rather than the
+    # request itself. Reported for builds and dry runs (the preview is where it
+    # matters most); a listing already shows the whole set, so it stays quiet.
+    set -l added_deps 0
+    for pkg in $sorted
+        contains "$pkg" $requested; or set added_deps (math $added_deps + 1)
+    end
+    if test $added_deps -gt 0; and test "$selection_given" = 1
+        ui_info "dependency expansion added $added_deps of the "(count $sorted)" selected packages (--no-deps builds only what you named)"
     end
 
     # Dry run

@@ -32,6 +32,79 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — a mistyped package name said nothing useful, and `-g gti` said nothing at all
+
+- **Symptom**: `fish build-all.fish mesa-gti` printed
+
+  ```
+  ✗ package recipe not found for ID 'mesa-gti'
+  ```
+
+  and stopped. No suggestion, no pointer to the listing, and no way to tell a
+  typo from a package that does not exist. `fish build-all.fish -g gti` was
+  worse: it exited 1 having printed **nothing**, so the only clue was the exit
+  status. A name that *is* installed on the host — `zen-browser` — was refused
+  outright, because resolution knew only recipe IDs and recipe paths.
+- **Root cause (two, and only the second is the interesting one)**:
+  1. `canonicalize_pkg_ref` had exactly two lookup tables (the ID list and the
+     map's recipe-path column) and neither is the name a user has in hand. The
+     pacman `pkgname` was simply not a lookup key, even though every recipe
+     commits a `.SRCINFO` that names it.
+  2. `resolve_group`'s diagnostic went to **stdout**, which is a *data* channel:
+     `main` reads the group with `set -l gl (resolve_group $g)`, so the message
+     was captured into `$gl` and thrown away. The function's own return status
+     was the only surviving signal, and the caller's `ui_error` path was never
+     reached because the caller only returns when `resolve_group` fails — which
+     it does, silently.
+- **Fix — the name index**: `_pkgname_index` reads `name|id` pairs from every
+  recipe's committed `.SRCINFO` (218 distinct names across 126 recipes; measured
+  zero unexpanded `${…}`, because `makepkg --printsrcinfo` already expanded
+  them, and *no name shared by two recipes*, so a lookup cannot pick the wrong
+  recipe). `canonicalize_pkg_ref` gained two exact tiers — case-variant ID and
+  pacman `pkgname` — and `_ref_form_note` announces each substitution, so a
+  reference never silently means something else. A typo is deliberately **not**
+  auto-corrected: a wrong guess would build a whole dependency chain, and
+  `libstdc++-snapshot` → `gcc-snapshot` is a 17-package split recipe. Typos are
+  reported by `_report_unknown_ref` with up to three ranked candidates
+  (exact name, case variant, substring, Levenshtein ≤ 2). The distance sweep
+  runs in **awk**, one process for all 126 candidates: the same sweep in fish
+  costs ~0.4 s, and `awk` was also the correct tool because a token containing
+  glob characters (`libstdc++-snapshot`) cannot become a pattern there.
+  `resolve_group` now writes its diagnostic to stderr.
+- **Fix — the listings, which is where the same defect class showed up again**:
+  a range indexes the **selection** in dependency order, but `--list` printed
+  the whole-set order and `-l` returned at parse time, discarding `-g`. So
+  `-l` index 22 was `vscodium-insiders-git` while `-g git 22..24` built
+  `ninja-git, mesa-git, niri-spicy-git` — two different answers with nothing
+  saying which one a range meant. `-l` now runs *after* the selection pipeline
+  (so `-l -g git` prints the 56 packages a range addresses, and says so), `-n`
+  with no selection covers the whole set — which is what `--help` had claimed
+  for it all along while the run errored — and ranges name their mistakes:
+  out-of-bounds reports the selection size and the valid window, a clamped bound
+  warns, `..` and `N..M` with a start past the end are refused instead of
+  silently selecting everything or nothing. `-g core`'s auto-install warning is
+  suppressed for `-l` only: a listing installs nothing.
+  A bare name that expands into its dependency chain now says how much of the
+  selection it added (`niri-spicy-git` → "added 2 of the 3").
+- **Validation**: `tests/project-cli-hints.sh` (new, 23rd fixture) asserts every
+  message above — including that the group diagnostic is on **stderr** and not
+  on stdout — and was mutation-tested red on five mutations: hints removed,
+  `-l`'s parse-time return restored, the out-of-bounds guard dropped, the
+  pkgname tier dropped, and `resolve_group`'s `>&2` removed. The last one
+  initially stayed **green**, because the swallowed text leaked back into the
+  output through another path (the captured string became a "package" and was
+  echoed by the topology error) — which is exactly why the assertion was
+  rewritten to check the channel, not the merged text. Full battery 23/23;
+  `--list` with no selection is byte-identical to before (diffed against the
+  previous revision), so `tests/project-config.sh` and every documented
+  invocation are unaffected.
+- **Durable rule**: a diagnostic written to a function's stdout is *data* when a
+  caller captures it — put it on stderr, or it will be silently swallowed and
+  the exit status will be the only evidence. And an index that a user has to
+  know by heart (which of 126 IDs is the one) should be discoverable from the
+  metadata the repo already commits: `.SRCINFO` is authoritative, needs no
+  PKGBUILD evaluation, and `tests/srcinfo-freshness.sh` already keeps it honest.
+
 ## 2026-09-19 — the knob switch died in makepkg's integrity check
 
 - **Symptom**: a build of the recipe with `_cpusched=cachyos` — every other knob

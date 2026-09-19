@@ -76,8 +76,8 @@ bash tests/recipe-sources.sh         # run one fixture directly
 `tests/run-all.sh` discovers `tests/*.sh` and needs no edit for a new fixture.
 The filter is a plain substring of the filename, so `pgo` runs the whole PGO
 family; `texlive`, `recipe`, `project`, `scheduler`, `sudo` and `probe` each
-narrow to one area, and `mkinitcpio`/`bpftune` isolate the two single-recipe
-hook fixtures.
+narrow to one area (`project` covers both `project-config` and `project-cli-hints`),
+and `mkinitcpio`/`bpftune` isolate the two single-recipe hook fixtures.
 
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
@@ -149,14 +149,22 @@ whose installed dependencies are known current.
 
 ```sh
 fish build-all.fish --no-deps niri-spicy-git   # leaf rebuild only
-fish build-all.fish -g git 22..38              # index range from --list
+fish build-all.fish -g git 22..38              # index range from '-l -g git'
 fish build-all.fish -s --install -g git        # resume: skip already-built archives
 ```
 
+A reference may be a recipe ID (`mesa-git`), a recipe path
+(`packages/git/mesa-git`), a case-variant ID, or a pacman `pkgname` — including a
+split output (`zen-browser` → `zen-browser-pgo`). The last two are exact lookups
+against the committed `.SRCINFO` names and are announced when substituted; a typo
+is never auto-corrected, it is reported with the nearest candidates.
+
 `-g` takes repeats or commas (`-g git -g core` / `-g git,core`) and dedupes the
 union, so group *and* explicit package selections can be combined in one run.
-Ranges index the `--list` order and may be open-ended (`22..`, `..15`), but a
-range still needs a `-g` or package selection to anchor it.
+Ranges index the **selection** in dependency order and may be open-ended (`22..`,
+`..15`), but a range still needs a `-g` or package selection to anchor it — read
+`-l -g git` (not a bare `-l`, which lists the whole set in a different order)
+before choosing one.
 
 `-i` installs each package before its dependents compile (core selection turns
 it on automatically), through `pacman -U --noconfirm --ask 4`, and an install
