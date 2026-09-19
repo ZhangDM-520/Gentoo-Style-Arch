@@ -325,11 +325,55 @@ install history lives in `NOTE.md`.
 
 ## 5. Pending tasks
 
-Re-verified against the host on 2026-09-17. Completed items were deleted
+Re-verified against the host on 2026-09-19. Completed items were deleted
 rather than left in place — an unchecked task list reads as authority while
 going stale.
 
 ### Queued (claim by editing this section)
+
+- **Rebuild `cmake-git` and `xorg-xwayland-git`: the installed binaries are PGO
+  phase-1 instrumented (found 2026-09-19).** `/usr/bin/cmake` (cmake-git
+  4.4.3.936, built 2026-09-07) and `/usr/bin/Xwayland` (built 2026-09-16) each
+  carry hundreds of **absolute** `.gcda` paths baked in — 431 and 348
+  respectively, from the pre-2026-09-15 layout
+  (`~/Projects/.Heavyweight/cmake-git/src/cmake/…`,
+  `~/Projects/xorg-xwayland-git/src/build/…`). libgcov `mkdir -p`s those paths
+  on **every invocation**, so the two directories reappear as 779 `.gcda` files
+  the moment anything runs `cmake` or starts Xwayland. Proven by deleting both
+  trees twice and re-creating all 779 files with one `cmake --version` and one
+  `Xwayland` call. Both installed builds **predate** the recipes' current
+  phase-2 `-fprofile-use` logic (which landed 2026-09-16), so this is a stale
+  install rather than a broken recipe — but a plain `-Syu` will not fix it,
+  because both package names are `IgnorePkg`-locked; it needs
+  `build-all.fish --no-deps --install` on each. Until then, deleting the two
+  directories is futile and their reappearance is not new debris.
+- **The instrumentation guard is a false negative on installed packages
+  (2026-09-19).** `verify_no_profile_instrumentation()` in the
+  `xorg-xwayland-git` recipe — and the same check quoted in
+  `.github/copilot-instructions.md` and §6 below — tests
+  `readelf -sW <bin> | grep -Eq '__gcov_|__llvm_profile'`. Run against the
+  **installed** `/usr/bin/Xwayland` it reports *clean*, because makepkg strips
+  the binary and `readelf` then has 883 symbol entries and no match, while
+  `strings -a` finds the 348 `.gcda` paths. The check is sound where the recipe
+  calls it (inside `package()`, before makepkg's strip step) but must never be
+  trusted against an installed or otherwise stripped binary; use
+  `strings -a <bin> | grep -c '\.gcda'` there. Add that form to the digest.
+
+- **`IgnorePkg` closure is 32 names short (found 2026-09-19).** Golden rule 9
+  says the closure diff must be empty; it is not. `comm -23` of the committed
+  `.SRCINFO` pkgname set (218 names) against `pacman-conf IgnorePkg` (221
+  entries, **no globs** — checked) leaves unprotected: the three
+  `linux-cachyos-rt-bore-lto*` outputs, all 30 `texlive-*` splits, and
+  `autofdo-git`, `bpftune-git`, `logseq-desktop-git`, `mkinitcpio`,
+  `openshadinglanguage`, `vscodium-insiders-git`. Most are latent today —
+  installed version equals or exceeds the repo's (`mkinitcpio` 42-2 vs 42-1,
+  `texlive-basic` 2026.1-1 on both sides) — but the 2026-09-04 `hip-runtime`
+  incident is precisely this failure mode: as soon as a stock version moves
+  ahead, `-Syu` replaces the house build with no warning. Note `linux-` is
+  variable-derived (`pkgbase="linux-$_pkgsuffix"`), so the closure check must
+  read `.SRCINFO`; a `PKGBUILD` grep reports a literal `linux-` and hides the
+  real names. Fix by one-line `IgnorePkg =` insertions inside `[options]`
+  after backing the file up, then re-run the `comm -23`.
 
 - **ROCm is half-removed**: `hsa-rocr` 7.2.4-1.1, `rocm-llvm` 2:7.2.4-2.1 and
   `comgr` 2:7.2.4-2.1 are installed again (the 2026-09-06 collective removal was
@@ -366,7 +410,17 @@ going stale.
   before (NVMe ASPM, `ananicy-cpp`, zram, a 20 GB write burst): a texlive build
   is the same fork/exec + I/O pattern, so those freezes were this fault. Fix:
   `packages/misc/linux-cachyos` moved onto the CachyOS RC channel
-  (`cachyos-7.3-rc3-4`) — recipe done, build/install pending. The evidence is
+  (`cachyos-7.3-rc3-4`) — recipe done, **and as of 2026-09-19 the fix is built,
+  installed and running**: `linux-cachyos-cachyos-lto` 7.3.rc3-1, `uname -r` =
+  `7.3.0-rc3-1-cachyos-cachyos-lto`, i.e. **7.3-rc3 is outside the affected
+  7.1 ≤ v < 7.2.6 range**. The build used `_cpusched=cachyos` (the recipe's
+  default is still `rt-bore`), so the running kernel is `PREEMPT_DYNAMIC`,
+  `CONFIG_HZ=600`, ThinLTO Clang, with **no PREEMPT_RT and no `SCHED_BORE`** —
+  a deliberate flavour change, not a silent one, but worth re-reading before a
+  default rebuild swaps the machine onto rt-bore. `linux-cachyos-rt-bore-lto`
+  7.2.5-1 and `linux-cachyos-lts` 6.18.52-1 remain installed as fallbacks, and
+  `efi_pstore.pstore_disable=N` plus the panic parameters are live on the
+  running command line, so the capture chain survived the swap. The evidence is
   upstream-documented plus circumstantial; the confirming A/B was skipped by
   decision, so read "identified" as strong, not proven.
 - **Decision needed at the next `linux-cachyos` rebuild: AutoFDO + Propeller
@@ -608,6 +662,10 @@ recipe).
 - **PGO operational**: root-owned gcda appears if instrumented daemons are
   installed mid-iteration (→ sudo rm -rf src, avoid installing); gcda
   verification via `find <dir>`; MT trainers need `-fprofile-update=atomic`;
+  an instrumented **installed** binary bakes the absolute `.gcda` paths into
+  itself, so it re-creates the whole `src/` tree on every run — check a shipped
+  binary with `strings -a <bin> | grep -c '\.gcda'`, **not** `readelf -sW`, which
+  is a false negative on anything makepkg has stripped (2026-09-19);
   a Meson PGO reconfigure must replace `c_args`, `cpp_args`, `c_link_args`,
   and `cpp_link_args` together so phase-1 `-fprofile-generate` cannot remain;
   profile-use configure probes need `-Wno-error=missing-profile`; verify the
