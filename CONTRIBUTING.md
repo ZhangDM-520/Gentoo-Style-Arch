@@ -1,9 +1,21 @@
 # Contributing
 
 Contributions should improve a recipe or the builder for a clean Arch
-checkout. Do not submit upstream source clones, generated build trees,
-package archives, downloaded signatures, local PGP key caches, or host-specific
-logs and profiles.
+checkout. **This set is maintained for AMD laptops** — AMD CPUs with
+amdgpu/radeon graphics — and the hardware-support trims follow from that
+target: a recipe may drop Intel- and NVIDIA-only firmware, drivers and code
+paths, and should name the platform or family it trims against, so a reader can
+see what the recipe no longer covers. Non-AMD paths stay when a maintained
+feature needs them. Do not submit upstream source clones, generated build
+trees, package archives, downloaded signatures, local PGP key caches, or
+host-specific logs and profiles.
+
+Explain non-obvious decisions in the recipe. **A comment explains the code, the
+kernel option, or the trim decision; it does not inventory the machine it was
+written on.** Kernel versions, package versions installed on the author's
+machine, CPU thread counts, bootloader command lines and incident narratives
+belong in `docs/NOTE.md`; `docs/MEMORY.md` §5 holds a live decision.
+`linux-cachyos` is the worked example (2026-09-19).
 
 ## Recipe changes
 

@@ -7,7 +7,7 @@ pkgname=(
   linux-firmware-whence
   linux-firmware-other
 
-  # Splits — trimmed to this machine's hardware (AMD Strix Halo:
+  # Splits — trimmed to the AMD laptop target (Strix Halo:
   # Radeon 880M/890M, MediaTek MT7925 wifi/BT, AMD ACP/USB4,
   # Cirrus CS35L41 speaker amps)
   amd-ucode
@@ -139,10 +139,10 @@ package_linux-firmware-other() {
   _pick mediatek "${fwdir}"/{mediatek,mt7*,rt[237]*}
 
   # Cirrus Logic: CS35L41 smart-amp speaker firmware + cs42l43 codec
-  # (needed by this machine's audio chain)
+  # (needed by the target's audio chain)
   _pick cirrus "${fwdir}"/cirrus "${fwdir}"/cs42l43*
 
-  # hardware trim (Strix Halo): drop firmware for vendors not on this machine
+  # hardware trim (Strix Halo): drop firmware for vendors outside the target
   rm -rf "${fwdir}"/{ar[0-9]*,ath*,carl9170*,htc_*,qca,wil6210*}                    # Qualcomm Atheros
   rm -rf "${fwdir}"/{bnx2*,brcm,cypress,tigon}                                     # Broadcom/Cypress
   rm -rf "${fwdir}"/{e100,hfi1_*,i915,intel,isci,iwlwifi*,ixp4xx,qat_*,xe}          # Intel

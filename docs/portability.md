@@ -80,6 +80,25 @@ target CPU; the Rust snapshot recipe uses it instead of a hard-coded
 `znver5`. Native optimizations in selected recipes are host-derived and
 should not be redistributed as portable binary artifacts.
 
+That last point separates two things that are easy to conflate:
+
+* **A recipe is portable.** No recipe here pins one machine's ISA. Every
+  native-flag injection is conditional on the environment not already setting a
+  target, and says so (`niri-spicy-git`, `rust-bindgen-git`,
+  `xwayland-satellite-git`); no recipe narrows `arch` below `x86_64`; and the
+  kernel's `_processor_opt` is a knob with `zen4` and `generic` alternatives
+  beside its `native` default. Copy those patterns rather than adding a new
+  hard-coded `-march`.
+* **An artifact is not.** `makepkg.conf` supplies `-march=native`, so a package
+  built from this tree is tuned to the building machine and is not a
+  redistributable binary. Hard-coding a target in a recipe would only move that
+  problem from the build host to the reader.
+
+The set is maintained against AMD laptop hardware (see `README.md`), and the
+hardware-support trims are validated on one such model. The recipes build on
+any Arch x86_64 host; it is the trims that a second, non-AMD model would be
+needed to re-verify.
+
 ## Host-specific profiles
 
 The CachyOS kernel recipe keeps its baseline `config` because it is a

@@ -137,6 +137,18 @@
     quietly missing files. Pin both with a fixture that diffs the old and new
     implementations (`tests/texlive-split.sh`, oracle in `tests/assets/`).
 
+17. **Recipes are public surface** (09-19 incident): a recipe comment explains
+    the code, the kernel option, or the trim decision — it does not inventory
+    the machine it was written on. Kernel versions, installed package versions,
+    CPU thread counts, bootloader command lines and incident narratives belong
+    in NOTE.md. The set is maintained for **AMD laptops** (AMD CPUs with
+    amdgpu/radeon graphics): a trim that follows from that target should name
+    the platform, while one that follows from a single author's environment is
+    a capability absence and should say so. A recipe is portable — ISA settings
+    come from the environment — but the artifact is not, because
+    `makepkg.conf` supplies `-march=native`. See `portability.md`,
+    `CONTRIBUTING.md` and the 2026-09-19 NOTE section.
+
 ## 2. Workspace overview
 
 - The public tree is `Gentoo_Style_Arch/`; recipes live under
@@ -381,6 +393,13 @@ going stale.
   panic landed in pstore in 17 compressed records and the machine self-rebooted
   in 27 s, and **never reached the journal**. pstore is the channel for a hard
   crash, not journald; do not read an empty journal as "nothing happened".
+  **Recipe side (2026-09-19):** `_capture_chain` now defaults to `no`, so a
+  kernel built from the recipe no longer carries the chain itself. The two
+  options that matter are **config-only** — `WQ_WATCHDOG` and `PSTORE_CONSOLE`
+  cannot be set from a command line — so set `_capture_chain=yes` in the
+  environment for that build (the override reaches the lane child; verified
+  2026-09-19). The armed command line and the sysctl drop-in above are
+  independent of the recipe and stay.
 - **Still open: the 2026-09-01 cluster.** `last -x` over the whole wtmp (machine
   installed 2026-08-31 15:20) shows ~23 unclean shutdowns, but the first four
   are a separate event: inside 27 minutes, the first ten minutes after
@@ -405,6 +424,18 @@ recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
+- **A comment in a tracked file is public surface** (2026-09-19, linux-cachyos):
+  the debugging facts that justify a knob — the running kernel version, the CPU
+  thread count, the bootloader command line, the incident that motivated it —
+  are exactly what `CONTRIBUTING.md` excludes as "host-specific logs and
+  profiles", and they had leaked into 16 comment sites across two commits.
+  Rewriting them forced the *claim* to move, not only the wording: the AutoFDO
+  drift note had rested on host state the committed `config` does not contain
+  (it carries no `AUTOFDO_CLANG`/`PROPELLER_CLANG` line), and `_host_tune` had
+  rested on a thread count where the committed `config` already carried
+  `MAXSMP=y`, `NR_CPUS=8192` and `CPUMASK_OFFSTACK=y` server defaults. A
+  claim grounded in committed files survives de-hosting; one grounded in the
+  machine does not — which is the signal that it was never a recipe fact.
 - **An unclean shutdown zeroes freshly written files** (2026-09-19, bettbox):
   XFS log recovery restores metadata without the data of the last seconds, so a
   file keeps its size and mtime with zeroed content — undetectable by any size

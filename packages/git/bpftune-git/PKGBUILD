@@ -48,11 +48,9 @@ package() {
 
 	# bpftune dlopens the tuner plugins from /usr/lib/bpftune/ and keeps
 	# pointers into them, so replacing those files underneath the running
-	# process kills a worker thread in strstr() with SIGSEGV.  Both coredumps
-	# this host has are that fault, each stamped in the same second as the
-	# `pacman -U` that rewrote the plugins (2026-09-16 07:38:35, 18:57:50;
-	# /var/log/pacman.log).  These hooks stop the unit before the swap and
-	# start it after, so it never spans the transaction.
+	# process kills a worker thread in strstr() with SIGSEGV.  These hooks
+	# stop the unit before the swap and start it after, so it never spans the
+	# transaction.
 	install -Dm755 "$srcdir/bpftune-restart.script" \
 		"$pkgdir/usr/share/libalpm/scripts/bpftune-restart"
 	install -Dm644 "$srcdir/50-bpftune-tuners-pre.hook" \

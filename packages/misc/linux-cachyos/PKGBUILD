@@ -109,10 +109,9 @@ _preempt_explicit="${_preempt+set}"
 # UNAVAILABLE under _cpusched=rt/rt-bore: mm/Kconfig gates the entire THP menu
 # (`menuconfig TRANSPARENT_HUGEPAGE`) on `!PREEMPT_RT`, so with PREEMPT_RT=y
 # the symbols below do not exist in the tree at all. scripts/config writes them
-# anyway, olddefconfig deletes them, and nothing is reported - which is why THP
-# was never once enabled on this host despite the knob being set for its whole
-# life. prepare() now says so out loud, and the expectation table records
-# !TRANSPARENT_HUGEPAGE so the loss is a tested fact rather than an accident.
+# anyway and olddefconfig deletes them, with nothing reported. prepare() now
+# prints the drop and the expectation table records !TRANSPARENT_HUGEPAGE, so
+# the loss is a tested fact rather than an accident.
 _hugepage_explicit="${_hugepage+set}"
 : "${_hugepage:=madvise}"
 
@@ -184,14 +183,15 @@ _hugepage_explicit="${_hugepage+set}"
 # Profiles are host-specific and intentionally disabled for a clean checkout.
 # Enable them only after placing a matching profile beside this PKGBUILD.
 #
-# Drift, deliberate: the kernel this host currently runs (7.2.5-1-cachyos-rt-bore-lto)
-# was built with AUTOFDO_CLANG=y and PROPELLER_CLANG=y. These defaults are "no", so
-# the first default rebuild of this recipe REPLACES an AutoFDO+Propeller-optimised
-# kernel with a plain one - a real, measurable loss of optimisation that produces no
-# warning anywhere in the build. Two honest choices: drop the profile files beside
-# this PKGBUILD and set _autofdo/_propeller to yes (keeping the optimisation), or
-# accept the plain kernel. What must not happen is the swap passing unnoticed, which
-# is why prepare() asserts the off state and prints it in the resolved-config diff.
+# Drift, deliberate: these defaults are "no", so a build with them produces a
+# kernel with AUTOFDO_CLANG and PROPELLER_CLANG unset. If you have previously
+# built this recipe with either enabled, the default rebuild silently replaces
+# an optimised kernel with a plain one - a real loss of optimisation that the
+# build does not warn about. Two honest choices: drop the profile files beside
+# this PKGBUILD and set _autofdo/_propeller to yes (keeping the optimisation),
+# or accept the plain kernel. What must not happen is the swap passing
+# unnoticed, which is why prepare() asserts the off state and prints it in the
+# resolved-config diff.
 : "${_autofdo:=no}"
 
 # Name for the AutoFDO profile (a file in this directory)
@@ -210,35 +210,37 @@ _hugepage_explicit="${_hugepage+set}"
 # Enable this after the profiles have been generated
 : "${_propeller_profiles:=no}"
 
-### Crash-capture chain
-# This kernel exists to leave evidence behind when the machine wedges, and the
-# capture chain is currently assembled entirely outside the recipe: the Limine
-# cmdline carries hardlockup_panic=1 softlockup_panic=1 hung_task_panic=1
-# panic_on_oops=1 panic=10 efi_pstore.pstore_disable=N sysrq=1, plus a sysctl
-# drop-in. The shipped config argues the other way on every count - it sets
-# EFI_VARS_PSTORE_DEFAULT_DISABLE=y and leaves PSTORE_CONSOLE, WQ_WATCHDOG,
-# PANIC_ON_OOPS, BOOTPARAM_HARDLOCKUP_PANIC and BOOTPARAM_SOFTLOCKUP_PANIC
-# unset - so a kernel that panics writes into a pstore the firmware-variable
-# level has disabled, and a bootloader-less boot records nothing at all.
+### Crash-capture chain (opt-in)
+# The shipped config argues against a usable crash-capture chain on every
+# count: it sets EFI_VARS_PSTORE_DEFAULT_DISABLE=y and leaves PSTORE_CONSOLE,
+# WQ_WATCHDOG, PANIC_ON_OOPS, BOOTPARAM_HARDLOCKUP_PANIC and
+# BOOTPARAM_SOFTLOCKUP_PANIC unset. A kernel that panics then writes into a
+# pstore the firmware-variable level has disabled, and a bootloader-less boot
+# records nothing at all.
 #
-# CVE-2026-90432 is why this matters: scx_hardlockup() deferred the sched_ext
-# abort to an irq_work that never ran on a hard-locked CPU with IRQs off, so
-# the machine wedged with no report. WQ_WATCHDOG is the option that makes a
-# never-run workqueue item announce itself.
+# Turning this on makes the config carry the chain itself instead of relying on
+# the operator's kernel command line and sysctl drop-in. It is also a behaviour
+# change: PANIC_ON_OOPS plus PANIC_TIMEOUT makes the kernel reboot on an oops
+# rather than limp on, and WQ_WATCHDOG makes a workqueue item that never runs
+# announce itself - the failure mode where a deferred irq_work cannot run
+# because the CPU is hard-locked with IRQs off.
+#
+# WQ_WATCHDOG and PSTORE_CONSOLE are config-only: no command line can set them,
+# which is what makes this knob worth having.
 #
 # BOOTPARAM_SOFTLOCKUP_PANIC is an *int* (0/1), not a bool, so `-e` would be a
 # silent no-op; it is written with --set-val.
-: "${_capture_chain:=yes}"
+: "${_capture_chain:=no}"
 
 ### Host-derived tuning
-# This laptop is 24 threads. The shipped config carries MAXSMP=y - a "maximum
-# number of SMP processors and NUMA nodes" server profile - together with
-# NR_CPUS=8192 and CPUMASK_OFFSTACK=y, and it enables ZSWAP while the boot
-# cmdline passes zswap.enabled=0 because zram is the swap mechanism in use.
-# Both are the config contradicting the host, so both are corrected here.
+# The shipped config carries MAXSMP=y - "maximum number of SMP processors and
+# NUMA nodes", a server profile - together with NR_CPUS=8192 and
+# CPUMASK_OFFSTACK=y, and enables ZSWAP. None of that suits a desktop or laptop,
+# so this knob corrects it: MAXSMP off, NR_CPUS=_nr_cpus, ZSWAP off (zram is
+# the mechanism where a swap device is wanted).
 # With MAXSMP off the NR_CPUS range is [2, 512]; _nr_cpus is validated against
 # that in prepare(). X86_AMD_PSTATE_DEFAULT_MODE is deliberately left at 3
-# (Active/EPP), which is what amd_pstate=active on the cmdline asks for.
+# (Active/EPP), the mode that lets amd-pstate follow the platform's EPP hints.
 : "${_host_tune:=yes}"
 : "${_nr_cpus:=64}"
 
@@ -248,8 +250,8 @@ _hugepage_explicit="${_hugepage+set}"
 # FORTIFY_SOURCE, RANDOMIZE_KSTACK_OFFSET_DEFAULT, X86_KERNEL_IBT and
 # STRICT_KERNEL_RWX/STRICT_MODULE_RWX all on). This knob exists for a
 # deliberate flip: init_on_free costs 3-8% and strict IOMMU DMA costs
-# throughput on every unmap. The host boots mitigations=off, which is a
-# cmdline decision this recipe does not override.
+# throughput on every unmap. CPU mitigation state is a command-line decision
+# this recipe does not override.
 : "${_hardened:=no}"
 
 ### Policy for features that cannot exist under _cpusched=rt/rt-bore
@@ -261,9 +263,9 @@ _hugepage_explicit="${_hugepage+set}"
 # 'abort' stops prepare() with a named reason when one of them was *explicitly*
 # set to something that cannot happen. 'accept' downgrades that to a warning and
 # records the loss as a negative expectation instead.
-# A knob left at this file's own default is never fatal: otherwise the default
-# _cpusched=rt-bore together with the default _hugepage=madvise would refuse to
-# build, and the defaults are exactly what this host runs.
+# A knob left at this file's own default is never fatal: otherwise the shipped
+# default _cpusched=rt-bore together with the shipped default _hugepage=madvise
+# would refuse to build.
 : "${_rt_feature_drops:=abort}"
 
 ### Kernel major the local MuQSS patch was rebased onto
@@ -323,13 +325,13 @@ else
 fi
 
 pkgbase="linux-$_pkgsuffix"
-# Tracking the CachyOS release-candidate channel. The reason is CVE-2026-90432:
-# on 7.1 <= v < 7.2.6 scx_hardlockup() deferred the sched_ext abort to an
-# irq_work, which never runs on a hard-locked CPU with IRQs off, so the machine
-# wedged instead of recovering - and the handler returned %true whenever
-# sched_ext was loaded, suppressing the kernel's own hardlockup report. 7.3-rc1+
-# carries the fix. Bump _rcver and _tagrel together as CachyOS re-tags the RC;
-# _minor only matters when the stable channel is selected again.
+# Tracking the CachyOS release-candidate channel. The reason is a sched_ext
+# hardlockup defect fixed in 7.3-rc1: on 7.1 <= v < 7.2.6 scx_hardlockup()
+# deferred the sched_ext abort to an irq_work, which never runs on a hard-locked
+# CPU with IRQs off, and the handler returned %true whenever sched_ext was
+# loaded, suppressing the kernel's own hardlockup report. Bump _rcver and
+# _tagrel together as CachyOS re-tags the RC; _minor only matters when the
+# stable channel is selected again.
 _major=7.3
 _minor=0
 #_minorc=$((_minor+1))
@@ -485,7 +487,8 @@ case "$_cpusched" in
         # only in a branch its own default (_cpusched=cachyos) cannot reach, so
         # the reference is dead code there. The patch touches
         # drivers/gpu/drm/i915/ and kernel/ksysfs.c, so its absence affects
-        # Intel GPUs only - this host is AMD (Strix Point, amdgpu).
+        # Intel GPUs only - the target here is AMD (amdgpu/radeon), which is
+        # unaffected.
         ;;
 esac
 
@@ -848,7 +851,7 @@ prepare() {
         BUILD_FLAGS+=(CLANG_PROPELLER_PROFILE_PREFIX="${startdir}/propeller")
     fi
 
-    ### Crash-capture chain
+    ### Crash-capture chain (opt-in)
     if [ "$_capture_chain" = "yes" ]; then
         echo "Wiring the crash-capture chain..."
         scripts/config -d EFI_VARS_PSTORE_DEFAULT_DISABLE \
@@ -859,6 +862,21 @@ prepare() {
         _config_wants+=(EFI_VARS_PSTORE_DEFAULT_DISABLE=n PSTORE_CONSOLE=y WQ_WATCHDOG=y \
             PANIC_ON_OOPS=y PANIC_TIMEOUT=10 BOOTPARAM_HARDLOCKUP_PANIC=y \
             BOOTPARAM_SOFTLOCKUP_PANIC=1 MAGIC_SYSRQ_DEFAULT_ENABLE=0x1)
+    else
+        # The shipped config already carries this state, so these writes are a
+        # no-op today. They exist so the knob means the same thing in both
+        # directions: `_capture_chain=no` is "the config must not carry the
+        # chain", whatever a future config sync does to it. The assertions are
+        # exact rather than `!SYM` because a renamed symbol must fail loudly
+        # instead of reading as "already off".
+        scripts/config -e EFI_VARS_PSTORE_DEFAULT_DISABLE \
+            -d PSTORE_CONSOLE -d WQ_WATCHDOG -d PANIC_ON_OOPS \
+            --set-val PANIC_TIMEOUT 0 -d BOOTPARAM_HARDLOCKUP_PANIC \
+            --set-val BOOTPARAM_SOFTLOCKUP_PANIC 0 \
+            --set-val MAGIC_SYSRQ_DEFAULT_ENABLE 0x0
+        _config_wants+=(EFI_VARS_PSTORE_DEFAULT_DISABLE=y PSTORE_CONSOLE=n WQ_WATCHDOG=n \
+            PANIC_ON_OOPS=n PANIC_TIMEOUT=0 BOOTPARAM_HARDLOCKUP_PANIC=n \
+            BOOTPARAM_SOFTLOCKUP_PANIC=0 MAGIC_SYSRQ_DEFAULT_ENABLE=0x0)
     fi
 
     ### Host-derived tuning
@@ -869,7 +887,7 @@ prepare() {
         if ! [[ "$_nr_cpus" =~ ^[0-9]+$ ]] || [ "$_nr_cpus" -lt 2 ] || [ "$_nr_cpus" -gt 512 ]; then
             _die "_nr_cpus must be an integer in [2, 512] (got '$_nr_cpus'); with MAXSMP disabled that is the range arch/x86/Kconfig accepts for NR_CPUS."
         fi
-        echo "Applying host tuning (NR_CPUS=$_nr_cpus, zram instead of zswap)..."
+        echo "Applying host tuning (NR_CPUS=$_nr_cpus)..."
         scripts/config -d ZSWAP -d MAXSMP --set-val NR_CPUS "$_nr_cpus"
         # CPUMASK_OFFSTACK is selected by MAXSMP and disappears with it; it is
         # asserted as off rather than left to be discovered.
@@ -892,15 +910,15 @@ prepare() {
     # "the kernel silently lost sched_ext" into a named failure.
     _config_wants+=(
         # sched_ext: SCHED_CLASS_EXT depends on BPF_SYSCALL && BPF_JIT &&
-        # DEBUG_INFO_BTF, so all three have to be asserted with it or the
-        # scheduler that this host actually runs can vanish unnoticed.
+        # DEBUG_INFO_BTF, so all three have to be asserted with it or the whole
+        # sched_ext scheduler can vanish unnoticed.
         SCHED_CLASS_EXT=y BPF_SYSCALL=y BPF_JIT=y DEBUG_INFO_BTF=y
         # The diagnostics the crash-capture chain is built on.
         PSTORE=y EFI_VARS_PSTORE=y LOCKUP_DETECTOR=y HARDLOCKUP_DETECTOR=y \
         SOFTLOCKUP_DETECTOR=y MAGIC_SYSRQ=y PSI=y IKCONFIG_PROC=y
-        # Amd-pstate mode 3 == Active (EPP), which is what amd_pstate=active on
-        # the cmdline selects; a version bump flipping this to 2 (Passive) or
-        # 4 (Guided) would quietly change the whole power/boost behaviour.
+        # Amd-pstate mode 3 == Active (EPP); a version bump flipping this to 2
+        # (Passive) or 4 (Guided) would quietly change the whole power/boost
+        # behaviour.
         X86_AMD_PSTATE=y X86_AMD_PSTATE_DEFAULT_MODE=3 CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y
         # Defaults that are already right, asserted so a bump cannot take them.
         SCHEDSTATS=y FTRACE_SYSCALLS=y SHUFFLE_PAGE_ALLOCATOR=y LRU_GEN=y LRU_GEN_ENABLED=y \
@@ -913,9 +931,9 @@ prepare() {
         # SYSCTL replaced PROC_SYSCTL in 7.3 (fs/proc/Kconfig); the shipped
         # config still names the old symbol.
         SYSCTL=y
-        # MODULE_SIG_FORCE must stay off: ryzen_smu-dkms-git and every other
-        # unsigned out-of-tree module would stop loading, and the DKMS module is
-        # part of this host's reason for building the kernel at all.
+        # MODULE_SIG_FORCE must stay off: it would stop every unsigned
+        # out-of-tree module from loading, and DKMS modules are a supported use
+        # of this kernel.
         !MODULE_SIG_FORCE
     )
     # The hardening trio is off by default, so the assertion has to follow the
@@ -929,12 +947,11 @@ prepare() {
     # `n` and not as `absent`.)
     [ "$_hardened" = "yes" ] ||
         _config_wants+=(!INIT_ON_FREE_DEFAULT_ON !BUG_ON_DATA_CORRUPTION !IOMMU_DEFAULT_DMA_STRICT)
-    # AutoFDO/Propeller drift. The kernel this host runs today (7.2.5) was built
-    # with AUTOFDO_CLANG=y and PROPELLER_CLANG=y; the recipe's default is both
-    # off, so a default rebuild quietly replaces an optimised kernel with a
-    # plain one. Asserting the off state records that swap in the log, and the
-    # assertion is skipped when the knob asks for the feature - an invariant
-    # that contradicts its own toggle would break the AutoFDO path instead.
+    # AutoFDO/Propeller drift. The recipe's default is both off, so a build that
+    # previously enabled either quietly loses the optimisation; asserting the
+    # off state records that swap in the log, and the assertion is skipped when
+    # the knob asks for the feature - an invariant that contradicts its own
+    # toggle would break the AutoFDO path instead.
     [ "$_autofdo" = "yes" ] || _config_wants+=(!AUTOFDO_CLANG)
     [ "$_propeller" = "yes" ] || _config_wants+=(!PROPELLER_CLANG)
     if [[ "$_cpusched" = "rt" || "$_cpusched" = "rt-bore" ]]; then

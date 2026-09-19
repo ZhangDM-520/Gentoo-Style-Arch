@@ -1,4 +1,4 @@
-# Maintainer: zhangdm (local dev stack, ~/Projects)
+# Maintainer: zhangdm (local dev stack)
 # PySide6 + shiboken6 built from Qt's pyside-setup dev branch against
 # qt6-base-git (Qt 6.13-dev). Scoped to the essential base modules with
 # -DMODULES so no bindings are generated against the still-stock 6.11.2

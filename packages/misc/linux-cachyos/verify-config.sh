@@ -15,7 +15,8 @@
 # Both cases leave the build log claiming success. The live example that
 # motivated this file: `mm/Kconfig` gates the whole THP menu on `!PREEMPT_RT`,
 # and this recipe's own `_cpusched=rt-bore` sets `PREEMPT_RT=y`, so every
-# `_hugepage` write was discarded and THP has never been enabled on this host.
+# `_hugepage` write was discarded and the option the knob names was never
+# actually enabled.
 #
 # Usage
 # -----

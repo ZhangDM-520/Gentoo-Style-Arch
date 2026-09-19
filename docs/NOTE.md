@@ -32,6 +32,100 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-19 — the recipes were reporting on my laptop
+
+- **Symptom**: `CONTRIBUTING.md` scopes a contribution to "a clean Arch
+  checkout" and excludes "host-specific logs and profiles", but two commits of
+  mine (`56e6c76`, `3ecf456`) had put the opposite into tracked files. The
+  `linux-cachyos` PKGBUILD documented the running kernel version
+  (`7.2.5-1-cachyos-rt-bore-lto`), the CPU thread count, an inventory of the
+  Limine command line and its sysctl drop-in, the `mitigations=off` and
+  `zswap.enabled=0` boot decisions, and a narrative of a hard freeze. A tracked
+  working document under `stable/systemd/` carried the exact CPU model in its
+  first "verified facts" list. A `third-party` recipe ID claimed `znver5` while
+  the recipe set no ISA at all.
+- **Root cause**: the journal rule — host incidents go in `NOTE.md`, the
+  operational contract goes in `MEMORY.md` — was never stated as a rule for
+  *recipes*, so every fact learned while debugging leaked into the file being
+  edited. Nothing stated who the set is *for* either, so a machine-specific
+  trim read as an accident rather than as the target.
+- **The audit's own correction**: the ISA half of the complaint did not hold.
+  No recipe hard-codes this machine's ISA — every native-flag injection is
+  conditional and says so (`niri-spicy-git`, `rust-bindgen-git`,
+  `xwayland-satellite-git`), no recipe narrows `arch` below `x86_64`,
+  `rust-git` parameterises through `GSA_TARGET_CPU`, and the kernel's
+  `_processor_opt` is a documented knob with `zen4`/`generic` alternatives.
+  What *is* machine-specific is the **artifact**, because `makepkg.conf`
+  supplies `-march=native`. That distinction is now written down rather than
+  assumed.
+- **Fix**:
+  - 16 comment sites — 15 in `packages/misc/linux-cachyos/PKGBUILD`, one in
+    `verify-config.sh` — rewritten to explain the option or the trim instead of
+    the machine. Three needed the *claim* to move, not the wording: the AutoFDO
+    drift note is now self-contained (the committed `config` carries no
+    `AUTOFDO_CLANG`/`PROPELLER_CLANG` line, so the old text rested on host
+    state); `_host_tune` is grounded in the committed `config` (`MAXSMP=y`,
+    `NR_CPUS=8192`, `CPUMASK_OFFSTACK=y`, `ZSWAP=y`) rather than a thread
+    count; the capture-chain note keeps the contradiction it documents and
+    drops the incident.
+  - `_capture_chain` default flipped to `no`, with the off branch given the same
+    verified treatment so the flip has a tested opposite. The default run stays
+    **84 expectations**: the 8 capture assertions swap to their off-state
+    counterparts, read out of the committed `config` and confirmed at the seam.
+  - `README.md` now states the target (**AMD laptops** — AMD CPUs with
+    amdgpu/radeon graphics) and that trimming has been exercised on one model;
+    `docs/portability.md` splits the portable recipe from the non-portable
+    artifact; `CONTRIBUTING.md` measures a contribution against the target and
+    states the comment rule.
+  - `linux-firmware`, `libdrm-git` and `hip-runtime` now say the AMD target
+    instead of "this machine" where the trim follows from the target. The five
+    remaining "this machine" sites (`dbus`, `udisks2`, `wireplumber`,
+    `rocm-llvm`) are capability absences, not specs, and stay.
+  - `stable/systemd/Workspace_information&TODO.md` deleted — a completed
+    planning document with the CPU model in it, and not an artifact
+    `docs/package-policy.md` permits. Its durable findings moved into the
+    recipe: the PGO branch is now marked as never having completed (the
+    experimental GCC 17 snapshot segfaults in `IPA pass: profile`), and
+    `check()` names the pre-existing openssl/tpm2-tss failures and `--nocheck`.
+  - `Zen-Browser-Arch-znver5-optimized` renamed to `zen-browser-pgo`; the
+    README now says what the recipe does (3-tier PGO, `-O3`, thin+cross LTO via
+    mozconfig, ISA inherited from the host).
+  - Two further sites the plan's inventory missed and the repo-wide sweep
+    caught: `bpftune-git`'s hook rationale carried a coredump count and two
+    timestamps (`2026-09-16 07:38:35, 18:57:50`) plus `/var/log/pacman.log` as
+    evidence — the mechanism (dlopen + stale pointers → `strstr()` SIGSEGV)
+    stays, the evidence goes; and `pyside6-git`'s maintainer line carried
+    `~/Projects`. Both date from `b02cefd` ("Prepare Gentoo_Style_Arch for
+    public release"), so the release pass missed them. `libdrm-git`'s trim now
+    says the AMD target rather than naming an SoC it does not actually select
+    on (the meson flags are AMD-wide, not SoC-specific).
+- **Validation**: `bash -n` on every edited recipe; `makepkg --printsrcinfo`
+  unchanged; real seam (`makepkg --nobuild`, real 7.3-rc3 tree) — default 84
+  with the off-state set, `_capture_chain=yes` 84 with the on-set,
+  `_hugepage=always` aborting by name; the `_capture_chain=yes` environment
+  override proven to reach the lane child (the spawn is `setsid --wait fish
+  build-all.fish --lane-job`, which inherits the environment, and the seam
+  proves `makepkg` passes it into `prepare()`); 21/21 fixtures;
+  `--audit`/`--list`/`--dry-run --group third-party` clean after the rename.
+- **Durable rules**:
+  - **A comment explains the code, the kernel option, or the trim decision; it
+    does not inventory the machine it was written on.** Kernel versions,
+    installed package versions, CPU thread counts, bootloader command lines and
+    incident narratives belong in this journal.
+  - **Declare the target.** A trim that follows from the maintained hardware is
+    a scope statement and should name the platform; a trim that follows from one
+    author's environment is a capability absence and should say so. Neither is a
+    licence plate for the running machine.
+  - **A recipe is portable; the artifact is not.** Recipes derive ISA settings
+    from the environment and so build on any x86_64 host; `makepkg.conf`
+    supplies `-march=native`, so the packages are tuned to the builder and are
+    not redistributable.
+  - `_capture_chain` is opt-in. `WQ_WATCHDOG` and `PSTORE_CONSOLE` are
+    config-only — no command line can set them — so a kernel built with the
+    default off keeps whatever panic path the command line provides but loses
+    the workqueue-hang detector. Set `_capture_chain=yes` in the environment
+    when that detector is the point.
+
 ## 2026-09-19 — `linux-cachyos`: the config toggles were a wish list, not a contract
 
 - **Symptom**: three of the recipe's knobs did nothing, and nothing anywhere said

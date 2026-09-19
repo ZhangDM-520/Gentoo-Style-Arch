@@ -11,6 +11,16 @@ shell code and may fetch and build software with the privileges and network
 access available to `makepkg`. Read the recipe and the security guidance
 before building or installing anything.
 
+The set is maintained for **AMD laptops**: AMD CPUs with amdgpu/radeon
+graphics. Hardware-support trims follow from that target — a recipe may drop
+Intel- and NVIDIA-only firmware, drivers and code paths — while the recipes
+themselves are written to build on any Arch x86_64 host, deriving ISA settings
+from the environment rather than pinning one. Packages built from this tree are
+tuned to the building machine (see `docs/portability.md`) and are not
+redistributable binaries. Trimming has been exercised on one AMD model, so
+treat "AMD laptop, any" as the intent and a second model as useful
+verification.
+
 ## What is included
 
 The current set has 126 recipe directories and 129 group memberships. The

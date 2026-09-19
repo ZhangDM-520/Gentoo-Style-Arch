@@ -1,5 +1,5 @@
 # package-id|recipe-path
-Zen-Browser-Arch-znver5-optimized|packages/third-party/Zen-Browser-Arch-znver5-optimized
+zen-browser-pgo|packages/third-party/zen-browser-pgo
 bettbox|packages/third-party/bettbox
 cmake-git|packages/core/cmake-git
 doxygen-git|packages/core/doxygen-git

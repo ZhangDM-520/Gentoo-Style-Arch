@@ -201,6 +201,13 @@ build() {
   # PGO via meson (NEVER via env CFLAGS — would leak into the freestanding
   # EFI -static-pie/-nostdlib targets). Upstream already sets b_pgo=off for
   # those targets; GCC profile data lands as *.gcda in the build dir.
+  #
+  # STATUS: the generate phase works (1567 gcda files from the workload), but
+  # the profile-use rebuild has never completed on the current toolchain — the
+  # experimental GCC 17 snapshot segfaults in "IPA pass: profile"
+  # (catalog.c, journal-send.c). Not flag-avoidable. Shipped packages are the
+  # verified non-PGO build; re-try with stable GCC 17 or clang
+  # -fprofile-instr-use/llvm-profdata.
   local _pgo=0
   if [[ -n "${_systemd_PGO:-}" ]]; then
     _pgo=1
@@ -245,6 +252,9 @@ build() {
 }
 
 check() {
+  # If this fails in test-crypto-util or test-tpm2, it is openssl/tpm2-tss
+  # version drift rather than anything this recipe's flags do; package with
+  # `makepkg --nocheck` in that case.
   meson test -C build --print-errorlogs
 }
 

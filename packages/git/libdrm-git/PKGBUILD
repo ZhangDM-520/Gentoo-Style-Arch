@@ -41,7 +41,7 @@ build() {
         -D install-test-programs=false
         -D b_lto=true
         -D b_ndebug=true
-        # AMD-only machine (Strix Halo): amdgpu + radeon only
+        # AMD target: amdgpu + radeon only
         -D amdgpu=enabled
         -D radeon=enabled
         -D intel=disabled
