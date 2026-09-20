@@ -1,7 +1,7 @@
 pkgbase = xwayland-satellite-git
 	pkgdesc = Xwayland outside your Wayland - git version
 	pkgver = 0.8.2.r13.gadd2795
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/Supreeeme/xwayland-satellite
 	arch = x86_64
 	license = MPL-2.0
@@ -16,6 +16,8 @@ pkgbase = xwayland-satellite-git
 	provides = xwayland-satellite
 	conflicts = xwayland-satellite
 	source = git+https://github.com/Supreeeme/xwayland-satellite.git
+	source = 0001-round-half-up.patch
 	b2sums = SKIP
+	b2sums = f8202a7eeffa8febd08a4702796f951adca784c67bdce2dda6eff55830b90a701f938be97998c7285677fbea293ae888f0a1dd336c2a641f08248be15247bf08
 
 pkgname = xwayland-satellite-git

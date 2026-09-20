@@ -4,7 +4,7 @@
 _pkgname=xwayland-satellite
 pkgname="$_pkgname-git"
 pkgver=0.8.2.r13.gadd2795
-pkgrel=1
+pkgrel=2
 pkgdesc="Xwayland outside your Wayland - git version"
 arch=(x86_64)
 url="https://github.com/Supreeeme/$_pkgname"
@@ -23,8 +23,10 @@ makedepends=(
 )
 provides=($_pkgname)
 conflicts=($_pkgname)
-source=(git+$url.git)
-b2sums=('SKIP')
+source=(git+$url.git
+        0001-round-half-up.patch)
+b2sums=('SKIP'
+        'f8202a7eeffa8febd08a4702796f951adca784c67bdce2dda6eff55830b90a701f938be97998c7285677fbea293ae888f0a1dd336c2a641f08248be15247bf08')
 
 pkgver() {
 	cd $_pkgname
@@ -35,6 +37,12 @@ prepare() {
 	cd $_pkgname
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_HOME="$srcdir"/.cargo
+
+	# Fix blurry X11 windows under fractional scaling: round the logical -> device
+	# conversion half-up instead of truncating, matching what compositors do with the
+	# on-screen rect. Local until https://github.com/Supreeeme/$_pkgname/issues/479 lands.
+	git apply -3 ../0001-round-half-up.patch
+
 	sed 's|/usr/local|/usr|' -i resources/$_pkgname.service
 	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
