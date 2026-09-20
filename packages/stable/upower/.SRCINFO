@@ -29,7 +29,7 @@ pkgbase = upower
 	optdepends = usbmuxd: Read charge status of iOS devices
 	backup = etc/UPower/UPower.conf
 	source = git+https://gitlab.freedesktop.org/upower/upower.git#tag=v1.91.4
-	b2sums = 639eb2519f2586b4d919437a38d18eb0747ad2678b689d01ac36d14d374eadec222079f96e331de8b8d51f0e482ab578d07b1f65213685d294a7fc57ca4c7f97
+	b2sums = ed239ed6d754e20e57f1f8fcab8d02126b505816c48c6e2ee2c9c004fa54fb275c0f24380e1b8df3547a5f6280e03a8b1432f8d40a822cc4eb82ab8a9f549309
 
 pkgname = upower
 	depends = glib2

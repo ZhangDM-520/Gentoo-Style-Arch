@@ -163,23 +163,45 @@
     `makepkg.conf` supplies `-march=native`. See `portability.md`,
     `CONTRIBUTING.md` and the 2026-09-19 NOTE section.
 
-18. **A lowered guard must be announced where the record is** (09-20 audit):
-    the stable version sync rewrites `pkgver`/`pkgrel` in place and leaves the
-    committed sums describing the previous version, so `build_package` adds
-    `--skipchecksums` for that build — those sources are built (and with `-i`
-    installed) without a committed sum. That is a deliberate trade for tracking
-    the repo version, but it used to be completely silent: `build_package` is
-    called from exactly one place (`lane_job`, always `quiet_flag=1`), every lane
-    redirects its stdout/stderr into the per-package log, and the one echo that
-    named the argv sat behind the non-quiet flag nothing ever passes — so the
-    flag reached neither the terminal nor any log. It now states itself in the
-    package log, `--help` explains it under `--no-sync`, `build-guide.md` has a
-    section, and `tests/stable-sync-checksums.sh` pins the flag, the disclosure
-    and the `--no-sync` inverse. Signature checks are unaffected
-    (`--skipchecksums` is not `--skippgpcheck`), and `--no-sync` avoids the path.
+18. **An auto-update must be anchored to the authority the value came from**
+    (09-20 audit): the stable version sync rewrites `pkgver`/`pkgrel` in place
+    and leaves the committed sums describing the previous version. The builder
+    used to paper over that with `--skipchecksums` — silently building sources
+    nobody had verified — and the first fix was merely to disclose it. That
+    disclosure was itself the wrong fix, because it left the guard lowered: the
+    refusal message told the maintainer to run `updpkgsums`, which rewrites the
+    sums **from whatever arrived** and therefore agrees with any tarball,
+    including a substituted one. A verification-shaped no-op is not a check.
+    The version comes from `pacman -Si` (Arch), but the bytes come from upstream
+    (`ftp.gnu.org`, `github.com`, `cdn.kernel.org`), so "the official repo" never
+    covered the fetch. The builder now anchors: it fetches the official
+    packaging repo's `.SRCINFO` at the version it just synced to, matches every
+    *moved* source against the checksums published there, writes with
+    `updpkgsums`, and verifies the fetched source against Arch's published
+    checksum (algorithms need not match — the artifact mediates). Every path that
+    cannot anchor refuses and restores the recipe.
+    Three measurements shaped it, and each contradicted a first assumption:
+    (a) **staleness is a moved source, not a moved version** — 26 of the 28
+    `packages/stable` recipes pin a literal version inside their `source=()`
+    URLs, so a pkgver rewrite usually leaves the sums valid and anchoring them
+    would be a false alarm; the builder diffs the expanded array instead.
+    (b) **a VCS `#tag=` source is anchorable** — makepkg's `calc_checksum_git`
+    hashes `git archive --format tar <tag>`, which is reproducible across
+    machines. Measured against fish 4.9.3: the local value matched Arch's byte
+    for byte, which also proved our committed sum was simply wrong. (c) **the
+    packaging repo's `main` can be ahead of the repos** (bash 5.3.20 vs the
+    5.3.15 the repos serve), so the version's own tag is fetched as a fallback.
+    `build_package` is called from exactly one place (`lane_job`, always
+    `quiet_flag=1`) and every lane redirects its stdout/stderr into the
+    per-package log, so that log is the only record that exists — accounting for
+    why the original silence was invisible. Signature checks are unaffected and
+    independent; 13 of the 28 `packages/stable` recipes anchor authenticity with
+    `validpgpkeys` rather than with a checksum.
     **If the builder lowers a guard for a build, the log and the artifact must
     say so** — a weakening that leaves no record is indistinguishable from a
-    bug.
+    bug. **And if the builder auto-updates a value, the new value must be checked
+    against a source the builder did not itself produce** — self-consistent is
+    not verified.
 
 ## 2. Workspace overview
 
@@ -554,24 +576,76 @@ recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
-- **A weakening that leaves no record is indistinguishable from a bug**
-  (2026-09-20, audit): `sync_stable_version` bumps a `packages/stable` recipe to
-  the repo's `pkgver`/`pkgrel` and deliberately does not refresh `sha256sums`,
-  so `build_package` adds `--skipchecksums` to `makepkg` for that build. Nothing
-  said so. The audit found it by grepping for the string across the whole
-  repository: it appeared **once**, in the builder, and in **no** document — the
-  argv echo that would have shown it sits behind `_BUILD_QUIET`, and
-  `build_package` is reached from exactly one call site, which always passes
-  `quiet_flag=1`. So in the shipped flow the flag reached neither the terminal
-  nor any log, and `--help` described `--no-sync` only as "don't auto-update
-  stable package versions". The fix is disclosure, not a behaviour change (the
-  flag is what makes a synced build possible at all): the package log now states
-  it unconditionally — the lane log is the only record in a multi-lane run —
-  `--help` and `build-guide.md` explain it, and
-  `tests/stable-sync-checksums.sh` pins the flag, the disclosure and the
-  `--no-sync` inverse so the message cannot rot into unconditional noise. Grep a
+- **Self-consistent is not verified** (2026-09-20, audit): `sync_stable_version`
+  bumps a `packages/stable` recipe to the repo's `pkgver`/`pkgrel` and
+  deliberately does not refresh `sha256sums`, so `build_package` added
+  `--skipchecksums` to `makepkg` for that build. Nothing said so. The audit
+  found it by grepping for the string across the whole repository: it appeared
+  **once**, in the builder, and in **no** document — the argv echo that would
+  have shown it sits behind `_BUILD_QUIET`, and `build_package` is reached from
+  exactly one call site, which always passes `quiet_flag=1`. So in the shipped
+  flow the flag reached neither the terminal nor any log, and `--help` described
+  `--no-sync` only as "don't auto-update stable package versions". Grep a
   security-relevant flag for its documentation, in both directions: a flag with
   one mention and no doc is a finding.
+  The first fix was disclosure, and it was wrong. Disclosing a lowered guard
+  does not raise it, and the refusal it replaced told the maintainer to run
+  `updpkgsums` — which hashes whatever arrived, so it agrees with a substituted
+  tarball and verifies nothing. The version came from Arch; the bytes come from
+  upstream; the anchoring has to come from the same place as the version. The
+  builder now fetches the official `.SRCINFO` for the version it synced to,
+  matches every *moved* source against Arch's published sums, writes with
+  `updpkgsums`, and verifies the fetched source against Arch's checksum.
+  Anything it cannot anchor refuses the build and restores the recipe, and it
+  reports its work in the package log rather than silently skipping the check.
+  `tests/stable-sync-checksums.sh` pins eleven scenarios; each was falsified
+  before being trusted — reverting the sum map, the `name::` rule, the source
+  diff, the VCS branch or the tag fallback each makes exactly one scenario fail.
+
+- **Sources and checksums in a .SRCINFO line up only within one algorithm**
+  (2026-09-20, same work): Arch publishes the same file list once *per*
+  algorithm, concatenated (`sha256sums =` ×N followed by `b2sums =` ×N), so
+  reading all checksum lines as one flat list cannot be indexed by source. With
+  one source and two algorithms the counts never matched, and eight of the 28
+  `packages/stable` recipes refused the build with "does not line its sources up
+  with its checksums" — a misleading message for a file that was perfectly
+  parseable. Take the first *contiguous* run of one algorithm and require it to
+  be exactly as long as the source list; anything else must fail closed rather
+  than anchor to half a list.
+
+- **The name makepkg fetches under is not the URL's basename** (2026-09-20,
+  same work): a `name::url` override (`udisks2::git+…`,
+  `openshadinglanguage-1.15.3.0.tar.gz::https://…/v1.15.3.0.tar.gz`) downloads
+  to `name`, while the basename of the URL is something else entirely. Looking
+  the file up by basename found nothing — and for `util-linux`'s renamed
+  `LICENSE` it found a *different* file with the same name, which produced a
+  false mismatch. The same error in the other direction would have verified the
+  wrong file while reporting success, so resolve a source's filename the way
+  makepkg resolves it, override first, and treat a VCS prefix as "inspect the
+  URL part after the override" — `fish::git+https://…` is a checkout, and a
+  check on the raw entry reads it as a tarball.
+
+- **A VCS source's checksum is a git-archive hash, so verify it as one**
+  (2026-09-20, same work): for `git+…#tag=v`, makepkg's `calc_checksum_git`
+  hashes `git archive --format tar v`, and that value is reproducible across
+  machines — Arch's published sum for `fish` 4.9.3 matched ours byte for byte,
+  and our recipe's committed sum was simply wrong (it failed makepkg's own
+  integrity check, which a build only escapes by disabling checksums). So
+  anchoring a VCS entry is real cross-checking, and the verification must
+  re-derive the archive hash; hashing the checkout directory cannot work and
+  reporting "not fetched" would refuse a buildable recipe.
+  The check is only reproducible off a **full** mirror: a
+  `git clone --filter=blob:none` renders an `export-subst` file differently
+  (`cmake/CcacheVersion.cmake`, 3350 vs 3313 bytes) and produced a false
+  mismatch, so mirror with a plain `git clone --bare` and never a filter.
+  Sweeping every `packages/stable` recipe against Arch the same day found
+  **four whose committed sums were wrong** — fish 4.9.3, upower 1.91.4,
+  ccache 4.14 and systemd 261.3, all VCS `#tag=` sources, all at the same
+  version as Arch's own packaging. Each was confirmed independently (a fresh
+  mirror plus `makepkg --verifysource` / `updpkgsums`) before being written,
+  and each had been shipping a sum that only a build with checksum
+  verification disabled could survive. A recipe that has never been built with
+  verification on is not evidence that its sum is right.
 
 - **A deny-list and a delete-list are the same list** (2026-09-20, tree cleanup):
   the root `.gitignore`'s downloaded-archive set and `nuclear_cleanup()`'s match

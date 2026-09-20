@@ -3133,3 +3133,35 @@ User directive: root dirs = git group; `.Heavy/` renamed to `.Heavyweight/`
 - **Validation**: a temporary/future-maintainer fixture with fake `makepkg`
   runs all five profiles on a deterministic 24-thread/21-GiB host and checks
   the resolved lane/job plans without building a real package.
+
+## 2026-09-20 — stable sync re-anchors its checksums to Arch
+
+- **Symptom**: `sync_stable_version` rewrote `pkgver` from `pacman -Si` and the
+  committed sums were deliberately left describing the previous version, so the
+  builder passed `--skipchecksums`. The flag reached neither the terminal nor
+  any log, because `build_package` is only ever called quiet and each lane logs
+  its own stream.
+- **Fix**: the builder now anchors the sums of every *moved* source to the value
+  Arch published for the version it synced to, taken from the official packaging
+  repo's `.SRCINFO`, writes them with `updpkgsums`, and verifies the fetched
+  source against Arch's checksum. `--skipchecksums` is never passed. Anything
+  it cannot anchor refuses the build and restores the recipe. `--help`,
+  `docs/build-guide.md` and §1 rule 18 describe the behaviour instead of the
+  now-removed flag.
+- **Why the trigger is the source, not the version**: 26 of 28 `stable` recipes
+  pin a literal version inside `source=()` URLs, so a `pkgver` bump usually
+  leaves their sums valid — the rebuild difference is a *diff of the expanded
+  `source=()` array*.
+- **Rule**: a check that hashes what arrived agrees with a substituted tarball.
+  Anchor to the authority the value came from, fail closed when it is
+  unavailable, and never leave a lowered guard undisclosed.
+- **Incidental finding**: sweeping every `stable` recipe against Arch found
+  **four committed checksums that were simply wrong** — fish 4.9.3, upower
+  1.91.4, ccache 4.14, systemd 261.3, all VCS `#tag=` sources at the same
+  version as Arch. Each was confirmed from a fresh mirror with
+  `makepkg --verifysource` before being rewritten, and each had been shipping a
+  sum only a build with verification disabled could survive.
+- **Validation**: `tests/stable-sync-checksums.sh` pins eleven scenarios, each
+  falsified before being trusted; the full battery is 32/32. A partial clone
+  (`--filter=blob:none`) proved unusable as a mirror — it renders an
+  `export-subst` file differently and reports a false mismatch.

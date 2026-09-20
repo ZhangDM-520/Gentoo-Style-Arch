@@ -60,20 +60,83 @@ repo is newer (never a downgrade; a `pkgver()`-driven recipe is skipped
 entirely). The edit is left in the working tree for you to commit, and the
 committed `.SRCINFO` and sums stay stale until you refresh and commit them.
 
-`makepkg` would then reject the freshly downloaded tarball, so that one build
-runs with `--skipchecksums`. **Those sources are not checksum-verified.** A
-signature is still enforced where the recipe has one, because
-`--skipchecksums` does not imply `--skippgpcheck`. The package log says so,
-which in a multi-lane run is the only record that exists:
+A rewrite that moves **`pkgver`** can move the `source=()` URLs with it, so the
+committed sums can end up describing the previous version and `makepkg` would
+reject the freshly fetched sources.
+
+Note where the version came from versus where the bytes come from: `pacman -Si`
+reports the version Arch publishes, but `makepkg` fetches that tarball from
+**upstream** (`ftp.gnu.org`, `github.com`, `cdn.kernel.org`, …). "The official
+repo" covers the version, not the fetch, so syncing cannot vouch for the bytes
+on its own. `updpkgsums` by itself would not either: it rewrites the sums from
+whatever arrived, which agrees with any tarball, including a substituted one —
+a verification-shaped no-op.
+
+What makes the sums stale is not the version bump but a **moved source**: 26 of
+the 28 `packages/stable` recipes pin a literal version inside their `source=()`
+URLs, so a rewrite leaves them fetching exactly what they fetched before and
+their committed sums still verify. Only `linux-api-headers` and
+`linux-firmware` spell the version into a URL. The builder therefore diffs the
+expanded `source=()` array around the rewrite and only acts when an entry
+actually changed; otherwise the build runs against the committed sums.
+
+For the entries that moved, the sums are re-anchored to the **official Arch
+packaging repo**:
+
+1. Fetch `https://gitlab.archlinux.org/archlinux/packaging/packages/<pkgbase
+   or split pkgname>/-/raw/<ref>/.SRCINFO` — the same authority the version came
+   from. `<ref>` is `main`, with **the version's own tag** (`<pkgver>-<pkgrel>`)
+   as the fallback for when the packaging repo has already moved past the
+   version the repos carry (bash's `main` is 5.3.20 while the repos serve
+   5.3.15). The revision must carry the version just synced to: another
+   version's sums describe different files.
+2. Match the moved `source=()` entries against the checksums it publishes, by
+   the name `makepkg` gives each one (a `name::url` override wins over the URL
+   basename). Every moved entry must appear.
+3. Write the refreshed sums with makepkg's own `updpkgsums`, so the recipe keeps
+   its formatting and its choice of algorithm.
+4. Verify the fetched sources against Arch's published checksum. The algorithm
+   need not match ours: Arch's hash is applied to the artifact, and the artifact
+   is what the recipe's own hash now describes. A VCS entry is verified the way
+   `makepkg` verifies it — `git archive --format tar <tag>` hashed, not a
+   directory — because a pinned tag is reproducible here (checked against `fish`
+   4.9.3 and `ccache` 4.14, whose values matched Arch's byte for byte).
+5. Refresh the committed `.SRCINFO`, when the recipe ships one — the sums are
+   part of it, so leaving it behind would pin the previous version's checksums.
+   `updpkgsums` and that step run as the invoking user in root mode, because
+   `makepkg` refuses to run as root.
+
+That makes the refresh an anchor rather than a rubber stamp — a substituted
+fetch is caught here, which is exactly what plain `updpkgsums` cannot do. The
+package log records the result, which in a multi-lane run is the only record
+that exists:
 
 ```
-⚠ <package>: --skipchecksums — sources are NOT checksum-verified, because …
-  Refresh them with 'updpkgsums' in the recipe, then rebuild, to restore …
+ℹ <package>: checksums re-anchored to the official <pkg> <ver> checksums,
+  and verified against the fetched sources
 ```
 
-To restore verification, run `updpkgsums` in the recipe, commit the refreshed
-sums, and rebuild. `--no-sync` avoids the whole path — no rewrite, no skipped
-checksums — at the cost of not tracking the repo version.
+**Every path that cannot anchor refuses the build**, and the recipe is restored
+byte-for-byte where it was already rewritten: `curl` or `updpkgsums` missing; no
+official revision carries our version; its sources and checksums do not line up
+(an unparseable file is never an anchor); an entry is not published there at all
+(the Linux-kernel recipes rebuild upstream patches as concatenated local
+sources, which no official PKGBUILD describes); the checkout could not be
+recomputed; or a source disagrees with Arch's checksum. Nothing is built or
+installed in those cases, and the message names the failing entry:
+
+```
+✗ <package>: refusing to build — a source does not match the official Arch checksum
+    <file>: Arch's sha512 is <want>, the fetched source hashes to <got>
+```
+
+`--no-sync` avoids the whole path: no rewrite, no anchoring, no refusal, and the
+committed version and sums build as-is, at the cost of not tracking the repo
+version. **`--skipchecksums` is never passed by the builder.** Refreshing by
+hand when the anchor cannot help is `updpkgsums` in the recipe, then commit and
+rebuild. Signature verification is a separate check throughout — it is enforced
+wherever the recipe has a `validpgpkeys` source, and 13 of the 28
+`packages/stable` recipes anchor authenticity that way rather than by checksum.
 
 ### sudo during `--install`
 

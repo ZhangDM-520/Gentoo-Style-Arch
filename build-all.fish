@@ -653,7 +653,26 @@ function pkgbuild_var -a pkg_path var
     grep -m1 "^$var=" "$pkg_path/PKGBUILD" 2>/dev/null | string replace -r '^[^=]*=' '' | string replace -r '[[:space:]]+#.*$' '' | string trim -c "\"'"
 end
 
+# Print an *expanded* PKGBUILD array, one element per line. Sourcing is the only
+# way to get what makepkg sees: `source=(…tar.gz{,.sig})` is two entries and
+# `{,-doc}` is two more, and a $pkgver inside an entry is a version. Tokenising
+# the text instead gets both wrong — a mistake this audit made twice before
+# catching it, and one that would silently miscalculate checksum coverage.
+function pkgbuild_array -a pkg_path name
+    bash -c 'source "$1" >/dev/null 2>&1; eval "printf \"%s\n\" \"\${$2[@]}\""' _ "$pkg_path/PKGBUILD" "$name" 2>/dev/null
+end
+
 # ─── Sync stable package version with Arch repos ─────────────────────────────
+# Return contract (build_package switches on it):
+#   0 = nothing to do — not a stable recipe, already current, or the repo
+#       version is a downgrade
+#   1 = rewritten, and pkgver moved
+#   2 = rewrite failed
+#   3 = rewritten, but only pkgrel/epoch moved
+#
+# 1 and 3 are informational only: whether the committed sums went stale depends
+# on whether a source=() entry actually changed, which build_package determines
+# by diffing the expanded array around this call. See the comment there.
 function sync_stable_version -a pkg_path
     # Only applies to recipes physically staged under packages/stable.
     string match -q "$SCRIPT_DIR/packages/stable/*" "$pkg_path"; or return 0
@@ -734,6 +753,15 @@ function sync_stable_version -a pkg_path
         ui_info "$pkgbase: $cur_pkgver-$cur_pkgrel → $repo_pkgver-$repo_pkgrel (synced with repo)"
     end
 
+    # Whether the *sources* move. A repo bump that carries only pkgrel or epoch
+    # leaves source=() alone, so the committed sums still verify and the caller
+    # must not treat the recipe as stale. Compared before the rewrite, because
+    # the rewrite is what destroys the old value.
+    set -l pkgver_changed 0
+    if test "$cur_pkgver" != "$repo_pkgver"
+        set pkgver_changed 1
+    end
+
     # Update pkgver/pkgrel (+ epoch when the repo carries one — never inside pkgver,
     # makepkg rejects colons there)
     if not sed -i "s/^pkgver=.*/pkgver=$repo_pkgver/" "$pkg_path/PKGBUILD"
@@ -757,7 +785,434 @@ function sync_stable_version -a pkg_path
         return 2
     end
 
+    if test $pkgver_changed -eq 1
+        return 1
+    end
+    return 3
+end
+
+# The URL part of a source entry, with any "name::" override removed, or nothing
+# when the entry is an in-tree file (a patch, a dotfile, an .install script) that
+# has no URL and so nothing to download.
+function source_url -a entry
+    set -l e $entry
+    if string match -q '*::*' -- $e
+        set e (string replace -r '^.*::' '' -- $e)
+    end
+    string match -q '*://*' -- $e; or return 1
+    echo $e
+end
+
+# The VCS protocol of a source entry (git/svn/hg/bzr), or nothing for a plain
+# download. It must be read from the URL part, after the "name::" prefix is
+# removed: "fish::git+https://…" is a git checkout, and testing the raw entry
+# misses it, so the checkout is then treated as a tarball and the build refused.
+function source_vcs -a entry
+    set -l e (source_url $entry); or return 1
+    for p in git svn hg bzr
+        if string match -q "$p+*" -- $e
+            echo $p
+            return 0
+        end
+    end
     return 1
+end
+
+# The name makepkg gives one source entry, which is what a checksum array
+# describes: the "name::" override when the entry has one, otherwise the
+# basename of the URL. Nothing is printed for a signature file (makepkg writes
+# SKIP for those) or for an in-tree file, because neither is a download that a
+# checksum published elsewhere can describe.
+#
+# The override matters: 'udisks2::git+…' downloads to "udisks2", and
+# 'openshadinglanguage-…tar.gz::https://…/v1.15.3.0.tar.gz' downloads to
+# "openshadinglanguage-…tar.gz", not to the URL's basename. Reading the basename
+# instead made the verifier look for a file that does not exist, and — worse, for
+# util-linux's renamed LICENSE — find a *different* file that happened to share
+# it, which is a false mismatch in that case and a false *pass* in the other
+# direction.
+function source_filename -a entry
+    set -l name ""
+    if string match -q '*::*' -- $entry
+        set name (string replace -r '::.*$' '' -- $entry)
+    else
+        set -l url (source_url $entry); or return 1
+        set name (string replace -r '[?#].*$' '' -- $url)
+        set name (string replace -r '^.*/' '' -- $name)
+    end
+    if test -z "$name"
+        return 1
+    end
+    for suffix in .sig .asc .signature
+        string match -q "*$suffix" -- $name; and return 1
+    end
+    echo $name
+end
+
+# The pkgver a .SRCINFO declares for its pkgbase, or nothing when it has none.
+function srcinfo_pkgver -a srcinfo
+    for line in (cat "$srcinfo" 2>/dev/null)
+        if string match -qr '^\s*pkgname\s*=' -- $line
+            break
+        end
+        if string match -qr '^\s*pkgver\s*=' -- $line
+            echo (string replace -r '^\s*pkgver\s*=\s*' '' -- $line)
+            return 0
+        end
+    end
+    return 1
+end
+
+# The official checksums for one recipe as "<file>\t<algorithm>\t<value>", read
+# from the *pkgbase* section of a .SRCINFO.
+#
+# makepkg writes .SRCINFO with every `source =` line in order, then each checksum
+# array in order, and it is already brace-expanded — so it is both easier and
+# safer to read than the official PKGBUILD, which would have to be *executed* to
+# be expanded. Sources and sums only line up *within* one algorithm, though:
+# Arch publishes the same file list once per algorithm (fish has one source with
+# both a sha512 and a b2 sum), so the flat list is not aligned. Only the first
+# contiguous run of one algorithm is used, and the function returns 1 unless that
+# run is exactly as long as the source list, so an unparseable file can never be
+# anchored to.
+function srcinfo_sum_map -a srcinfo
+    set -l srcs
+    set -l algos
+    set -l vals
+    for line in (cat "$srcinfo" 2>/dev/null)
+        if string match -qr '^\s*pkgname\s*=' -- $line
+            break
+        end
+        if string match -qr '^\s*source\s*=' -- $line
+            set -a srcs (string replace -r '^\s*source\s*=\s*' '' -- $line)
+        else if string match -qr '^\s*(sha256|sha512|b2|md5)sums\s*=' -- $line
+            set -a algos (string replace -r 'sums$' '' -- (string replace -r '^\s*([a-z0-9]+)\s*=.*$' '$1' -- $line))
+            set -a vals (string replace -r '^\s*[a-z0-9]+\s*=\s*' '' -- $line)
+        end
+    end
+    if test (count $srcs) -eq 0; or test (count $algos) -lt (count $srcs)
+        return 1
+    end
+    set -l alg $algos[1]
+    set -l run 0
+    for a in $algos
+        if test "$a" != "$alg"
+            break
+        end
+        set run (math $run + 1)
+    end
+    if test $run -ne (count $srcs)
+        return 1
+    end
+    for i in (seq (count $srcs))
+        if test -z "$vals[$i]"; or test "$vals[$i]" = "SKIP"
+            continue
+        end
+        set -l f (source_filename $srcs[$i])
+        if test -z "$f"
+            continue
+        end
+        printf '%s\t%s\t%s\n' $f $alg $vals[$i]
+    end
+end
+
+# makepkg's own checksum for one VCS source: it hashes `git archive --format tar
+# <tag>` of the checkout, so the value is reproducible on any machine and Arch's
+# published value is a cross-check rather than a local echo. Prints nothing and
+# returns 1 when there is nothing to recompute yet (no checkout, or a fragment
+# makepkg itself would answer SKIP for); returns 2 when the recomputation was
+# attempted and failed.
+function vcs_source_sum -a dir entry alg
+    set -l url (source_url $entry); or return 1
+    if not string match -q '*#*' -- $url
+        return 1
+    end
+    set -l frag (string replace -r '^[^#]*#' '' -- $url)
+    set -l kind (string replace -r '=.*$' '' -- $frag)
+    if test "$kind" != tag; and test "$kind" != commit
+        return 1
+    end
+    set -l val (string replace -r '^[^=]*=' '' -- $frag)
+    set -l name (source_filename $entry); or return 1
+    set -l cands "$dir/$name"
+    if set -q SRCDEST; and test -n "$SRCDEST"
+        set -a cands "$SRCDEST/$name"
+    end
+    set -l repo ""
+    for cand in $cands
+        if test -d "$cand"
+            set repo "$cand"
+            break
+        end
+    end
+    if test -z "$repo"
+        return 1
+    end
+    set -l sum (git -c core.abbrev=no -C "$repo" archive --format tar "$val" 2>/dev/null | command "$alg"sum | string replace -r '\s+.*$' '')
+    if test -z "$sum"
+        return 2
+    end
+    echo $sum
+end
+
+# ─── Re-anchor a synced recipe's checksums to the official Arch ones ─────────
+# sync_stable_version rewrites pkgver from the repos, which moves any source=()
+# entry spelling the version out. The committed sums then describe the previous
+# version and makepkg would reject the freshly fetched sources. Two tempting ways
+# out are both wrong: re-hashing the download alone (updpkgsums by itself)
+# records whatever arrived and verifies nothing, and --skipchecksums builds it
+# unverified. So the sums are re-anchored to the value *Arch* published for that
+# version and the fetched bytes are checked against it — automatically, because
+# the official packaging repo is the same source of truth the version itself was
+# synced from.
+#
+# Only the entries that actually moved are anchored. A pkgver rewrite that leaves
+# source=() alone — 26 of the 28 stable recipes pin literal versions in their
+# URLs — leaves the committed sums valid, so refusing those builds would be a
+# false alarm, and so would re-hashing them.
+#
+# updpkgsums does the writing, so the recipe keeps its own formatting and its own
+# choice of algorithm; the values are then verified against Arch's, whatever
+# algorithm those are in, and the check is per-file so a disagreement names the
+# file. Every path fails closed, restoring the recipe where it was already
+# rewritten.
+#
+# Return: 0 = anchored and verified · 1 = nothing to anchor · 2 = could not
+#         fetch/write/verify (recipe restored) · 3 = unanchored (recipe
+#         untouched) · 4 = a source disagrees with Arch's checksum (recipe
+#         restored)
+function anchor_sums_from_official -a pkg_path
+    set -l pkg_name (basename "$pkg_path")
+    set -l pkgbase (pkgbuild_var "$pkg_path" pkgbase)
+    if test -z "$pkgbase"
+        set pkgbase $pkg_name
+    end
+    set -l pkgver (pkgbuild_var "$pkg_path" pkgver)
+    set -l pkgrel (pkgbuild_var "$pkg_path" pkgrel)
+    set -l refuse_manual "  Refresh them by hand — 'updpkgsums' in that recipe, commit, rebuild. '--no-sync' builds the committed version as-is."
+
+    # Which of the moved sources a checksum published elsewhere can describe at
+    # all: an in-tree file was not downloaded and a signature file gets SKIP.
+    set -l anchor_names
+    set -l anchor_entries
+    for e in $argv[2..-1]
+        if test -z (source_url $e)
+            continue
+        end
+        set -l fn (source_filename $e)
+        if test -z "$fn"
+            continue
+        end
+        if contains -- $fn $anchor_names
+            continue
+        end
+        set -a anchor_names $fn
+        set -a anchor_entries $e
+    end
+    if test (count $anchor_names) -eq 0
+        return 1
+    end
+
+    if not type -q curl
+        ui_error "$pkg_name: refusing to build — pkgver was synced to $pkgver-$pkgrel and 'curl' is missing, so the official checksums cannot be read"
+        echo "$refuse_manual"
+        return 2
+    end
+    if not type -q updpkgsums
+        ui_error "$pkg_name: refusing to build — pkgver was synced to $pkgver-$pkgrel and 'updpkgsums' is missing, so the sums cannot be refreshed (it ships with pacman)"
+        echo "$refuse_manual"
+        return 2
+    end
+
+    set -l tmp (mktemp -d)
+
+    # Which official packaging repo carries this recipe, at which revision. The
+    # pkgbase is usually right; some recipes follow a name Arch does not have
+    # (hip-runtime lives under hip), so each split pkgname is tried as well.
+    # `main` comes first, and the version's own tag is the fallback for when the
+    # packaging repo has already moved past the version the repos carry (bash's
+    # main is 5.3.20 while the repos serve 5.3.15). A revision whose pkgver is
+    # not ours is no anchor at all: it describes different files.
+    set -l srcinfo ""
+    set -l published ""
+    set -l tried
+    set -l seen_pkg ""
+    set -l seen_ver ""
+    for c in $pkgbase (pkgbuild_array "$pkg_path" pkgname)
+        if test -z "$c"
+            continue
+        end
+        if contains -- $c $tried
+            continue
+        end
+        set -a tried $c
+        for r in main "$pkgver-$pkgrel"
+            set -l f "$tmp/$c-$r.SRCINFO"
+            if not curl -fsSL --max-time 60 -o "$f" "https://gitlab.archlinux.org/archlinux/packaging/packages/$c/-/raw/$r/.SRCINFO" 2>/dev/null
+                continue
+            end
+            if not test -s "$f"
+                continue
+            end
+            # A revision that does not carry our pkgver is no anchor: it
+            # describes different files. A failed fetch can still leave a body
+            # behind (a 404 page passes `test -s`), so an unreadable pkgver has
+            # to be a clean mismatch rather than a comparison with nothing.
+            set -l v (srcinfo_pkgver "$f")
+            if test -z "$v"
+                continue
+            end
+            if test "$v" = "$pkgver"
+                set srcinfo "$f"
+                set published "$c"
+                break
+            end
+            set seen_pkg "$c"
+            set seen_ver "$v"
+        end
+        if test -n "$published"
+            break
+        end
+    end
+    if test -z "$published"
+        if test -n "$seen_ver"
+            ui_error "$pkg_name: refusing to build — pkgver was synced to $pkgver-$pkgrel, but the official packaging repo carries $seen_ver"
+            echo "  (read from the .SRCINFO of the official $seen_pkg packaging repo; anchoring to another version's checksums would describe different files)"
+        else
+            ui_error "$pkg_name: refusing to build — pkgver was synced to $pkgver-$pkgrel, and the official Arch packaging repo carries no revision of $pkgbase at that version to anchor the checksums to"
+        end
+        echo "$refuse_manual"
+        rm -rf -- "$tmp"
+        return 3
+    end
+
+    set -l map "$tmp/map"
+    srcinfo_sum_map "$srcinfo" >"$map"
+    if test $status -ne 0; or not test -s "$map"
+        ui_error "$pkg_name: refusing to build — the official .SRCINFO for $published does not line its sources up with its checksums, so it cannot be used as an anchor"
+        echo "$refuse_manual"
+        rm -rf -- "$tmp"
+        return 3
+    end
+
+    # Grade before writing. An entry the official file does not cover cannot be
+    # anchored, and hashing the download ourselves is precisely the false
+    # verification this function exists to avoid.
+    set -l unanchored
+    for fn in $anchor_names
+        if not grep -qF -- (printf '%s\t' $fn) "$map"
+            set -a unanchored $fn
+        end
+    end
+    if test (count $unanchored) -gt 0
+        ui_error "$pkg_name: refusing to build — the official packaging repo carries $published $pkgver but publishes no checksum for:"
+        printf '  %s\n' $unanchored
+        echo "$refuse_manual"
+        rm -rf -- "$tmp"
+        return 3
+    end
+
+    if not cp -- "$pkg_path/PKGBUILD" "$tmp/PKGBUILD.orig"
+        ui_error "$pkg_name: cannot back up $pkg_path/PKGBUILD before refreshing the checksums"
+        rm -rf -- "$tmp"
+        return 2
+    end
+
+    # Write with makepkg's own updater: it preserves the recipe's formatting and
+    # keeps whatever checksum algorithm the recipe already uses, and it is also
+    # what fetches the sources that step 2 below then verifies.
+    if not pushd "$pkg_path" >/dev/null
+        ui_error "$pkg_name: cannot enter $pkg_path to refresh the checksums"
+        rm -rf -- "$tmp"
+        return 2
+    end
+    # updpkgsums shells out to makepkg, which refuses to run as root (it exits
+    # 10 before it touches the sums). Root mode therefore drops to the invoking
+    # user for this step too — the recipe tree is theirs, not root's.
+    set -l run_as env
+    if test "$_ROOT_MODE" = "1"
+        set run_as sudo -u "$_BUILD_USER" env HOME=$_BUILD_HOME
+    end
+    $run_as updpkgsums >"$tmp/updpkgsums.log" 2>&1
+    set -l upd_rc $status
+    popd >/dev/null
+    if test "$upd_rc" -ne 0
+        cp --force -- "$tmp/PKGBUILD.orig" "$pkg_path/PKGBUILD"
+        ui_error "$pkg_name: refusing to build — 'updpkgsums' could not refresh the checksums (exit $upd_rc); the recipe was restored"
+        tail -5 "$tmp/updpkgsums.log" 2>/dev/null | sed 's/^/  /'
+        echo "$refuse_manual"
+        rm -rf -- "$tmp"
+        return 2
+    end
+
+    # Verify the fetched sources against Arch's values. This is the step that
+    # makes the refresh an anchor rather than a rubber stamp, and it is why the
+    # algorithm does not have to match: Arch's hash is checked against the
+    # artifact, and the artifact is what the recipe's own hash now describes.
+    # A VCS checkout is hashed the way makepkg hashes it (git archive of the
+    # tag), because there is no file to run sha256sum on.
+    set -l bad
+    for i in (seq (count $anchor_names))
+        set -l fn $anchor_names[$i]
+        set -l e $anchor_entries[$i]
+        set -l alg (awk -F'\t' -v f="$fn" '$1==f{print $2}' "$map")
+        set -l want (awk -F'\t' -v f="$fn" '$1==f{print $3}' "$map")
+        if not contains -- $alg sha256 sha512 md5 b2
+            set -a bad "$fn: Arch publishes an algorithm this check does not know ('$alg')"
+            continue
+        end
+        set -l got ""
+        if source_vcs $e >/dev/null
+            set got (vcs_source_sum "$pkg_path" "$e" "$alg")
+            switch $status
+                case 1
+                    set -a bad "$fn: the VCS checkout was not available to recompute Arch's $alg against"
+                    continue
+                case 2
+                    set -a bad "$fn: 'git archive' could not reproduce the $alg Arch publishes for this checkout"
+                    continue
+            end
+        else
+            set -l file ""
+            if test -f "$pkg_path/$fn"
+                set file "$pkg_path/$fn"
+            else if set -q SRCDEST; and test -n "$SRCDEST"; and test -f "$SRCDEST/$fn"
+                set file "$SRCDEST/$fn"
+            end
+            if test -z "$file"
+                set -a bad "$fn: not fetched into the recipe or \$SRCDEST, so Arch's checksum could not be applied to it"
+                continue
+            end
+            set got (command "$alg"sum "$file" | string replace -r '\s+.*$' '')
+        end
+        if test "$got" != "$want"
+            set -a bad "$fn: Arch's $alg is $want, the fetched source hashes to $got"
+        end
+    end
+    if test (count $bad) -gt 0
+        cp --force -- "$tmp/PKGBUILD.orig" "$pkg_path/PKGBUILD"
+        ui_error "$pkg_name: refusing to build — a source does not match the official Arch checksum"
+        printf '  %s\n' $bad
+        echo "  Nothing was built or installed and the recipe was restored. A source that disagrees with Arch's published checksum is a different source, not a stale sum."
+        rm -rf -- "$tmp"
+        return 4
+    end
+
+    # The sums are part of the committed .SRCINFO too. Refresh it when the
+    # recipe ships one, so a synced-and-anchored recipe does not leave a stale
+    # .SRCINFO pinning the previous version's checksums (srcinfo-freshness.sh).
+    if test -f "$pkg_path/.SRCINFO"
+        if $run_as makepkg --printsrcinfo --dir "$pkg_path" >"$pkg_path/.SRCINFO.tmp" 2>/dev/null
+            mv -f -- "$pkg_path/.SRCINFO.tmp" "$pkg_path/.SRCINFO"
+        else
+            rm -f -- "$pkg_path/.SRCINFO.tmp"
+            ui_warning "$pkg_name: the checksums were re-anchored but the committed .SRCINFO could not be refreshed; regenerate it with 'makepkg --printsrcinfo > .SRCINFO'"
+        end
+    end
+
+    ui_info "$pkg_name: checksums re-anchored to the official $published $pkgver checksums, and verified against the fetched sources"
+    rm -rf -- "$tmp"
+    return 0
 end
 
 # ─── List built package files for a PKGBUILD (all splits, current version) ───
@@ -1934,19 +2389,42 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
         end
     end
 
-    # Sync stable recipes with the latest Arch repository version
-    set -l synced 0
+    # Sync stable recipes with the latest Arch repository version.
+    #
+    # What makes the committed sums stale is not the version number but a moved
+    # *source*: 26 of the 28 stable recipes pin a literal version inside their
+    # source=() URLs, so a pkgver rewrite leaves them fetching exactly what they
+    # fetched before and their sums still verify. Only linux-api-headers and
+    # linux-firmware spell the version into a URL. Diffing the array around the
+    # rewrite is therefore the precise signal, and treating every pkgver bump as
+    # stale would refuse builds whose sums were never in question.
+    set -l sources_before (pkgbuild_array "$pkg_path" source)
     if test "$no_sync_flag" != "1"
         sync_stable_version "$pkg_path"
-        set -l sync_rc $status
-        if test "$sync_rc" -eq 0
-            set synced 0
-        else if test "$sync_rc" -eq 1
-            set synced 1
-        else
-            ui_error "failed to synchronize stable metadata for $pkg_name"
-            return 1
+        switch $status
+            case 0 1 3
+                # 1 = pkgver moved, 3 = only pkgrel/epoch moved; the source diff
+                # below is what decides, since neither answer implies the sources
+                # moved.
+            case '*'
+                ui_error "failed to synchronize stable metadata for $pkg_name"
+                return 1
         end
+    end
+    set -l sources_after (pkgbuild_array "$pkg_path" source)
+    set -l moved_sources
+    set -l source_count (count $sources_after)
+    if test (count $sources_before) -gt $source_count
+        set source_count (count $sources_before)
+    end
+    for i in (seq $source_count)
+        if test "$sources_before[$i]" != "$sources_after[$i]"
+            set -a moved_sources $sources_after[$i]
+        end
+    end
+    set -l stale_sums 0
+    if test (count $moved_sources) -gt 0
+        set stale_sums 1
     end
 
     if test "$_BUILD_QUIET" != "1"
@@ -1968,18 +2446,23 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
 
     # Build
     set -l makepkg_args -sf --noconfirm
-    if test $synced -eq 1
-        set -a makepkg_args --skipchecksums
-        # sync_stable_version rewrote pkgver/pkgrel from the repos and left the
-        # committed sums describing the previous version, so makepkg would
-        # reject the freshly downloaded tarball. Skipping the check is what
-        # makes a synced build possible at all — and it means those sources are
-        # NOT verified. That must never be silent: build_package is only ever
-        # called quiet (every lane redirects its stdout/stderr into the
-        # per-package log), so the argv echo below reaches no human and this
-        # warning is the only record a person can inspect afterwards.
-        ui_warning "$pkg_name: --skipchecksums — sources are NOT checksum-verified, because pkgver/pkgrel were just synced from the repos while the committed sums still describe the previous version"
-        echo "  Refresh them with 'updpkgsums' in the recipe, then rebuild, to restore verification (docs/build-guide.md)."
+    if test $stale_sums -eq 1
+        # The sync moved a source URL, so the committed sums now describe the
+        # previous version. They are re-anchored to the official Arch checksums
+        # and the fetched sources are verified against those — not skipped (which
+        # builds unverified sources) and not re-hashed from the fetch alone
+        # (which verifies nothing). anchor_sums_from_official reports why it
+        # cannot, and every such path refuses the build.
+        #
+        # Neither the anchoring nor a refusal may be silent: build_package is
+        # only ever called quiet (every lane redirects its stdout/stderr into
+        # the per-package log), so that log is the only record a person can
+        # inspect afterwards.
+        anchor_sums_from_official "$pkg_path" $moved_sources
+        set -l anchor_rc $status
+        if test "$anchor_rc" -ne 0; and test "$anchor_rc" -ne 1
+            return 1
+        end
     end
 
     # Full redirect to the log (2026-09-07): 'tee' to a lagging terminal
@@ -3048,11 +3531,17 @@ function usage
     echo "  -c, --clean       Clean build artifacts before building"
     echo "  -s, --skip        Skip packages where .pkg.tar.zst is newer than PKGBUILD"
     echo "  --no-sync          Don't auto-update stable package versions from repos."
-    echo "                     The default sync rewrites pkgver/pkgrel in place and builds"
-    echo "                     those packages with --skipchecksums (their committed sums"
-    echo "                     still describe the previous version), so their sources are"
-    echo "                     not verified until the sums are refreshed. Every affected"
-    echo "                     package says so in its own log — see docs/build-guide.md."
+    echo "                     The default sync rewrites pkgver/pkgrel in place. When a"
+    echo "                     source=() URL moves with the version, the recipe's checksums"
+    echo "                     are re-anchored to the value Arch published for that version"
+    echo "                     (the official packaging repo's .SRCINFO) and the fetched"
+    echo "                     sources are verified against it — never skipped, and never"
+    echo "                     re-hashed from the fetch alone. If it cannot anchor (no"
+    echo "                     official revision at that version, or an entry Arch does not"
+    echo "                     publish) it REFUSES the build and restores the recipe rather"
+    echo "                     than build unverified sources. A bump that leaves source=()"
+    echo "                     alone builds against the committed sums unchanged."
+    echo "                     See docs/build-guide.md."
     echo "  --lanes N|auto     Run N makepkg lanes, or choose from CPU/RAM (default "(string join '' -- "$_DEFAULT_LANES")"). Interactive"
     echo "                    terminals get a compact dashboard with active log tails;"
     echo "                    pipes use plain output. Packages start as soon as deps are installed;"
