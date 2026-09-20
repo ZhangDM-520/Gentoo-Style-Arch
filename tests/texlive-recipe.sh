@@ -173,7 +173,11 @@ grep -q '^texlive-texmf:' "$root/config/dependencies.conf" ||
     fail "not registered in config/dependencies.conf"
 grep -Fq "'^svn\+|^svn://'" "$root/build-all.fish" ||
     fail "build-all.fish does not clean svn source checkouts"
-grep -Fq "'*.whl'" "$root/build-all.fish" ||
+# This recipe downloads a wheel, so the builder's cleanup list must cover
+# `.whl`. The list is `_DOWNLOAD_ARCHIVE_EXTS` (one set shared with the ignore
+# rules — the general cross-check lives in tests/cleanup-extensions.sh); assert
+# the membership rather than the old inline match, which the list replaced.
+grep -q '^set -g _DOWNLOAD_ARCHIVE_EXTS .*\(^\| \)whl\( \|$\)' "$root/build-all.fish" ||
     fail "build-all.fish does not clean downloaded wheels"
 
 # .SRCINFO must match the recipe.

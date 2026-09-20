@@ -24,10 +24,14 @@ packages/*/*/*/
 # committed. A file a recipe needs *locally* is still protected:
 # tests/recipe-sources.sh fails when a non-URL source=() entry exists on disk
 # but is not committed, so a missing negation here is caught, not silent.
+# This set is the same set `-ccc`/`--nuclear` deletes: `_DOWNLOAD_ARCHIVE_EXTS`
+# in build-all.fish. Keep the two in step — when they drifted, a cleanup left ten
+# downloads behind for a commit sweep to pick up (2026-09-20).
 *.tgz
 *.zip
 *.jar
 *.ttf
+*.whl
 *.part
 *.sig
 *.asc

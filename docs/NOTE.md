@@ -32,6 +32,93 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-20 — cmake-git's PGO phase 2 never ran: the configure cache, not the rebuild, holds the flags
+- **Symptom**: the queued rebuild of `cmake-git` — the fix for the five
+  instrumented installed files — **failed 100 % of the time**, aborting inside
+  its own `package()` guard with "final package still contains profile
+  instrumentation" for `cmake`, `ccmake`, `cpack` and `ctest`, while the
+  installed instrumented build (4.4.3.936, built 2026-09-07) stayed in place.
+  Read as a machine-load or environment problem it made no sense: the run had
+  the whole host.
+- **Root cause**: `build()` ran PGO as two phases, and phase 2 could not work.
+  Phase 1 exports `-fprofile-generate` and runs `./bootstrap`; phase 2 only
+  swaps the flags in the exported variables
+  (`${CFLAGS/-fprofile-generate/-fprofile-use}`) and runs `make clean; make`.
+  But **CMake reads `CFLAGS`/`CXXFLAGS`/`LDFLAGS` once, while it initialises the
+  cache**, and phase 1's `./bootstrap` wrote `CMakeCache.txt` with the phase-1
+  flags. `make clean` does not remove that cache, so the final link line still
+  read `-fprofile-generate` and the payload stayed a phase-1 build. Phase 1 did
+  its job — the log records `Profile data generated: 755 .gcda files`.
+- **Proven, not inferred**: `CMakeCache.txt` still read
+  `CMAKE_CXX_FLAGS:STRING=… -fprofile-generate` after the "phase-2" rebuild, and
+  the final executable link line in the build log still carried
+  `-fprofile-generate`. Reproduced in ~10 s on a scratch CMake project: with the
+  cache present, changing the environment changes nothing; **even re-running the
+  configure step with the cache in place still ignores the environment**; only
+  dropping `CMakeCache.txt` (or passing `-DCMAKE_C_FLAGS=` explicitly) makes the
+  new flags take effect.
+- **Fix**: `cmake-git`'s bootstrap invocation is factored into one
+  `bootstrap_cmake()` helper so the two phases cannot drift, and phase 2 is now
+  `make clean` → `rm -f CMakeCache.txt` → `bootstrap_cmake` → `make`. `make
+  clean` stays, because with only the cache removed `make` would compare fresh
+  objects against unchanged sources and relink the instrumented ones.
+- **Validation**: `bash -n` on the recipe; `.SRCINFO` freshness fixture green.
+  The real build is the remaining proof and is deliberately **not** run as a
+  syntax check — `strings -a /usr/bin/cmake | grep -c '\.gcda'` must reach 0.
+- **Rule**: this is the **CMake twin of the Meson staleness rule** — a
+  configure-time argument cache survives a rebuild, and `make clean` is not a
+  reconfigure. A PGO phase 2 must purge the cache and re-run the configure step.
+  The distinction is worth keeping: `xorg-xwayland-git` gets it right with
+  `meson setup --reconfigure`, and its rebuild is simply waiting its turn.
+## 2026-09-20 — the downloaded-archive rule lived in two places, and they had already drifted twice
+- **Symptom**: 36 MB of upstream release archives (nine archives plus a font,
+  ten files) were tracked and pushed in `packages/stable/libreoffice-fresh/`,
+  and had been public since the 2026-09-16 release sweep. The ignore half was
+  fixed on the spot (`213424a`: `git rm --cached` plus `*.tgz`/`*.zip`/`*.jar`/
+  `*.ttf` in the root `.gitignore`), but its **other half was still broken**:
+  `nuclear_cleanup()` matched downloads with a hand-written test,
+  `string match -q '*.tar.*' -- "$fname"; or string match -q '*.whl'`, so
+  `-ccc` deleted this recipe's eighteen `.tar.*` downloads and left the ten
+  behind for a sweep to commit.
+- **Root cause**: the same list was written twice — once as the ignore rules,
+  once as the cleanup match — with no link between them. They had in fact
+  **already drifted once** (see the 2026-09-14 entry: `texlive-texmf`'s `svn://`
+  checkouts and its `latexminted` wheel survived `--nuclear` forever), and each
+  drift was repaired by appending one more pattern to one of the two lists.
+- **Fix**: one list, in `build-all.fish`, as `_DOWNLOAD_ARCHIVE_EXTS`, used by
+  `nuclear_cleanup()`; `.gitignore` carries the same set and names the shared
+  invariant in a comment. `*.whl` joined the ignore rules so the two sets are
+  literally equal, and `_DOWNLOAD_ARCHIVE_EXTS`'s wildcard entry is **quoted** —
+  fish glob-expands an unquoted `tar.*` and silently drops it when nothing
+  matches, which would have shrunk the list back to the old behaviour without
+  any error.
+- **Second defect, found by the new fixture**: the report of what `-ccc` keeps is
+  the maintainer's only chance to see it before agreeing, and in a pipe it
+  printed a blank line. The builder shadows `set_color` with a wrapper that is
+  empty off a terminal, and fish drops a whole word like
+  `(set_color cyan)"text"(set_color normal)` when the substitution yields
+  nothing — so `echo` lost the text entirely. Eighteen call sites (this function's
+  banner, the symlink summary, and the `--link-sources`/dedup reports) were
+  rewritten as `printf '%s%s%s\n' (set_color cyan) "text" (set_color normal)`,
+  where the text is its own argument and survives either way. A pipe is the
+  documented interface to parse, so a report that only exists on a terminal is
+  not a report.
+- **Validation**: new `tests/cleanup-extensions.sh` drives a synthetic workspace
+  under `$TMPDIR` and asserts that every archive type the ignore file denies is
+  deleted by `-ccc`, that a local (non-URL) asset and its signature survive, that
+  a symlinked source is kept and reported, that the deletion is named in the
+  report, and that the report survives a pipe. It also **cross-checks the two
+  lists statically in both drift directions**, and was proven to fail in each
+  (shrinking the builder list; deleting a rule; adding `*.7z`). Battery
+  24 → **25 fixtures, all green**. `tests/texlive-recipe.sh` asserted the old
+  literal `'*.whl'` match; it now asserts membership of the shared list, pointing
+  at the general fixture.
+- **Rule**: a deny-list and a delete-list are the same list, so keep one
+  definition and test the equality — an interval where only one of them is right
+  is invisible in the diff and shows up months later as committed upstream
+  archives. Corollary, from the same fixture: anything a scripted consumer is
+  expected to read must be checked **through a pipe**, because the colour
+  wrapper that makes a terminal pleasant is what silently deletes the text.
 ## 2026-09-19 — two orphan trees under `~/Projects` were instrumented binaries, and the IgnorePkg closure had drifted
 
 - **Symptom**: `~/Projects/.Heavyweight/cmake-git/src/cmake/` and

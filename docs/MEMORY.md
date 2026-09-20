@@ -58,11 +58,19 @@
    all coupled Qt modules in the SAME pass; verify private tags
    (`nm -D --undefined-only | grep QtPrivate_`); never `-Syu` fresh base-git
    while stock modules remain.
-6. **Meson staleness**: re-running meson setup over an existing build dir
-   keeps stale option values. After ANY meson-git upgrade run the stale-meson
+6. **Configure-cache staleness**: re-running a configure step over an existing
+   build dir keeps stale argument values — Meson's `meson setup` options, and
+   CMake's `CMakeCache.txt`, which is stronger: the `CFLAGS`/`CXXFLAGS`/
+   `LDFLAGS` *environment* is read only while the cache is initialised, so a
+   later change to them is ignored even by a fresh configure. `make clean`
+   touches neither. After ANY meson-git upgrade run the stale-meson
    audit: `find . -name meson-info.json`, purge build dirs whose version
    differs (build dirs live at arbitrary depths — a maxdepth sweep misses
-   them), rebuild a canary.
+   them), rebuild a canary. A PGO phase 2 therefore purges the cache and
+   re-runs the configure step rather than only rebuilding: `cmake-git` shipped
+   phase-1 payloads for months because `${CFLAGS/-fprofile-generate/
+   -fprofile-use}` plus `make clean; make` left the phase-1 flags in the cache
+   (2026-09-20).
 7. **Don't touch in-progress builds**: check running makepkg processes and
    runtime log mtimes before rebuilding a package someone else is on.
    Never run two heavy builds concurrently (OOM).
@@ -276,6 +284,14 @@ install history lives in `NOTE.md`.
   zlib-ng-compat); zstd phase-2 only; `options=(!lto)` where LTO breaks
   (llvm-git, rocm-llvm, hip-runtime, gcc-snapshot, niri-spicy-git,
   blender-git); Zen uses mozconfig thin LTO instead.
+- **PGO phase-2 reconfigure**: a phase-2 pass must re-run the *configure* step,
+  not only the build — the argument cache survives `make clean`. Meson:
+  `meson setup --reconfigure` with both compiler and linker caches replaced
+  (§1 rule 6, `docs/build-guide.md`). CMake: `cmake-git` reads
+  `CFLAGS`/`CXXFLAGS`/`LDFLAGS` only while initialising `CMakeCache.txt`, so
+  phase 2 deletes that file and re-runs `bootstrap_cmake()` — without it the
+  link line keeps `-fprofile-generate` and `package()`'s instrumentation guard
+  aborts (2026-09-20).
 - **PGO training workloads**: mesa (vkcube on lavapipe + glxinfo/eglinfo,
   gcda in srcdir/mesa-pgo-profile, ON by default); glib2/gtk/cairo (`meson
   test`, timeouts + `|| true`); bash/zsh (`make check` timeout 900 + `|| true`
@@ -325,7 +341,7 @@ install history lives in `NOTE.md`.
 
 ## 5. Pending tasks
 
-Re-verified against the host on 2026-09-19. Completed items were deleted
+Re-verified against the host on 2026-09-20. Completed items were deleted
 rather than left in place — an unchecked task list reads as authority while
 going stale.
 
@@ -359,6 +375,22 @@ going stale.
   makepkg strips — so the recipe is not wrong, it is incomplete. Use
   `strings -a <bin> | grep -c '\.gcda'` for any installed binary.
 
+  held for the packages it touched. A plain `-Syu` will not fix it, because
+  both names are `IgnorePkg`-locked; it needs
+- **`cmake-git` is the exception to "not a broken recipe" (measured
+  2026-09-20):** its queued rebuild **cannot** succeed as written, so do not
+  re-run it expecting a fix. Phase 2 only re-exports the compiler variables and
+  runs `make clean; make`, but phase 1's `./bootstrap` wrote the phase-1
+  `-fprofile-generate` into `CMakeCache.txt`; CMake reads those variables only
+  while initialising that cache, `make clean` leaves it alone, and re-running
+  the configure step with the cache present still ignores the environment. The
+  final link line is therefore still instrumented and the recipe's own guard
+  aborts `package()` with "final package still contains profile
+  instrumentation". The recipe now purges the cache and re-runs
+  `bootstrap_cmake()` in phase 2; `xorg-xwayland-git` needs no recipe change
+  (`meson setup --reconfigure`). Done looks like
+  `strings -a /usr/bin/cmake | grep -c '\.gcda'` → 0 for
+  `cmake`/`ccmake`/`cpack`/`ctest` and for `Xwayland`.
 - **`IgnorePkg` closure is complete again (audited 2026-09-19, fixed same
   day).** The closure had drifted **32 names short**: `comm -23` of the
   committed `.SRCINFO` pkgname set (218) against `pacman-conf IgnorePkg` left
@@ -493,6 +525,25 @@ recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
+- **A deny-list and a delete-list are the same list** (2026-09-20, tree cleanup):
+  the root `.gitignore`'s downloaded-archive set and `nuclear_cleanup()`'s match
+  test were written twice and had already drifted twice (first `svn://`/`*.whl`,
+  then `.zip`/`.jar`/`.tgz`/`.ttf`), each time repaired by appending one more
+  pattern to one of them. The visible cost was 36 MB of upstream archives
+  committed and pushed. They are now one list, `_DOWNLOAD_ARCHIVE_EXTS` in
+  `build-all.fish`, and `tests/cleanup-extensions.sh` cross-checks it against
+  `.gitignore` **in both directions** so a third drift fails a fixture rather
+  than a sweep. Its wildcard member is quoted for a second reason: fish
+  glob-expands an unquoted `tar.*` and silently drops it when nothing matches.
+- **Text wrapped in a colour escape is text lost off a terminal** (2026-09-20,
+  same fixture): the builder shadows `set_color` with a wrapper that emits
+  nothing when stdout is not a tty, and fish drops an *entire word* like
+  `(set_color cyan)"text"(set_color normal)` when the substitution yields
+  nothing. `echo` therefore printed a blank line, and `-ccc`'s "will delete N
+  targets" banner — the last thing a maintainer sees before agreeing — was
+  invisible in exactly the piped mode the docs say to parse. Write such lines as
+  `printf '%s%s%s\n' (set_color cyan) "text" (set_color normal)`; the text is its
+  own argument and survives either way.
 - **A comment in a tracked file is public surface** (2026-09-19, linux-cachyos):
   the debugging facts that justify a knob — the running kernel version, the CPU
   thread count, the bootloader command line, the incident that motivated it —

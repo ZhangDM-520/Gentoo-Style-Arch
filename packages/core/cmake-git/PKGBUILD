@@ -36,6 +36,19 @@ prepare() {
     patch -p1 -i ../cmake-cppflags.patch # Honor CPPFLAGS https://gitlab.kitware.com/cmake/cmake/issues/12928
 }
 
+# The bootstrap/configure step, in one place so the two PGO phases cannot drift
+# apart. It reads CFLAGS/CXXFLAGS/LDFLAGS out of the environment, which is why
+# phase 2 has to call it again (see build()).
+bootstrap_cmake() {
+  ./bootstrap --prefix=/usr \
+    --mandir=/share/man \
+    --docdir=/share/doc/cmake \
+    --datadir=/share/cmake \
+    --sphinx-man \
+    --system-libs \
+    --parallel="${GSA_BUILD_JOBS:-$(/usr/bin/getconf _NPROCESSORS_ONLN)}"
+}
+
 build() {
   cd "$srcdir/cmake"
 
@@ -44,13 +57,7 @@ build() {
   export CXXFLAGS="$CXXFLAGS -fprofile-generate ${CPPFLAGS}"
   export LDFLAGS="$LDFLAGS -fuse-ld=mold -fprofile-generate"
 
-  ./bootstrap --prefix=/usr \
-    --mandir=/share/man \
-    --docdir=/share/doc/cmake \
-    --datadir=/share/cmake \
-    --sphinx-man \
-    --system-libs \
-    --parallel="${GSA_BUILD_JOBS:-$(/usr/bin/getconf _NPROCESSORS_ONLN)}"
+  bootstrap_cmake
   make
 
   # Run cmake on a test project to generate profile data
@@ -79,7 +86,18 @@ EOF
   export CXXFLAGS="${CXXFLAGS/-fprofile-generate/-fprofile-use}"
   export LDFLAGS="${LDFLAGS/-fprofile-generate/-fprofile-use}"
 
+  # Reconfiguring is mandatory, not tidiness: CMake reads CFLAGS/CXXFLAGS/LDFLAGS
+  # only while it *initialises the cache*, and phase 1's bootstrap wrote that
+  # cache with the phase-1 flags. `make clean` does not remove CMakeCache.txt, and
+  # re-running configure with the cache still in place goes on ignoring the
+  # environment — so the substitution above would be a no-op, `make` would relink
+  # the instrumented objects, and the payload would stay a phase-1 build. That is
+  # the 2026-09-20 failure: package() aborted on cmake/ccmake/cpack/ctest, all
+  # four still carrying baked `.gcda` paths. The cache has to go for the new flags
+  # to be read at all, hence clean -> purge -> reconfigure -> build.
   make clean
+  rm -f CMakeCache.txt
+  bootstrap_cmake
   make
 }
 

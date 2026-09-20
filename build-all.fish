@@ -62,6 +62,14 @@ function set_color
     end
 end
 
+# Because that wrapper is *empty* off a terminal, text must never ride in the
+# same word as its escapes: fish drops a whole word like
+# `(set_color cyan)"text"(set_color normal)` when the substitution yields
+# nothing, so `echo` printed a blank line in a pipe — and the pipe is the
+# documented interface to parse. Write such lines as
+# `printf '%s%s%s\n' (set_color cyan) "text" (set_color normal)`, where the
+# text is its own argument and survives either way.
+
 set -g _UI_ICON_OK "✓"
 set -g _UI_ICON_ERROR "✗"
 set -g _UI_ICON_WARN "⚠"
@@ -69,6 +77,20 @@ set -g _UI_ICON_INFO "·"
 set -g _UI_ICON_ACTIVE "→"
 set -g _PACMAN_MUTEX "$LOG_DIR/.pacman-install.lock"
 set -g _PACMAN_MUTEX_WAIT 300
+# Downloaded remote archives: what `-ccc`/`--nuclear` deletes and what the root
+# .gitignore denies, as one list. A download lands *in the recipe directory*
+# (makepkg's SRCDEST defaults to $startdir), so the two sets have to move
+# together: drift one way and a sweep commits 36 MB of upstream archives (that
+# happened — 2026-09-20, ten files in `libreoffice-fresh`); drift the other and
+# `-ccc` leaves the next `.zip` behind to be committed the same way. Only
+# URL-backed entries are ever matched, so a local patch, hook or keyring in the
+# recipe directory is never a target, and `tests/recipe-sources.sh` fails rather
+# than let a local asset vanish silently. Keep `.whl` here even though the
+# gitignore spells it too — texlive-texmf downloads one.
+# The wildcard entries are quoted on purpose: fish glob-expands an unquoted
+# `tar.*` and drops it when nothing matches, which would silently shrink this
+# list back to the old behaviour.
+set -g _DOWNLOAD_ARCHIVE_EXTS tar 'tar.*' tgz zip jar ttf whl
 # Unprivileged -i runs: the dispatcher refreshes the sudo cached credential so
 # the lane installs (`sudo -n`, lane children have no tty) never need a
 # password. The interval sits well inside the 5-min sudo timeout so a slow poll
@@ -863,7 +885,14 @@ function nuclear_cleanup
                 if test -z "$fname"
                     set fname (basename (string replace -r '[?#].*$' '' -- "$url"))
                 end
-                if string match -q '*.tar.*' -- "$fname"; or string match -q '*.whl' -- "$fname"
+                set -l is_download_archive 0
+                for _ext in $_DOWNLOAD_ARCHIVE_EXTS
+                    if string match -q "*.$_ext" -- "$fname"
+                        set is_download_archive 1
+                        break
+                    end
+                end
+                if test $is_download_archive -eq 1
                     if test -f "$d/$fname"; and not test -L "$d/$fname"
                         set -a pkg_targets "$d/$fname"
                     end
@@ -880,7 +909,7 @@ function nuclear_cleanup
         end
 
         if test (count $pkg_skipped) -gt 0
-            echo (set_color yellow)"$d — symlinks preserved"(set_color normal)
+            printf '%s%s%s\n' (set_color yellow) "$d — symlinks preserved" (set_color normal)
             for t in $pkg_skipped
                 echo "  ↷ kept: $t"
             end
@@ -891,7 +920,7 @@ function nuclear_cleanup
             # Dedupe (a sig file can be both a source entry and a companion)
             set pkg_targets (printf '%s\n' $pkg_targets | awk '!seen[$0]++')
 
-            echo (set_color cyan)"$d"(set_color normal)
+            printf '%s%s%s\n' (set_color cyan) "$d" (set_color normal)
             for t in $pkg_targets
                 set -l sz (du -sh "$t" 2>/dev/null | cut -f1)
                 printf '  %-8s %s\n' "$sz" "$t"
@@ -911,9 +940,9 @@ function nuclear_cleanup
 
     set -l total (du -sch $all_targets 2>/dev/null | tail -1 | cut -f1)
     echo ""
-    echo (set_color red)"☢ NUCLEAR: will delete "(count $all_targets)" targets ("$total")"(set_color normal)
+    printf '%s%s%s\n' (set_color red) "☢ NUCLEAR: will delete "(count $all_targets)" targets ("$total")" (set_color normal)
     if test (count $all_skipped) -gt 0
-        echo (set_color yellow)"  "(count $all_skipped)" symlink(s) preserved."(set_color normal)
+        printf '%s%s%s\n' (set_color yellow) "  "(count $all_skipped)" symlink(s) preserved." (set_color normal)
     end
     echo "  Built package archives are kept — run -cc to remove those too."
     read -P "Proceed? [y/N] " -l answer
@@ -1174,7 +1203,7 @@ function link_sources
         set -l canon_dir "$canon[3]"
         set -l canon_path "$canon_dir/$canon[2]"
 
-        echo (set_color cyan)"shared mirror: $u"(set_color normal)
+        printf '%s%s%s\n' (set_color cyan) "shared mirror: $u" (set_color normal)
         echo "  canonical: $canon_path"
 
         # Repair the canonical mirror when it is a real clone
@@ -1184,7 +1213,7 @@ function link_sources
             if test "$origin" != "$u"
                 if git -c safe.bareRepository=all -C "$canon_path" \
                     remote set-url origin "$u"
-                    echo (set_color yellow)"  ↻ fixed origin: '$origin' → '$u'"(set_color normal)
+                    printf '%s%s%s\n' (set_color yellow) "  ↻ fixed origin: '$origin' → '$u'" (set_color normal)
                     set n_fix (math $n_fix + 1)
                 else
                     ui_error "cannot repair mirror origin: $canon_path"
@@ -1197,7 +1226,7 @@ function link_sources
             if test -z "$refspec"
                 if git -c safe.bareRepository=all -C "$canon_path" \
                     config remote.origin.fetch "+refs/*:refs/*"
-                    echo (set_color yellow)"  ↻ added missing remote.origin.fetch refspec (fetch was a silent no-op)"(set_color normal)
+                    printf '%s%s%s\n' (set_color yellow) "  ↻ added missing remote.origin.fetch refspec (fetch was a silent no-op)" (set_color normal)
                     set n_fix (math $n_fix + 1)
                 else
                     ui_error "cannot repair mirror fetch refspec: $canon_path"
@@ -1206,30 +1235,30 @@ function link_sources
                 end
             else if test (git -c safe.bareRepository=all -C "$canon_path" \
                 config --get core.bare 2>/dev/null) = true; and test "$refspec" != '+refs/*:refs/*'
-                echo (set_color yellow)"  ⚠ bare mirror with non-mirror refspec '$refspec' — won't fetch tags/pull refs"(set_color normal)
+                printf '%s%s%s\n' (set_color yellow) "  ⚠ bare mirror with non-mirror refspec '$refspec' — won't fetch tags/pull refs" (set_color normal)
             end
             set -l io (git -c safe.bareRepository=all -C "$canon_path" \
                 config --local --list 2>/dev/null | grep -i insteadof)
             if test -n "$io"
-                echo (set_color yellow)"  ⚠ insteadOf redirect present — fetches do NOT go to '$u'"(set_color normal)
+                printf '%s%s%s\n' (set_color yellow) "  ⚠ insteadOf redirect present — fetches do NOT go to '$u'" (set_color normal)
             end
         else if test -d "$canon_path"; and not test -L "$canon_path"
             set -l child (find "$canon_path" -mindepth 1 -maxdepth 1 \
                 -print -quit 2>/dev/null)
             if test -z "$child"
                 if rmdir "$canon_path"
-                    echo (set_color yellow)"  ↻ removed stale empty mirror directory"(set_color normal)
+                    printf '%s%s%s\n' (set_color yellow) "  ↻ removed stale empty mirror directory" (set_color normal)
                 else
                     ui_error "cannot remove stale empty mirror directory: $canon_path"
                     set n_error (math $n_error + 1)
                     continue
                 end
             else
-                echo (set_color red)"  ✗ existing non-git mirror path is not replaceable: $canon_path"(set_color normal)
+                printf '%s%s%s\n' (set_color red) "  ✗ existing non-git mirror path is not replaceable: $canon_path" (set_color normal)
                 continue
             end
         else if test -L "$canon_path"
-            echo (set_color yellow)"  ⚠ canonical is itself a symlink (dangling until its target exists)"(set_color normal)
+            printf '%s%s%s\n' (set_color yellow) "  ⚠ canonical is itself a symlink (dangling until its target exists)" (set_color normal)
         else
             echo "  ℹ canonical missing — makepkg will clone it here on the next build of $canon[3]"
         end
@@ -1243,14 +1272,14 @@ function link_sources
                 set -l want (realpath -m "$canon_path" 2>/dev/null; or echo "$canon_path")
                 set -l resolved (realpath -m "$twin_path" 2>/dev/null)
                 if test "$resolved" = "$want"
-                    echo (set_color green)"  ✓ linked: $twin_path"(set_color normal)
+                    printf '%s%s%s\n' (set_color green) "  ✓ linked: $twin_path" (set_color normal)
                     set n_ok (math $n_ok + 1)
                     continue
                 end
-                echo (set_color yellow)"  ↻ relinking $twin_path (was → $resolved)"(set_color normal)
+                printf '%s%s%s\n' (set_color yellow) "  ↻ relinking $twin_path (was → $resolved)" (set_color normal)
                 rm "$twin_path"
             else if valid_source_mirror "$twin_path"
-                echo (set_color red)"  ☢ duplicate clone: $twin_path ("(du -sh "$twin_path" 2>/dev/null | cut -f1)")"(set_color normal)
+                printf '%s%s%s\n' (set_color red) "  ☢ duplicate clone: $twin_path ("(du -sh "$twin_path" 2>/dev/null | cut -f1)")" (set_color normal)
                 set -a deletions "$twin_path"
                 set -a deletions "$twin_dir/src"
                 set -a del_twins "$twin_dir|$parts[2]|$canon_path"
@@ -1265,7 +1294,7 @@ function link_sources
                         continue
                     end
                 else
-                    echo (set_color red)"  ✗ existing non-git source path is not replaceable: $twin_path"(set_color normal)
+                    printf '%s%s%s\n' (set_color red) "  ✗ existing non-git source path is not replaceable: $twin_path" (set_color normal)
                     continue
                 end
             else
@@ -1283,7 +1312,7 @@ function link_sources
 
     if test (count $deletions) -gt 0
         echo ""
-        echo (set_color red)"☢ Dedup will delete "(count $deletions)" paths:"(set_color normal)
+        printf '%s%s%s\n' (set_color red) "☢ Dedup will delete "(count $deletions)" paths:" (set_color normal)
         for t in $deletions
             test -e "$t"; or continue
             printf '  %-8s %s\n' (du -sh "$t" 2>/dev/null | cut -f1) "$t"
@@ -1310,7 +1339,7 @@ function link_sources
                 set n_fix (math $n_fix + 1)
             end
         end
-        echo (set_color green)"✓ duplicates removed — twins now share the canonical mirrors."(set_color normal)
+        printf '%s%s%s\n' (set_color green) "✓ duplicates removed — twins now share the canonical mirrors." (set_color normal)
     end
 
     echo ""

@@ -95,6 +95,16 @@ recipe-local patches and intentional symlinks. Review its target list before
 confirming. Ctrl-C terminates isolated lane process groups and restores the
 terminal dashboard.
 
+A downloaded remote archive is deleted only if its URL source's filename has one
+of the extensions in `_DOWNLOAD_ARCHIVE_EXTS` — the same set the root
+`.gitignore` denies, so a `-ccc` sweep and the ignore rules cannot disagree about
+what a download is (`tests/cleanup-extensions.sh` fails if they do). Because the
+match is on URL-backed sources, a *local* asset in a recipe directory is never a
+target even when it carries one of those extensions. `--nuclear` reads its
+confirmation from stdin and prints the same target list to a pipe as to a
+terminal, so `printf 'n\n' | fish build-all.fish -ccc` lists what it would
+delete and then aborts — answering `y` deletes it.
+
 ## Troubleshooting
 
 Read the per-package log named in a failure message. A stale system pacman
@@ -195,3 +205,17 @@ the staged package payload after `meson install`; temporary helpers under
 `build/meson-private/` are not shipped and must not be treated as package
 artifacts. This section is the operational reference for the PGO rules that
 `CONTRIBUTING.md` states and that `MEMORY.md` §6 explains as failure modes.
+
+A CMake-based PGO recipe has the same requirement with a sharper edge. CMake
+reads `CFLAGS`, `CXXFLAGS` and `LDFLAGS` only while it *initialises*
+`CMakeCache.txt`, so once the phase-1 configure has run, changing those
+variables in the environment is ignored — including by a re-run of the
+configure step. `make clean` does not remove the cache either. Phase 2 must
+therefore delete `CMakeCache.txt` (or set the flags explicitly with
+`-DCMAKE_C_FLAGS=…`) *and* re-run the configure step; without that, the
+"rebuild" relinks phase-1 objects and the payload stays instrumented.
+`cmake-git` demonstrates both halves: `bootstrap_cmake()` keeps the configure
+arguments in one place, and phase 2 is `make clean` → purge the cache →
+`bootstrap_cmake` → `make`. Keeping `make clean` matters: with only the cache
+removed, `make` would compare fresh objects against unchanged sources and
+relink them unchanged.

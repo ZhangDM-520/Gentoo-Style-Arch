@@ -38,9 +38,9 @@ rather than granting it.
 | `CONTRIBUTING.md` | Recipe-change checklist, trimming standard, source-verification rules. |
 | `SECURITY.md` | Trust model (a recipe executes arbitrary shell), safe-operation rules, what must never be committed. |
 
-`docs/NOTE.md` is 2 100+ lines and keeps growing: grep a dated section rather
-than reading it end to end, and remember its naming-history table when an old
-entry mentions paths that no longer exist.
+`docs/NOTE.md` is the long chronological file (newest section first): grep a
+dated section rather than reading it end to end, and remember its naming-history
+table when an old entry mentions paths that no longer exist.
 
 `docs/MEMORY.md` §5 **Queued (claim by editing this section)** is the project's
 work queue: check it before starting unrelated work, and claim an item by
@@ -273,8 +273,9 @@ recipe here guards that absent optional input instead. Do not re-enable the
 systemd bootloader feature to satisfy it — rebuild the guard:
 `fish build-all.fish --no-deps --install mkinitcpio`, then `sudo mkinitcpio -P`.
 
-**Local assets and ignore rules.** Two ignore layers must both pass. Nine
-recipes default-deny with a bare `*` plus `!` negations, so a new file without
+**Local assets and ignore rules.** Two ignore layers must both pass. Some
+recipes default-deny with a bare `*` plus `!` negations (`grep -rl '^\*$'
+packages/*/*/.gitignore` lists them), so a new file without
 a matching negation is silently dropped from the commit while still building
 locally — a clean checkout then fails with "was not found in the build
 directory". Separately, the *root* `.gitignore` denies `packages/*/*/*/`, i.e.
@@ -310,10 +311,24 @@ append hard-coded `-O3`, `-march`, or `-mtune` to a recipe; host-derived native
 settings are fine, and an explicit `GSA_TARGET_CPU` must be intentional and
 documented. `mold-git` does not provide `mold` for depend resolution — the
 house idiom is a runtime `command -v mold` guard. Meson recipes use
-`arch-meson`. LTO/PGO phases, the Meson reconfigure rules that must replace
-both compiler and linker argument caches, and the symbol-level
-instrumentation check (`readelf -sW <lib> | grep -E '__gcov_|__llvm_profile'`
-must be empty) are documented in `docs/build-guide.md` and `MEMORY.md` §4/§6.
+`arch-meson`. LTO/PGO phases, and the rules that must replace a *configure-time*
+argument cache rather than only recompiling — Meson's `meson setup
+--reconfigure`, and CMake's `CMakeCache.txt`, which `make clean` does not touch
+— are documented in `docs/build-guide.md` and `MEMORY.md` §4/§6.
+
+The instrumentation check needs **both predicates and both seams**. Inside
+`package()`, before makepkg strips, `readelf -sW <lib> | grep -E
+'__gcov_|__llvm_profile'` must be empty; against anything installed or already
+stripped that same command reports a false clean, so use `strings -a <bin> |
+grep -c '\.gcda'` there — the baked path is what survives stripping. A defensive
+call inside a shell function must end in `|| return 1`, because bash returns the
+*last* command's status and a bare mid-function call prints its error and
+passes anyway (fish behaves the same). The invariant is enforced from the
+builder rather than per recipe: `verify_pgo_payload()` in `build-all.fish`
+refuses to install an archive from a `-fprofile-generate` recipe that still
+carries a baked `.gcda` destination, because most recipes instrument and only a
+handful guard themselves.
+
 The builder exports `GSA_BUILD_JOBS` to every lane and rewrites `MAKEFLAGS`/
 `NINJAFLAGS` without discarding the caller's other flags, so a recipe that
 wants the lane's job count should read `GSA_BUILD_JOBS` rather than calling
