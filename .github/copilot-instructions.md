@@ -313,8 +313,10 @@ documented. `mold-git` does not provide `mold` for depend resolution — the
 house idiom is a runtime `command -v mold` guard. Meson recipes use
 `arch-meson`. LTO/PGO phases, and the rules that must replace a *configure-time*
 argument cache rather than only recompiling — Meson's `meson setup
---reconfigure`, and CMake's `CMakeCache.txt`, which `make clean` does not touch
-— are documented in `docs/build-guide.md` and `MEMORY.md` §4/§6.
+--reconfigure`, and CMake's `CMakeCache.txt`, whose flags must be rewritten
+*inside* the file (`make clean` keeps the cache, and deleting it also drops the
+install prefix and the dependency selection) — are documented in
+`docs/build-guide.md` and `MEMORY.md` §4/§6.
 
 The instrumentation check needs **both predicates and both seams**. Inside
 `package()`, before makepkg strips, `readelf -sW <lib> | grep -E

@@ -66,11 +66,17 @@
    touches neither. After ANY meson-git upgrade run the stale-meson
    audit: `find . -name meson-info.json`, purge build dirs whose version
    differs (build dirs live at arbitrary depths — a maxdepth sweep misses
-   them), rebuild a canary. A PGO phase 2 therefore purges the cache and
-   re-runs the configure step rather than only rebuilding: `cmake-git` shipped
-   phase-1 payloads for months because `${CFLAGS/-fprofile-generate/
-   -fprofile-use}` plus `make clean; make` left the phase-1 flags in the cache
-   (2026-09-20).
+   them), rebuild a canary. A PGO phase 2 therefore replaces the cached
+   arguments and lets the build system reconfigure itself rather than only
+   rebuilding: `cmake-git` shipped phase-1 payloads for months because
+   `${CFLAGS/-fprofile-generate/-fprofile-use}` plus `make clean; make` left the
+   phase-1 flags in the cache (2026-09-20). Replace the values *inside* the
+   cache — `sed` the flag strings, then `touch CMakeLists.txt` so the generated
+   `Makefile` re-checks and regenerates — and do not delete the file to force
+   it: the cache also holds the install prefix the configure was given,
+   `--mandir`/`--docdir`/`--datadir`, `CMAKE_USE_SYSTEM_*` and `-fuse-ld=mold`,
+   and deleting it silently reprefixed one payload to `/usr/local` with bundled
+   dependencies.
 7. **Don't touch in-progress builds**: check running makepkg processes and
    runtime log mtimes before rebuilding a package someone else is on.
    Never run two heavy builds concurrently (OOM).
@@ -289,9 +295,17 @@ install history lives in `NOTE.md`.
   `meson setup --reconfigure` with both compiler and linker caches replaced
   (§1 rule 6, `docs/build-guide.md`). CMake: `cmake-git` reads
   `CFLAGS`/`CXXFLAGS`/`LDFLAGS` only while initialising `CMakeCache.txt`, so
-  phase 2 deletes that file and re-runs `bootstrap_cmake()` — without it the
-  link line keeps `-fprofile-generate` and `package()`'s instrumentation guard
-  aborts (2026-09-20).
+  phase 2 rewrites the flag strings **inside** that file and touches a tracked
+  input (`CMakeLists.txt`) so the generated `Makefile` regenerates — without it
+  the link line keeps `-fprofile-generate` and `package()`'s instrumentation
+  guard aborts (2026-09-20). Rewrite the cache rather than delete it: it also
+  holds the install prefix, `--mandir`/`--docdir`/`--datadir`,
+  `CMAKE_USE_SYSTEM_*` and mold's `-fuse-ld=mold`, so a deletion re-prefixes the
+  payload to `pkg/usr/local` and swaps system libraries back to bundled ones.
+  Never re-run `./bootstrap` either: that is a *build of a compiler*, and its
+  objects are compiled from the same sources as phase 1, so `-fprofile-use`
+  there hits the phase-1 generate-mode profiles and make dies on
+  `-Werror=coverage-mismatch`.
 - **PGO training workloads**: mesa (vkcube on lavapipe + glxinfo/eglinfo,
   gcda in srcdir/mesa-pgo-profile, ON by default); glib2/gtk/cairo (`meson
   test`, timeouts + `|| true`); bash/zsh (`make check` timeout 900 + `|| true`
@@ -386,9 +400,18 @@ going stale.
   the configure step with the cache present still ignores the environment. The
   final link line is therefore still instrumented and the recipe's own guard
   aborts `package()` with "final package still contains profile
-  instrumentation". The recipe now purges the cache and re-runs
-  `bootstrap_cmake()` in phase 2; `xorg-xwayland-git` needs no recipe change
-  (`meson setup --reconfigure`). Done looks like
+  instrumentation". The fix is a rewrite of the flags inside the cache
+  (`sed` → `touch CMakeLists.txt` → `make clean` → `make`, the touched input
+  being what makes the generated `Makefile` regenerate) plus two tolerance
+  flags, because GCC refuses the profile in two different ways here:
+  `-Wno-missing-profile` (every fresh feature probe is untrained, and
+  `Source/Checks/cm_cxx_features.cmake` reads *any* probe warning as "feature
+  unavailable", so the configure otherwise aborts with "The C++ compiler does not
+  support C++11") and `-Wno-error=coverage-mismatch` (a few kwsys sources come
+  back with a different arc count, which GCC treats as an error by default).
+  Re-running `./bootstrap` instead fails the build on
+  `-Werror=coverage-mismatch` in `Bootstrap.cmk`. `xorg-xwayland-git` needs no
+  recipe change (`meson setup --reconfigure`). Done looks like
   `strings -a /usr/bin/cmake | grep -c '\.gcda'` → 0 for
   `cmake`/`ccmake`/`cpack`/`ctest` and for `Xwayland`.
 - **`IgnorePkg` closure is complete again (audited 2026-09-19, fixed same

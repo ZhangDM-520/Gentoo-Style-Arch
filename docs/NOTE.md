@@ -57,17 +57,96 @@ dependency edges, and incident root causes are unaffected by the renames.
   configure step with the cache in place still ignores the environment**; only
   dropping `CMakeCache.txt` (or passing `-DCMAKE_C_FLAGS=` explicitly) makes the
   new flags take effect.
-- **Fix**: `cmake-git`'s bootstrap invocation is factored into one
-  `bootstrap_cmake()` helper so the two phases cannot drift, and phase 2 is now
-  `make clean` → `rm -f CMakeCache.txt` → `bootstrap_cmake` → `make`. `make
-  clean` stays, because with only the cache removed `make` would compare fresh
-  objects against unchanged sources and relink the instrumented ones.
+- **Fix, first form (refused by the build — kept here because the reason is the
+  useful part)**: factor the bootstrap invocation into a `bootstrap_cmake()`
+  helper and make phase 2 `make clean` → `rm -f CMakeCache.txt` →
+  `bootstrap_cmake` → `make`. The re-bootstrap was wrong: `./bootstrap` compiles
+  the bootstrap CMake out of the same sources, so running it a second time under
+  `-fprofile-use` recompiles those objects against the profiles phase 1 produced
+  *for a generate-mode build* and dies on
+  `-Werror=coverage-mismatch` ("source locations … have changed, the profile
+  data may be out of date") in `Bootstrap.cmk/Makefile`. The build log shows
+  phase 1 fine (`Profile data generated: 755 .gcda files`) and the failure
+  immediately after, in `bootstrapping CMake`.
+- **Fix, second form (also refused — the warning trap)**: phase 2 becomes
+  `make clean` → `rm -f CMakeCache.txt` → `make`, deleting the cache so the
+  generated `Makefile` reconfigures by itself on the next invocation, reading the
+  phase-2 environment. Measured on a scratch project rather than assumed:
+  `-DFOO=1` at configure, then `rm CMakeCache.txt` and `make` with `-DFOO=2` →
+  `flags.make` contains `-DFOO=2` and the build succeeds. **It failed anyway**,
+  one step further on: `make_unique`/`unique_ptr`/`filesystem` all answered
+  "no" during the reconfigure, so configure aborted with "The C++ compiler does
+  not support C++11 (e.g. std::unique_ptr)". `Source/Checks/cm_cxx_features.cmake`
+  decides a feature is missing when the probe output matches
+  `"(^|[ :])[Ww][Aa][Rr][Nn][Ii][Nn][Gg]"` — **any** warning counts as
+  unsupported — and the probes are compiled fresh, so `-fprofile-use` warns
+  `-Wmissing-profile` ("profile count data file not found", the paths are new)
+  on every one of them. The check log shows the probes *building and linking
+  cleanly*; only the warning made CMake answer "no".
+- **Fix, third form (also refused — the profile mismatch)**: phase 2 keeps the
+  cache purge **and** appends `-Wno-missing-profile`. That is the one warning the
+  probes legitimately produce, and suppressing it let the reconfigure reach a yes
+  — but the build then died at 5 % on
+  `Source/kwsys/ProcessUNIX.c.o`, in *both* the C and the C++ target:
+  "number of counters in profile data for function `cmsysProcess_AddCommand`
+  does not match its profile data (counter `arcs`, expected 15 and have 16)
+  [-Werror=coverage-mismatch]". GCC treats a mismatched profile as an error by
+  default, and the mismatch is intrinsic to the two-phase scheme rather than
+  something in this tree: `-fprofile-use` enables passes the `-fprofile-generate`
+  phase did not run, so a handful of functions come back with a different arc
+  count.
+- **Fix, fourth form (the purge itself was wrong — measured, then replaced)**:
+  keeping the purge and adding both flags produced a payload that *built* clean
+  (0 baked paths in all four binaries) and then failed `package()` on an
+  unrelated symptom: the phase-2 configure had printed `-- Using bundled: CURL
+  EXPAT …` where phase 1 printed `-- Using system-installed: …`, and the tree
+  landed under `pkg/usr/local/…`. Root cause: `CMakeCache.txt` is not "the
+  flags" — it is every decision `./bootstrap` made, so `--prefix=/usr`,
+  `--mandir`/`--docdir`/`--datadir`, thirteen `CMAKE_USE_SYSTEM_*` entries and
+  `-fuse-ld=mold` all reverted the moment it was deleted. The exported
+  `CFLAGS`/`CXXFLAGS`/`LDFLAGS` in this form were dead code for the same reason
+  the original code was: with a cache present, CMake ignores the environment.
+- **Fix, final**: rewrite the flag strings *inside* the cache and force a
+  regeneration — `sed -i 's/-fprofile-generate/-fprofile-use
+  -Wno-missing-profile -Wno-error=coverage-mismatch/g' CMakeCache.txt`, fail the
+  build if any `-fprofile-generate` survives, `touch CMakeLists.txt`, then
+  `make clean` → `make`. Pre-flight on the real tree: the reconfigure took
+  **3.1 s** (the cached feature answers mean no probe re-runs at all, which also
+  demotes `-Wno-missing-profile` from required to backstop), and it regenerated
+  **65/65** `flags.make` and **44/44** `link.txt` to the use-flags with **0**
+  left at generate, kept `CMAKE_INSTALL_PREFIX:PATH=/usr` in both the cache and
+  `cmake_install.cmake`, kept mold on the link line and all thirteen
+  `CMAKE_USE_SYSTEM_*` entries. `-Wno-error=coverage-mismatch` is what lets the
+  build finish, at the cost of compiling the mismatching functions (kwsys
+  process handling) without profile data — every other function keeps the real
+  profile, and the payload is uninstrumented either way, which is the point of
+  the phase. `make clean` stays, for a second reason: regenerated rules do not
+  invalidate phase-1 objects, so without it `make` would relink the instrumented
+  ones against fresh sources.
 - **Validation**: `bash -n` on the recipe; `.SRCINFO` freshness fixture green.
   The real build is the remaining proof and is deliberately **not** run as a
-  syntax check — `strings -a /usr/bin/cmake | grep -c '\.gcda'` must reach 0.
+  syntax check — `strings -a /usr/bin/cmake | grep -c '\.gcda'` must reach 0 for
+  `cmake`/`ccmake`/`cpack`/`ctest`.
 - **Rule**: this is the **CMake twin of the Meson staleness rule** — a
   configure-time argument cache survives a rebuild, and `make clean` is not a
-  reconfigure. A PGO phase 2 must purge the cache and re-run the configure step.
+  reconfigure. Replace the cached values and make the build system regenerate;
+  do **not** delete the cache, which carries the install prefix, the install
+  directories and the dependency selection as well as the flags, and losing them
+  is invisible until the payload is inspected. Do **not** re-run the bootstrap
+  either: it is a *build of a compiler* and inherits whatever profile data the
+  previous phase left lying in its own object directory.
+  Then watch what the reconfigure has to say: `-fprofile-use` adds
+  `-Wmissing-profile` to every fresh probe, and a project whose feature checks
+  treat a warning as a negative answer will read an untrained profile as a
+  missing compiler feature. A PGO phase 2 needs its build system's *own* probe
+  policy checked, not just its cache.
+- **`-fprofile-generate` and `-fprofile-use` do not describe the same build.**
+  `-fprofile-use` enables optimization passes the generate phase never ran
+  (`-funroll-loops`, `-fpeel-loops`, `-ftracer`, …), so some functions come back
+  with a different arc count and GCC refuses their profile — as an *error*, by
+  default. A phase 2 that cannot regenerate its inputs needs
+  `-Wno-error=coverage-mismatch` (which compiles those functions unprofiled)
+  alongside `-Wno-missing-profile`.
   The distinction is worth keeping: `xorg-xwayland-git` gets it right with
   `meson setup --reconfigure`, and its rebuild is simply waiting its turn.
 ## 2026-09-20 — the downloaded-archive rule lived in two places, and they had already drifted twice

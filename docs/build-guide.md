@@ -210,12 +210,49 @@ A CMake-based PGO recipe has the same requirement with a sharper edge. CMake
 reads `CFLAGS`, `CXXFLAGS` and `LDFLAGS` only while it *initialises*
 `CMakeCache.txt`, so once the phase-1 configure has run, changing those
 variables in the environment is ignored — including by a re-run of the
-configure step. `make clean` does not remove the cache either. Phase 2 must
-therefore delete `CMakeCache.txt` (or set the flags explicitly with
-`-DCMAKE_C_FLAGS=…`) *and* re-run the configure step; without that, the
-"rebuild" relinks phase-1 objects and the payload stays instrumented.
-`cmake-git` demonstrates both halves: `bootstrap_cmake()` keeps the configure
-arguments in one place, and phase 2 is `make clean` → purge the cache →
-`bootstrap_cmake` → `make`. Keeping `make clean` matters: with only the cache
-removed, `make` would compare fresh objects against unchanged sources and
-relink them unchanged.
+configure step. `make clean` does not remove the cache either. Phase 2 therefore
+has to reach *into* the cache and rewrite the flag strings, then provoke a
+regeneration — `cmake-git` does exactly this:
+
+```sh
+sed -i 's/-fprofile-generate/-fprofile-use …/g' CMakeCache.txt
+if grep -q -- '-fprofile-generate' CMakeCache.txt; then   # a leftover silently
+  error "phase 2 is still a phase-1 build"; return 1      # ships a phase-1 payload
+fi
+touch CMakeLists.txt    # what makes the generated Makefile re-check and regenerate
+make clean
+make
+```
+
+**Rewrite the cache; deleting it is the trap that looks like the local fix.** A
+`CMakeCache.txt` is not "the flags" — it is every decision phase 1's
+`./bootstrap` made: the install prefix from `--prefix=/usr`, `--mandir`/
+`--docdir`/`--datadir`, the `CMAKE_USE_SYSTEM_*` dependency selection, and the
+`-fuse-ld=mold` link flags. Measured on 2026-09-20 while this recipe deleted the
+cache: the phase-2 configure printed `-- Using bundled: CURL EXPAT …` where
+phase 1 had `-- Using system-installed: …`, and the payload was installed under
+`pkg/usr/local/…` instead of `pkg/usr/…`. That also describes the cheaper route's
+cost — the reconfigure reuses the cached feature answers and takes seconds, while
+a fresh configure re-probes and takes ~100 s. Passing the flags with
+`-DCMAKE_C_FLAGS=…` on a reconfigure is the same idea by a supported door.
+
+`make clean` is still required: regenerated rules do not invalidate phase-1
+objects, so without it `make` compares fresh objects against unchanged sources
+and relinks the instrumented ones. Re-running `./bootstrap` is worse than either
+route — the bootstrap is a *build of a compiler*, from the same sources phase 1
+compiled, so a second bootstrap under `-fprofile-use` compiles its objects
+against the phase-1 generate-mode profiles and make dies on
+`-Werror=coverage-mismatch`; that is how this fix failed on 2026-09-20 before the
+cache edit was tried.
+
+A profile-*use* pass needs two tolerance flags, and they are load-bearing for
+different reasons. `-Wno-missing-profile` is the guard on a fresh probe:
+`-fprofile-use` warns on a probe that never ran, and CMake's
+`Source/Checks/cm_cxx_features.cmake` reads *any* warning in a probe's output as
+"feature unavailable", so a project that re-probes concludes this compiler has no
+C++11 support and aborts the configure. Keeping the cache is what keeps that from
+happening at all, so read this flag as the backstop for any recipe that does
+re-probe. `-Wno-error=coverage-mismatch` cannot be avoided: `-fprofile-use`
+enables passes the generate phase never ran, so a few functions come back with a
+different arc count, which GCC treats as an error by default; downgraded, those
+functions compile without profile data while the rest keep it.
