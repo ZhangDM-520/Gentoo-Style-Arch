@@ -1654,7 +1654,7 @@ function dashboard_tail_rows -a pkg
         return 0
     end
 
-    set -l log_file "$LOG_DIR/"(basename "$pkg")".log"
+    set -l log_file (package_log_file "$pkg")
     set -l lines (tail -n 3 "$log_file" 2>/dev/null | sanitize_log_stream)
     for i in (seq 3)
         set -l line ""
