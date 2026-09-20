@@ -313,15 +313,29 @@ end
 
 function read_group_config -a group_name
     set -l group_file "$GROUP_CONFIG_DIR/$group_name.list"
-    test -f "$group_file"; or return 1
+    if not test -f "$group_file"
+        ui_error "group list not found: $group_file"
+        return 1
+    end
     set -l values
     for raw_line in (cat "$group_file")
         set -l line (string trim -- "$raw_line")
         test -n "$line"; or continue
         string match -q '#*' -- "$line"; and continue
-        string match -qr '^[A-Za-z0-9._+-]+$' -- "$line"; or return 1
-        contains "$line" $_PACKAGE_IDS; or return 1
-        contains "$line" $values; and return 1
+        # Name the line, not just the group. The caller can only say "invalid
+        # package group: git", which leaves the user diffing a 56-line list.
+        if not string match -qr '^[A-Za-z0-9._+-]+$' -- "$line"
+            ui_error "invalid entry in $group_file: '$line' (allowed: A-Za-z0-9._+-)"
+            return 1
+        end
+        if not contains "$line" $_PACKAGE_IDS
+            ui_error "entry in $group_file names no package: $line"
+            return 1
+        end
+        if contains "$line" $values
+            ui_error "$line appears twice in $group_file"
+            return 1
+        end
         set -a values "$line"
     end
     assign_group "$group_name" $values
@@ -399,8 +413,9 @@ function load_project_config
     end
 
     for group_name in git stable core misc third-party
+        # read_group_config names the offending file and line itself; a second
+        # generic "invalid package group" here would just follow it.
         if not read_group_config "$group_name"
-            ui_error "invalid package group: $group_name"
             return 1
         end
     end
@@ -3584,9 +3599,31 @@ function main
     echo "Blocked:           $blocked"
     echo "Remaining:         "(count $remaining)
     if test (count $remaining) -gt 0
+        # Mirror every flag that changes what a resume MEANS. Dropping -i was
+        # the worst omission: the interrupted run was installing each package as
+        # it built, and a resume without it rebuilds the rest while later
+        # packages compile against the old ABIs — the rule-11 hazard the -i
+        # ordering exists to prevent. --no-deps and --no-sync change the
+        # selection and the build inputs; --allow-broken-rustc is required
+        # outright when the probe was bypassed. The tip below already told the
+        # user to add "-s -i", so the command printed above it contradicted the
+        # advice right next to it.
+        set -l resume_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level"
+        if test "$install_flag" = "1"
+            set -a resume_args --install
+        end
+        if test "$no_deps_flag" -eq 1
+            set -a resume_args --no-deps
+        end
+        if test "$no_sync_flag" = "1"
+            set -a resume_args --no-sync
+        end
+        if test $allow_broken_rustc -eq 1
+            set -a resume_args --allow-broken-rustc
+        end
         echo ""
         echo "To resume, run:"
-        echo "  build-all.fish --lanes $lane_count --jobs $jobs_override --intensity $intensity_level "(string join ' ' $remaining)""
+        echo "  build-all.fish "(string join ' ' -- $resume_args)" "(string join ' ' -- $remaining)""
         echo "(Tip: add -s so already-built pkgs are skipped.)"
     end
     return 1

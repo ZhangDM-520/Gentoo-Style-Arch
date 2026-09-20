@@ -116,4 +116,20 @@ make_workspace "$dir"
 sed -i 's/^memory_per_job_gib=.*/memory_per_job_gib=0/' "$dir/config/build-defaults.conf"
 assert_rejected 'invalid numeric default' "$dir" 'memory_per_job_gib=0'
 
+# ─── Group-list problems name the line, not just the group ──────────────────
+dir="$fixture/group-duplicate"
+make_workspace "$dir"
+printf 'p1\np1\np2\n' >"$dir/config/groups/git.list"
+assert_rejected 'duplicate group entry' "$dir" 'p1 appears twice in'
+
+dir="$fixture/group-unknown"
+make_workspace "$dir"
+printf 'p1\np2\nghost\n' >"$dir/config/groups/git.list"
+assert_rejected 'unknown group entry' "$dir" 'names no package: ghost'
+
+dir="$fixture/group-missing"
+make_workspace "$dir"
+rm -f "$dir/config/groups/git.list"
+assert_rejected 'missing group list' "$dir" 'group list not found:'
+
 printf 'config diagnostics fixture: PASS\n'
