@@ -18,7 +18,12 @@
 pkgname=onlyoffice-git
 _oo_release=9.4.0        # DesktopEditors release tag, i.e. v9.4.0
 _oo_build=9.4.0.130      # build tag: pins every module. A DIFFERENT namespace.
-pkgver=9.4.0.130         # replaced by pkgver() at build time; this is the fallback
+# The static fallback for pkgver(): pkgver() recomputes it from the checked-out
+# tree at build time. Keep this line free of trailing comments -- build-all.fish
+# reads it with `grep -m1 '^pkgver=' | cut -d= -f2`, which does not strip them,
+# and a commented value silently matches no archive so the install step does
+# nothing and still reports success.
+pkgver=9.4.0.130
 pkgrel=1
 pkgdesc='Office suite that combines text, spreadsheet and presentation editors, built from upstream git sources'
 arch=('x86_64')
