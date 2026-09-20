@@ -1970,6 +1970,16 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
     set -l makepkg_args -sf --noconfirm
     if test $synced -eq 1
         set -a makepkg_args --skipchecksums
+        # sync_stable_version rewrote pkgver/pkgrel from the repos and left the
+        # committed sums describing the previous version, so makepkg would
+        # reject the freshly downloaded tarball. Skipping the check is what
+        # makes a synced build possible at all — and it means those sources are
+        # NOT verified. That must never be silent: build_package is only ever
+        # called quiet (every lane redirects its stdout/stderr into the
+        # per-package log), so the argv echo below reaches no human and this
+        # warning is the only record a person can inspect afterwards.
+        ui_warning "$pkg_name: --skipchecksums — sources are NOT checksum-verified, because pkgver/pkgrel were just synced from the repos while the committed sums still describe the previous version"
+        echo "  Refresh them with 'updpkgsums' in the recipe, then rebuild, to restore verification (docs/build-guide.md)."
     end
 
     # Full redirect to the log (2026-09-07): 'tee' to a lagging terminal
@@ -3037,7 +3047,12 @@ function usage
     echo "                    expansion (leaf rebuild with known-current deps)"
     echo "  -c, --clean       Clean build artifacts before building"
     echo "  -s, --skip        Skip packages where .pkg.tar.zst is newer than PKGBUILD"
-    echo "  --no-sync         Don't auto-update stable package versions from repos"
+    echo "  --no-sync          Don't auto-update stable package versions from repos."
+    echo "                     The default sync rewrites pkgver/pkgrel in place and builds"
+    echo "                     those packages with --skipchecksums (their committed sums"
+    echo "                     still describe the previous version), so their sources are"
+    echo "                     not verified until the sums are refreshed. Every affected"
+    echo "                     package says so in its own log — see docs/build-guide.md."
     echo "  --lanes N|auto     Run N makepkg lanes, or choose from CPU/RAM (default "(string join '' -- "$_DEFAULT_LANES")"). Interactive"
     echo "                    terminals get a compact dashboard with active log tails;"
     echo "                    pipes use plain output. Packages start as soon as deps are installed;"

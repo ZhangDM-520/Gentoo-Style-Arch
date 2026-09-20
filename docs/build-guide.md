@@ -51,6 +51,30 @@ The supervisor installs as root but runs `makepkg` as the invoking user and
 resolves that user's real home directory. A bare root shell without an
 invoking user is rejected.
 
+### Stable version sync and checksum verification
+
+`packages/stable` recipes track the Arch repository version and are updated
+automatically before they build: the builder reads the repo's version with
+`pacman -Si` and rewrites `pkgver`/`pkgrel` in the recipe **in place** when the
+repo is newer (never a downgrade; a `pkgver()`-driven recipe is skipped
+entirely). The edit is left in the working tree for you to commit, and the
+committed `.SRCINFO` and sums stay stale until you refresh and commit them.
+
+`makepkg` would then reject the freshly downloaded tarball, so that one build
+runs with `--skipchecksums`. **Those sources are not checksum-verified.** A
+signature is still enforced where the recipe has one, because
+`--skipchecksums` does not imply `--skippgpcheck`. The package log says so,
+which in a multi-lane run is the only record that exists:
+
+```
+⚠ <package>: --skipchecksums — sources are NOT checksum-verified, because …
+  Refresh them with 'updpkgsums' in the recipe, then rebuild, to restore …
+```
+
+To restore verification, run `updpkgsums` in the recipe, commit the refreshed
+sums, and rebuild. `--no-sync` avoids the whole path — no rewrite, no skipped
+checksums — at the cost of not tracking the repo version.
+
 ### sudo during `--install`
 
 Unprivileged `--install` installs happen inside lane children, which have no

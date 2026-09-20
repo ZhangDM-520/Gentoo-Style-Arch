@@ -163,6 +163,24 @@
     `makepkg.conf` supplies `-march=native`. See `portability.md`,
     `CONTRIBUTING.md` and the 2026-09-19 NOTE section.
 
+18. **A lowered guard must be announced where the record is** (09-20 audit):
+    the stable version sync rewrites `pkgver`/`pkgrel` in place and leaves the
+    committed sums describing the previous version, so `build_package` adds
+    `--skipchecksums` for that build — those sources are built (and with `-i`
+    installed) without a committed sum. That is a deliberate trade for tracking
+    the repo version, but it used to be completely silent: `build_package` is
+    called from exactly one place (`lane_job`, always `quiet_flag=1`), every lane
+    redirects its stdout/stderr into the per-package log, and the one echo that
+    named the argv sat behind the non-quiet flag nothing ever passes — so the
+    flag reached neither the terminal nor any log. It now states itself in the
+    package log, `--help` explains it under `--no-sync`, `build-guide.md` has a
+    section, and `tests/stable-sync-checksums.sh` pins the flag, the disclosure
+    and the `--no-sync` inverse. Signature checks are unaffected
+    (`--skipchecksums` is not `--skippgpcheck`), and `--no-sync` avoids the path.
+    **If the builder lowers a guard for a build, the log and the artifact must
+    say so** — a weakening that leaves no record is indistinguishable from a
+    bug.
+
 ## 2. Workspace overview
 
 - The public tree is `Gentoo_Style_Arch/`; recipes live under
@@ -535,6 +553,25 @@ targets); the stale `gcc-*-snapshot` language splits (only fortran, libs and
 recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
+
+- **A weakening that leaves no record is indistinguishable from a bug**
+  (2026-09-20, audit): `sync_stable_version` bumps a `packages/stable` recipe to
+  the repo's `pkgver`/`pkgrel` and deliberately does not refresh `sha256sums`,
+  so `build_package` adds `--skipchecksums` to `makepkg` for that build. Nothing
+  said so. The audit found it by grepping for the string across the whole
+  repository: it appeared **once**, in the builder, and in **no** document — the
+  argv echo that would have shown it sits behind `_BUILD_QUIET`, and
+  `build_package` is reached from exactly one call site, which always passes
+  `quiet_flag=1`. So in the shipped flow the flag reached neither the terminal
+  nor any log, and `--help` described `--no-sync` only as "don't auto-update
+  stable package versions". The fix is disclosure, not a behaviour change (the
+  flag is what makes a synced build possible at all): the package log now states
+  it unconditionally — the lane log is the only record in a multi-lane run —
+  `--help` and `build-guide.md` explain it, and
+  `tests/stable-sync-checksums.sh` pins the flag, the disclosure and the
+  `--no-sync` inverse so the message cannot rot into unconditional noise. Grep a
+  security-relevant flag for its documentation, in both directions: a flag with
+  one mention and no doc is a finding.
 
 - **A deny-list and a delete-list are the same list** (2026-09-20, tree cleanup):
   the root `.gitignore`'s downloaded-archive set and `nuclear_cleanup()`'s match
