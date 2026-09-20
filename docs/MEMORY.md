@@ -363,34 +363,18 @@ going stale.
 
 - **Rebuild `cmake-git` and `xorg-xwayland-git` — a recurrence of the
   2026-09-16 PGO leak, on the two packages that fix did not cover (found
-  2026-09-19).** A full sweep of `/usr/bin`, `/usr/lib` and `/usr/lib32` for an
-  absolute `.gcda` destination returns **exactly five files in two packages**:
-  `cmake`, `ccmake`, `cpack` and `ctest` (431/432/438/481 baked paths) from
-  `cmake-git` 4.4.3.936, and `Xwayland` (348) from `xorg-xwayland-git`
-  24.1.13.r1181. Everything else is clean — `glib2-git` and `cairo-git` both
-  return 0, so the 2026-09-16 fix held for the packages it touched. Both of
-  these are **stale installs that predate their recipes' current logic**
-  (cmake-git built 2026-09-07, Xwayland 2026-09-16), so this is not a broken
-  recipe — but a plain `-Syu` will not fix it, because both names are
-  `IgnorePkg`-locked; it needs `build-all.fish --no-deps --install` on each.
-  Until then the two trees under `~/Projects` are re-created in full (779
-  `.gcda` files) by one `cmake --version` and one `Xwayland` call, so deleting
-  them is futile and their reappearance is not new debris.
-- **Implement the whole documented verification, not half of it (2026-09-19).**
-  The 2026-09-16 entry on this same defect already prescribes *two* checks —
-  "`readelf -sW` on the installed libraries must find no `__gcov_` or
-  `__llvm_profile` symbols, **and `strings` must contain no legacy `.gcda`
-  destinations**" — but the digest line below and
-  `verify_no_profile_instrumentation()` in the `xorg-xwayland-git` recipe
-  implement only the first. Against a stripped binary that half-check is a
-  **false negative**: `readelf -sW /usr/bin/Xwayland` reports *clean* (883
-  symbol entries, no match) while `strings -a` finds all 348 `.gcda` paths.
-  The check is sound where the recipe calls it — inside `package()`, before
-  makepkg strips — so the recipe is not wrong, it is incomplete. Use
-  `strings -a <bin> | grep -c '\.gcda'` for any installed binary.
-
+  2026-09-19, gate landed 2026-09-20).** A full sweep of every installed file
+  owned by every PGO recipe for an absolute `.gcda` destination returns
+  **exactly five files in two packages**: `cmake`, `ccmake`, `cpack` and
+  `ctest` (431/432/438/482 baked paths) from `cmake-git` 4.4.3.936, and
+  `Xwayland` (348) from `xorg-xwayland-git` 24.1.13.r1181. Everything else is
+  clean — `glib2-git` and `cairo-git` both return 0, so the 2026-09-16 fix
   held for the packages it touched. A plain `-Syu` will not fix it, because
   both names are `IgnorePkg`-locked; it needs
+  `build-all.fish --no-deps --install` on each. Until then the two trees under
+  `~/Projects` are re-created in full (779 `.gcda` files) by one
+  `cmake --version` and one `Xwayland` call, so deleting them is futile and
+  their reappearance is not new debris.
 - **`cmake-git` is the exception to "not a broken recipe" (measured
   2026-09-20):** its queued rebuild **cannot** succeed as written, so do not
   re-run it expecting a fix. Phase 2 only re-exports the compiler variables and
@@ -414,6 +398,10 @@ going stale.
   recipe change (`meson setup --reconfigure`). Done looks like
   `strings -a /usr/bin/cmake | grep -c '\.gcda'` → 0 for
   `cmake`/`ccmake`/`cpack`/`ctest` and for `Xwayland`.
+- **`xorg-xwayland-git` is 24.1.13, and its guard is `strings`-based.** The
+  recipe path is `packages/git/xorg-xwayland-git`, not `xorg-wayland-git`.
+  `ctest` carries **482** baked paths, not 481 (the number counts paths, so it
+  moves between builds; treat it as "hundreds", not a constant).
 - **`IgnorePkg` closure is complete again (audited 2026-09-19, fixed same
   day).** The closure had drifted **32 names short**: `comm -23` of the
   committed `.SRCINFO` pkgname set (218) against `pacman-conf IgnorePkg` left
@@ -755,6 +743,19 @@ recipe).
   itself and re-creates the whole tree on every run, so check a shipped binary
   with `strings -a <bin> | grep -c '\.gcda'` — `readelf -sW` alone is a **false
   negative** on anything makepkg has stripped (2026-09-19);
+  the payload gate lives in `build-all.fish` (`verify_pgo_payload`, gated on
+  the recipe containing `-fprofile-generate`) because 21 recipes instrument
+  and only 6 carry a recipe-level guard — per-recipe verification produced two
+  separate recurrences, so it is the wrong seam for a whole-set invariant;
+  four of those guard call sites were also **decorative** until 2026-09-20
+  (mid-`package()`, no `|| return 1`, so bash discarded the status and the
+  build succeeded with the instrumentation in it — every `verify_*` call
+  belongs either last or with `|| return 1`);
+  that scan is **whole-archive** (subtree scoping embeds an install-location
+  assumption and misses a `usr/libexec` leak, while `.PKGINFO`/`.BUILDINFO`/
+  prose each pass the standalone-path predicate) and
+  **fails closed** (a `tar` extraction that yields nothing is an error, not a
+  clean result) (2026-09-20);
   a Meson PGO reconfigure must replace `c_args`, `cpp_args`, `c_link_args`,
   and `cpp_link_args` together so phase-1 `-fprofile-generate` cannot remain;
   profile-use configure probes need `-Wno-error=missing-profile`; verify the

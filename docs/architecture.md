@@ -36,3 +36,12 @@ mandatory, dependency order is meaningful, `--install` installs before a
 dependent build starts, core packages run alone, and failures stop new
 dispatches while draining existing lanes. These invariants are part of the
 maintainer contract.
+
+The install path also owns one payload invariant: a package built from a
+recipe that instruments with `-fprofile-generate` is refused if its archive
+still carries an absolute `.gcda` destination. This belongs to the builder
+rather than to the recipes because it must hold for every PGO recipe,
+including ones that have not been written yet — verification copy-pasted into
+individual recipes is the failure mode that produced two separate recurrences
+in 2026-09-16 and 2026-09-19. The check sits on the runtime state seam as
+well: it is the last point before files are written into `/usr`.

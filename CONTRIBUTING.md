@@ -84,7 +84,11 @@ Trim packaging to the maintained target:
   support when they are part of the maintained feature set;
 - keep mold, LTO, and PGO phases aligned with the package's documented
   exception (the Meson reconfigure rules and the verification procedure are in
-  `docs/build-guide.md`; the failure mechanisms are in `MEMORY.md` §6); and
+  `docs/build-guide.md`; the failure mechanisms are in `MEMORY.md` §6); a
+  recipe that trains with `-fprofile-generate` must also verify the payload it
+  actually ships — `readelf` **and** `strings` where the staged files are
+  unstripped, `strings` alone against an installed binary — and must not
+  assume the builder's central gate makes its own check optional; and
 - never use invalid `options` such as `!check` or `autodeps` to paper over a
   recipe problem.
 
@@ -113,10 +117,14 @@ bash tests/run-all.sh
 `tests/run-all.sh` runs every fixture (discovered, so new ones need no edit
 here); pass a substring to narrow it, e.g. `bash tests/run-all.sh recipe`. The
 fixtures are non-mutating and cover the project configuration, recipe
-registration and assets, source sharing, PGO transitions, and the scheduler's
-resource profiles, so run the whole battery rather than only the file matching
-the recipe you touched — the map-format change of 2026-09-17 was caught by two
-unrelated recipe fixtures.
+registration and assets, source sharing, PGO transitions and the PGO install
+gate, and the scheduler's resource profiles, so run the whole battery rather
+than only the file matching the recipe you touched — the map-format change of
+2026-09-17 was caught by two unrelated recipe fixtures.
+
+`--audit` also reports installed files under a PGO recipe that still carry a
+baked `.gcda` path, and names PGO recipes that are not installed at all, so it
+is the quickest way to spot a stale install that predates a recipe fix.
 
 Do not use a full real rebuild as a syntax check. For changes to scheduling,
 installation, cleanup, source sharing, or signals, add or run a focused

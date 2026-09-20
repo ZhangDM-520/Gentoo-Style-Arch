@@ -33,6 +33,7 @@ and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
 ## 2026-09-20 — cmake-git's PGO phase 2 never ran: the configure cache, not the rebuild, holds the flags
+
 - **Symptom**: the queued rebuild of `cmake-git` — the fix for the five
   instrumented installed files — **failed 100 % of the time**, aborting inside
   its own `package()` guard with "final package still contains profile
@@ -149,7 +150,9 @@ dependency edges, and incident root causes are unaffected by the renames.
   alongside `-Wno-missing-profile`.
   The distinction is worth keeping: `xorg-xwayland-git` gets it right with
   `meson setup --reconfigure`, and its rebuild is simply waiting its turn.
+
 ## 2026-09-20 — the downloaded-archive rule lived in two places, and they had already drifted twice
+
 - **Symptom**: 36 MB of upstream release archives (nine archives plus a font,
   ten files) were tracked and pushed in `packages/stable/libreoffice-fresh/`,
   and had been public since the 2026-09-16 release sweep. The ignore half was
@@ -198,6 +201,63 @@ dependency edges, and incident root causes are unaffected by the renames.
   archives. Corollary, from the same fixture: anything a scripted consumer is
   expected to read must be checked **through a pipe**, because the colour
   wrapper that makes a terminal pleasant is what silently deletes the text.
+
+## 2026-09-20 — the PGO payload check was a per-recipe convention, so it kept being missed
+
+- **Symptom**: the 2026-09-16 PGO leak recurred on `cmake-git` and
+  `xorg-xwayland-git` — five installed files (`cmake`, `ccmake`, `cpack`,
+  `ctest`, `Xwayland`) re-creating hundreds of `.gcda` files on every run —
+  even though a fix for exactly this defect had already landed, and two
+  recipes carried a verification function for it.
+- **Root cause**: verification was a per-recipe convention, not an invariant.
+  21 recipes instrument with `-fprofile-generate`; only 5 checked their own
+  output. Two earlier commits each fixed the subset they were looking at
+  (`f613685`, `4db32c5`), so the 22nd recipe was guaranteed to miss it. Worse,
+  **four of those five checks could not fail a build at all**: they were called
+  mid-`package()` without `|| return 1`, and bash returns the status of the
+  *last* command, so the check printed its ERROR, exited 0, and makepkg
+  packaged the instrumented payload anyway. Only `cairo-git` had the call as
+  the final command, which is the one position where the status propagates by
+  accident. The 2026-09-16 entry had also documented *two* checks —
+  `readelf -sW` for symbols **and** `strings` for baked `.gcda` paths — while
+  the digest line and the recipe function implemented only the first, which is
+  a false negative on anything makepkg has stripped (`readelf` → 0 matches on
+  `/usr/bin/Xwayland`, `strings -a` → 348).
+- **Fix**: moved the invariant into the builder. `verify_pgo_payload()` in
+  `build-all.fish` runs at both install seams (`install_pkgs_now()` and
+  `install_all()`), gated on the sibling `PKGBUILD` containing
+  `-fprofile-generate`, extracts the **whole** archive, requires a standalone
+  `/<path>.gcda` string, and fails closed when `tar` yields nothing.
+  `audit_workspace()` gained an "Installed PGO payloads" section, because a
+  gate cannot retroactively fix a stale install — that is what hid this defect
+  for six weeks. The five existing recipe guards were upgraded to the dual
+  predicate, which also fixed a latent bug where `return 1` on the first hit
+  skipped the remaining files, and `cmake-git` gained the guard it never had.
+- **Validation**: `tests/pgo-payload-guard.sh` pins the gate end-to-end in a
+  synthetic workspace (four payloads, stub `pacman`/`sudo`); red tests prove
+  the gate, the archive scope and the strict predicate are each load-bearing.
+  `tests/pgo-transition.sh` now exercises both detectors at the recipe seam,
+  asserts repo-wide that no call site discards the check result, and uses leak
+  paths that avoid `.Heavyweight`, which `--audit` correctly reported as
+  legacy-layout drift.
+- **Measurements that changed the design** (each replaced a written
+  assumption): `.BUILDINFO` contains no `.gcda` — it records
+  `-fprofile-generate` in `buildenv`, which a path predicate ignores — so the
+  "whole-archive scanning trips over metadata" rationale was simply wrong, and
+  whole-archive scanning turned out to be the more complete choice. Scanning
+  every file owned by every PGO recipe costs ~13 s for 14 559 files, which
+  `--audit` can afford. `ctest` carries **482** baked paths, not 481, because
+  the first sweep had been restricted to `/usr/bin`, `/usr/lib` and
+  `/usr/lib32` while the recipe path is `packages/git/xorg-xwayland-git`.
+- **Rule**: a whole-set invariant belongs in the builder, not in a per-recipe
+  convention — if two commits can each fix "part of it", the next recipe will
+  miss it. A check that cannot fail its caller is worse than no check, because
+  it reports success: a `verify_*` call inside `package()` needs `|| return 1`
+  (or must be the function's last command), since bash discards the status of
+  every earlier command. Verify PGO payloads with `strings`; add `readelf` only
+  where the files are still unstripped. And a check that guards a write into
+  `/usr` must never report clean because it in fact scanned nothing.
+
 ## 2026-09-19 — two orphan trees under `~/Projects` were instrumented binaries, and the IgnorePkg closure had drifted
 
 - **Symptom**: `~/Projects/.Heavyweight/cmake-git/src/cmake/` and

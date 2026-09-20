@@ -169,31 +169,82 @@ initramfs input; the guarded hook is the intended compatibility boundary.
 
 ### PGO libraries recreating old build paths
 
-Some recipes use a temporary GCC profile-generation build for training. The
-final package must not contain that instrumentation. If an older
-`glib2-git` or `cairo-git` install recreates `src/build` after cleanup, replace
-the packages before removing the residual tree:
+Some recipes use a temporary profile-generation build for training. The final
+package must not contain that instrumentation. If an older `glib2-git` or
+`cairo-git` install recreates `src/build` after cleanup, replace the packages
+before removing the residual tree:
 
 ```sh
 fish build-all.fish --no-deps --install glib2-git
 fish build-all.fish --no-deps --install cairo-git
 readelf -sW /usr/lib/libglib-2.0.so.0 | grep -E '__gcov_|__llvm_profile'
-readelf -sW /usr/lib/libcairo.so.2 | grep -E '__gcov_|__llvm_profile'
+strings -a /usr/lib/libglib-2.0.so.0 | grep -cE '/[^[:space:]]*\.gcda'
 ```
 
-Both symbol checks must produce no output. Restart applications that were
-running against the old libraries, then remove only the now-inactive residual
-build trees. Do not treat GLib warnings from a portal or sandboxed
-application as evidence of a builder process; correlate them with the
-installed library symbols and profile-file paths first.
+Both checks must produce no output and a count of `0`. **`readelf` alone is a
+false negative**: makepkg strips before writing the archive, so the profile
+runtime's symbol entries are gone while the absolute `.gcda` destinations
+baked in at compile time survive in `.rodata`. Measured on the 2026-09-19
+recurrence, `readelf -sW /usr/bin/Xwayland` reported clean (883 symbol
+entries, no match) while `strings -a` found all 348 paths.
+
+Restart applications that were running against the old libraries, then remove
+only the now-inactive residual build trees. Do not treat GLib warnings from a
+portal or sandboxed application as evidence of a builder process; correlate
+them with the installed library symbols and profile-file paths first.
 
 The same verification applies to `gtk3-git`, `gtk4-git`, and
 `xorg-xwayland-git`. If a GUI application reports an undefined `__gcov_*`
 symbol, replace the affected custom package with the fixed rebuild before
 rebuilding dependents; repository packages are a temporary recovery path, not
-the underlying fix. All five libraries are verified clean on the maintained
-host: `readelf -sW <lib> | grep -cE '__gcov_|__llvm_profile'` returns 0 for
-libglib-2.0, libcairo, libgtk-3, libgtk-4 and libxwayland.
+the underlying fix.
+
+#### The two verification seams
+
+A payload check runs at one of two places, and the two cannot use the same
+predicate:
+
+| Seam | Where | Predicate |
+| --- | --- | --- |
+| Recipe | `package()`, against the staged `$pkgdir` tree, before makepkg strips | `readelf` **and** `strings` |
+| Builder | `install_pkgs_now()` / `install_all()`, against the finished `.pkg.tar.zst` | `strings` only |
+
+A recipe-level check must be able to **fail the build**. Called mid-`package()`
+without `|| return 1`, it cannot: bash returns the status of the function's
+last command, so the check prints its error, exits 0, and makepkg packages the
+instrumented payload anyway. Four recipes were in exactly that state until
+2026-09-20. Write `verify_no_profile_instrumentation "$pkgdir" || return 1`, or
+place the call last; `tests/pgo-transition.sh` enforces it repo-wide.
+
+Both are deliberate. The recipe seam sees unstripped files, which is the only
+place `readelf -sW` is meaningful. The builder seam is the durable one: it
+covers every recipe rather than the handful that remember to call a guard, and
+it runs immediately before files are added to `/usr`, so the check is worth
+its cost. `verify_pgo_payload()` in `build-all.fish` implements it and is
+gated on the sibling `PKGBUILD` containing `-fprofile-generate`, so
+non-PGO recipes are untouched.
+
+The builder seam extracts and scans the **whole archive**, not a
+`usr/bin`+`usr/lib` subtree. Subtree scoping embeds an assumption about where
+a recipe installs files, and it is wrong for a leak under `usr/libexec` (the
+fixture's `deep-bad` payload demonstrates the miss). Whole-archive scanning is
+precise as well as complete: archive metadata (`.PKGINFO`, `.BUILDINFO`,
+`.MTREE`), prose documentation quoting a `.gcda` path, and source comments
+quoting one all pass, because the predicate matches a standalone
+`file: /path/to/x.gcda` string rather than any mention of `.gcda`.
+`.BUILDINFO` is not a trap in either direction — it records
+`-fprofile-generate` in `buildenv` but contains no `.gcda` string at all.
+
+The scan **fails closed**. `tar` with member names that match nothing exits
+non-zero and extracts nothing, which would make the scan pass vacuously; the
+check therefore treats a non-zero `tar` status or an empty extraction as a
+hard failure rather than a clean result.
+
+Replacing the packages is only half the fix — stale installs keep leaking
+until they are rebuilt. `build-all.fish --audit` reports every installed file
+owned by a PGO recipe that still carries a baked `.gcda` path, and names the
+PGO recipes that are not installed at all, so a recurrence is visible without
+re-deriving the sweep.
 
 During a Meson PGO transition, the final reconfigure must replace both
 compiler and linker argument caches (`c_args`, `cpp_args`, `c_link_args`, and

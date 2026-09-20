@@ -107,7 +107,7 @@ if [[ "$*" == *meson-private/sanity_check_for_c.exe* ]]; then
     exit 0
 fi
 
-if [[ "$*" == *instrumented/* ]]; then
+if [[ "$*" == *instrumented-symbols/* ]]; then
     printf '0000000000000000 g    DF .text  0000000000000000 __gcov_init\n'
     exit 0
 fi
@@ -132,13 +132,26 @@ source "$root/$recipe_path/PKGBUILD"
 build
 pkgdir="\$PWD/pkg"
 mkdir -p "\$pkgdir/usr/lib"
-: >"\$pkgdir/usr/lib/\$package_id.so"
+# A clean payload may still *mention* a .gcda path in shipped text: the
+# predicate matches a standalone absolute path, so prose must not fail it.
+printf 'coverage notes: rebuild /tmp/x/src/A.dir/b.cxx.gcda\n' \
+    >"\$pkgdir/usr/lib/\$package_id.so"
 verify_no_profile_instrumentation "\$pkgdir"
 
-mkdir -p "\$PWD/instrumented"
-: >"\$PWD/instrumented/\$package_id.so"
-if verify_no_profile_instrumentation "\$PWD/instrumented" 2>/dev/null; then
-    printf 'instrumented package fixture unexpectedly passed\n' >&2
+# Two shapes of leak, so both detectors stay load-bearing:
+#  - symbols: what readelf finds, and only before makepkg strips
+#  - paths:   what survives stripping, so only the .gcda predicate sees it
+mkdir -p "\$PWD/instrumented-symbols" "\$PWD/instrumented-paths"
+: >"\$PWD/instrumented-symbols/\$package_id.so"
+printf 'code\0/home/someone/build/pgo-fixture/%s/src/A.dir/b.cxx.gcda\0code\n' \
+    "\$package_id" >"\$PWD/instrumented-paths/\$package_id.so"
+
+if verify_no_profile_instrumentation "\$PWD/instrumented-symbols" 2>/dev/null; then
+    printf 'instrumented package fixture unexpectedly passed (coverage symbols)\n' >&2
+    exit 1
+fi
+if verify_no_profile_instrumentation "\$PWD/instrumented-paths" 2>/dev/null; then
+    printf 'instrumented package fixture unexpectedly passed (.gcda paths)\n' >&2
     exit 1
 fi
 EOF
@@ -149,5 +162,40 @@ CFLAGS='-O3' \
 CXXFLAGS='-O3' \
 LDFLAGS='' \
 "$fixture/run-build.sh"
+
+# Repo-wide: a recipe-level check that cannot fail the build is decorative.
+# bash returns the status of the LAST command in a function, so a call placed
+# mid-`package()` without `|| return 1` is discarded and makepkg packages the
+# instrumented payload anyway — the check prints its ERROR and exits 0. That is
+# how four recipes carried a "guard" that never guarded anything.
+call_site_failures=0
+while IFS= read -r recipe; do
+    mapfile -t lines <"$recipe"
+    for i in "${!lines[@]}"; do
+        line=${lines[$i]}
+        # The definition is `verify_...() {`; only calls have a space after the
+        # name, so this cannot mistake one for the other.
+        [[ $line =~ ^[[:space:]]*verify_no_profile_instrumentation[[:space:]] ]] || continue
+        [[ $line == *'|| return 1'* ]] && continue
+        j=$((i + 1))
+        while :; do
+            next=${lines[$j]:-}
+            next=${next#"${next%%[![:space:]]*}"}
+            if [[ -z $next || $next == \#* ]]; then
+                j=$((j + 1))
+                continue
+            fi
+            break
+        done
+        if [[ $next != '}' ]]; then
+            printf 'pgo-transition: %s:%s discards the check result — add `|| return 1` or make it the last command\n' \
+                "${recipe#"$root"/}" "$((i + 1))" >&2
+            call_site_failures=1
+        fi
+    done
+done < <(grep -rl 'verify_no_profile_instrumentation()' "$root"/packages/*/*/PKGBUILD)
+if ((call_site_failures != 0)); then
+    exit 1
+fi
 
 printf 'PGO transition fixture (%s): PASS\n' "$package_id"

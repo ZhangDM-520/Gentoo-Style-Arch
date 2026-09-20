@@ -733,6 +733,11 @@ function install_all
     if not require_command flock; or not require_command pacman
         return 1
     end
+    # -ia returns before run_lanes, so check_runtime_prereqs never runs for it.
+    # verify_pgo_payload needs both: tar unrolls the archive, strings reads it.
+    if not require_command tar; or not require_command strings
+        return 1
+    end
     if test "$_ROOT_MODE" != "1"; and not require_command sudo
         return 1
     end
@@ -752,6 +757,11 @@ function install_all
         return 1
     end
     set -l install_log "$LOG_DIR/install-all.log"
+    # Single-transaction escape hatch: the payload check still has to hold —
+    # this path never passes through install_pkgs_now.
+    if not verify_pgo_payload $pkgs
+        return 1
+    end
     if test "$_ROOT_MODE" = "1"
         run_pacman_locked "$install_log" pacman -U --noconfirm --ask 4 $argv $pkgs
     else
@@ -762,6 +772,92 @@ function install_all
         ui_error "Install failed (rc=$irc)"
         return 1
     end
+end
+
+# ─── PGO payload verification ────────────────────────────────────────────────
+# An installed PGO *phase-1* binary bakes absolute `.gcda` destinations into
+# `.rodata`, and libgcov recreates that entire tree on every invocation — the
+# 2026-09-20 incident: `cmake`, `ccmake`, `cpack`, `ctest` and `Xwayland`
+# rebuilt .Heavyweight/cmake-git and xorg-xwayland-git in full (779 files) from
+# one command each. The damage lands only once such a package is INSTALLED, so
+# this gates the install: an instrumented archive that never reaches pacman is
+# inert.
+#
+# makepkg strips the payload before it writes the archive (no PGO recipe sets
+# `!strip`), so the symbol test the recipes run inside `package()` —
+# `readelf -sW | grep -E '__gcov_|__llvm_profile'` — is blind here: it returns
+# clean on a stripped binary that still carries 431 baked paths. The path string
+# is what survives stripping, so that is what this looks for.
+#
+# The whole archive is inspected, with no member filter: instrumentation can
+# live in a helper under usr/libexec or opt just as well as in usr/bin, and
+# scoping to the obvious two directories would miss exactly those. Precision
+# comes from the predicate instead — it matches a *standalone* absolute path, so
+# valid metadata (.BUILDINFO, .PKGINFO record no `.gcda` at all), prose docs,
+# and a source comment quoting a path all pass while a real baked destination
+# does not. Gating on the recipe keeps the extract cost on the few recipes that
+# can leak, and covers a recipe that *starts* instrumenting with no further edit
+# here.
+#
+# The char class after the leading slash excludes `/` and `*` for that reason:
+# a glob literal is not a standalone path, and `ctest` (CMake's coverage tool)
+# legitimately ships `/*.gcda` in its own GCOV support. Without the exclusion a
+# correctly rebuilt cmake-git is refused at install, which is how the 2026-09-20
+# rebuild of cmake-git failed *after* its payload came out clean.
+#
+# Returns 0 for every archive that is clean or not applicable, 1 after naming
+# the offending members. Callers abort: an instrumented payload must never be
+# installed, and under `-i` every later package would compile against it.
+function verify_pgo_payload
+    set -l failed 0
+    for archive in $argv
+        set -l recipe_dir (dirname -- "$archive")
+        if not grep -q -- '-fprofile-generate' "$recipe_dir/PKGBUILD" 2>/dev/null
+            continue
+        end
+        set -l tmp_root "$TMPDIR"
+        if test -z "$tmp_root"
+            set tmp_root /tmp
+        end
+        set -l work (mktemp -d "$tmp_root/gsa-pgo-verify.XXXXXX" 2>/dev/null)
+        if test -z "$work"
+            ui_error "cannot create a temp dir to verify "(basename "$archive")
+            return 1
+        end
+        # GNU tar restores the whole archive — nothing is filtered out. A
+        # non-zero status, or an archive that yields no files at all, means the
+        # payload could not be read; an unverified PGO payload is exactly what
+        # this exists to prevent, so that fails closed instead of passing by
+        # default.
+        tar --zstd -xf "$archive" -C "$work" 2>/dev/null
+        set -l tar_rc $status
+        set -l extracted (count (find "$work" -type f 2>/dev/null))
+        if test "$tar_rc" -ne 0; or test "$extracted" -eq 0
+            rm -rf -- "$work"
+            ui_error "refusing to install "(basename "$archive")": its payload could not be read (tar rc=$tar_rc, $extracted files), so PGO instrumentation cannot be ruled out"
+            set failed 1
+            continue
+        end
+        # `strings -f` prefixes every line with its file, so one invocation
+        # covers the whole payload and still names the offender. The scan runs
+        # from inside $work, so the reported paths are relative to the archive.
+        set -l hits (cd "$work"; and find . -type f -exec strings -a -f {} + 2>/dev/null \
+            | grep -E '^[^:]+: /[^[:space:]/*][^[:space:]]*\.gcda' \
+            | cut -d: -f1 | sort -u)
+        rm -rf -- "$work"
+        if test (count $hits) -gt 0
+            for hit in $hits
+                ui_error (basename "$archive")": profile-instrumented payload — "$hit
+            end
+            ui_error "refusing to install "(basename "$archive")": a phase-1 PGO binary is packaged, so libgcov would recreate its build tree on every run"
+            ui_error "rebuild the recipe so phase 2 really replaces the profiled flags (docs/build-guide.md: PGO)"
+            set failed 1
+        end
+    end
+    if test "$failed" = "1"
+        return 1
+    end
+    return 0
 end
 
 function run_pacman_locked -a log_file
@@ -974,8 +1070,10 @@ end
 # Read-only inventory of migration drift. Historical NOTE.md entries and large
 # source/build trees are reported separately from active control-file findings.
 function audit_workspace
-    if not require_command rg
-        return 1
+    # `strings`/`xargs` back the installed-PGO-payload scan; without them that
+    # section would report a clean result it never actually measured.
+    for tool in rg strings xargs mktemp
+        require_command $tool; or return 1
     end
 
     ui_heading "Workspace legacy audit"
@@ -1080,6 +1178,65 @@ function audit_workspace
             echo "  $path"
         end
     end
+
+    echo ""
+    echo "Installed PGO payloads:"
+    # An installed binary that still carries -fprofile-generate is the one
+    # PGO defect the recipe-level check cannot see: it fails only on machines
+    # that do not have the instrumenting build's directory tree.  The builder
+    # refuses such an archive at install time (verify_pgo_payload), but an
+    # install made *before* that gate existed stays broken until rebuilt, so
+    # the audit reports it.  Every file is scanned rather than the obvious
+    # usr/bin+usr/lib pair, because scoping to those embeds an assumption
+    # about where a recipe installs its binaries.  Archive metadata is not a
+    # false-positive source here: the predicate matches a `.gcda` path, not
+    # the `-fprofile-generate` flag that `.BUILDINFO` happens to record.
+    set -l pgo_names
+    for entry in $_PACKAGE_MAP
+        set -l fields (string split '|' -- "$entry")
+        set -l recipe "$SCRIPT_DIR/$fields[2]"
+        grep -q -- '-fprofile-generate' "$recipe/PKGBUILD" 2>/dev/null; or continue
+        # Names come from .SRCINFO, never PKGBUILD: the kernel assigns pkgbase
+        # in a variable, so PKGBUILD scraping would misreport it as absent.
+        for name in (sed -n 's/^pkgname = //p' "$recipe/.SRCINFO" 2>/dev/null)
+            set -a pgo_names "$name"
+        end
+    end
+    if test (count $pgo_names) -gt 0
+        set pgo_names (printf '%s\n' $pgo_names | awk '!seen[$0]++')
+    end
+    set -l pgo_list (mktemp 2>/dev/null)
+    set -l pgo_absent
+    if test -n "$pgo_list"
+        for name in $pgo_names
+            if not pacman -Qq -- "$name" >/dev/null 2>&1
+                set -a pgo_absent "$name"
+                continue
+            end
+            LANG=C pacman -Ql -- "$name" 2>/dev/null | awk '$2 !~ /\/$/ {print $2}'
+        end > $pgo_list
+    end
+    if test (count $pgo_absent) -gt 0
+        echo "  not installed (not inspected): "(string join ' ' $pgo_absent)
+    end
+    # Fail closed: a scan that read no files would otherwise report "none".
+    set -l pgo_files 0
+    test -n "$pgo_list"; and set pgo_files (count (cat $pgo_list))
+    if test -z "$pgo_list" -o "$pgo_files" -eq 0
+        echo "  unable to enumerate installed files — payload check skipped"
+    else
+        echo "  inspected $pgo_files files from "(count $pgo_names)" PGO recipes"
+        set -l pgo_hits (xargs -d'\n' -r -n 400 strings -a -f < $pgo_list 2>/dev/null \
+            | grep -E '^[^:]+: /[^[:space:]/*][^[:space:]]*\.gcda' | cut -d: -f1 | sort -u)
+        if test (count $pgo_hits) -eq 0
+            echo "  none carry baked .gcda paths"
+        else
+            for hit in $pgo_hits
+                echo "  $hit"
+            end
+        end
+    end
+    test -n "$pgo_list"; and rm -f $pgo_list
 
     echo ""
     echo "Historical references in docs/NOTE.md are not treated as active"
@@ -1362,6 +1519,11 @@ function install_pkgs_now -a log_file
     set -l pkgs $argv[2..-1]
     if test (count $pkgs) -eq 0
         return 0
+    end
+    # Never install a PGO phase-1 payload: libgcov would recreate its build tree
+    # on every run, and under -i every later package would build against it.
+    if not verify_pgo_payload $pkgs
+        return 1
     end
     set -l irc 1
     # Install: root mode runs pacman directly (no timestamp to expire);
@@ -1869,6 +2031,8 @@ function check_runtime_prereqs -a install_flag needs_stable_sync
     end
     if test "$install_flag" = "1"
         set -a required flock pacman
+        # verify_pgo_payload unrolls the archive to inspect its payload.
+        set -a required tar strings
         if test "$_ROOT_MODE" != "1"
             set -a required sudo
         end
@@ -2772,8 +2936,9 @@ function usage
     echo "  -cc, --cleanup    Remove ALL built package archives (*.pkg.tar.zst)"
     echo "  -ccc, --nuclear   Remove pulled sources: src/pkg/build dirs, source git"
     echo "                    clones, and downloaded source tarballs (asks first)"
-    echo "  --audit           Read-only report of legacy paths, package drift, and"
-    echo "                    stale runtime/error artifacts"
+    echo "  --audit           Read-only report of legacy paths, package drift,"
+    echo "                    stale runtime/error artifacts, and installed PGO"
+    echo "                    packages still carrying -fprofile-generate payloads"
     echo "  -ln, --link-sources"
     echo "                    Dedup git source clones: symlink twins to one"
     echo "                    canonical mirror; repair origin/refspec; asks first"
