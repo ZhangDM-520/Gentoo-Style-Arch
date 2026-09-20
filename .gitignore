@@ -19,6 +19,15 @@ packages/*/*/*/
 *.src.tar.*
 *.tar
 *.tar.*
+# Upstream archive types "*.tar.*" does not reach. makepkg's SRCDEST is the
+# recipe directory, so a download lands beside the PKGBUILD and must never be
+# committed. A file a recipe needs *locally* is still protected:
+# tests/recipe-sources.sh fails when a non-URL source=() entry exists on disk
+# but is not committed, so a missing negation here is caught, not silent.
+*.tgz
+*.zip
+*.jar
+*.ttf
 *.part
 *.sig
 *.asc
