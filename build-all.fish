@@ -587,6 +587,28 @@ function expand_deps
     printf '%s\n' $result
 end
 
+# Read one PKGBUILD assignment as a VALUE, not as text.
+#
+# The shape used here until 2026-09-20 — `grep -m1 '^pkgver=' | cut -d= -f2 |
+# string trim -c "'"` — keeps any trailing comment (`pkgver=1.0.0 # bump` is
+# legal PKGBUILD syntax) and keeps double quotes. Downstream the value then
+# merely stops matching, which is silent: list_split_pkgs found no archive and
+# install_pkgs_now called the empty list a success, so `-i` printed "All builds
+# succeeded!" without pacman ever running. Version *comparisons* are the other
+# half — a trailing comment made cur_pkgver differ from the repo version on
+# every run, so an already-current stable recipe was rewritten each time, and
+# the garbage operand reached vercmp, which the never-downgrade guard rests on.
+# tests/install-archive-guard.sh pins the install half.
+#
+# Only an unquoted '#' starts a comment (`x=1#2` is a single word in bash), so
+# the strip requires whitespace first. Every stage is fed by the pipeline
+# above it — none of them may fall back to reading stdin, which in an
+# interactive run is the terminal. A variable that is absent prints nothing,
+# so `test -n` is false exactly as it was with the old pipeline.
+function pkgbuild_var -a pkg_path var
+    grep -m1 "^$var=" "$pkg_path/PKGBUILD" 2>/dev/null | string replace -r '^[^=]*=' '' | string replace -r '[[:space:]]+#.*$' '' | string trim -c "\"'"
+end
+
 # ─── Sync stable package version with Arch repos ─────────────────────────────
 function sync_stable_version -a pkg_path
     # Only applies to recipes physically staged under packages/stable.
@@ -600,7 +622,7 @@ function sync_stable_version -a pkg_path
         return 0
     end
 
-    set -l pkgbase (grep -m1 '^pkgbase=' "$pkg_path/PKGBUILD" | cut -d= -f2 | string trim -c "'" | string trim)
+    set -l pkgbase (pkgbuild_var "$pkg_path" pkgbase)
     if test -z "$pkgbase"
         set pkgbase (basename "$pkg_path")
     end
@@ -646,8 +668,8 @@ function sync_stable_version -a pkg_path
     end
 
     # Read current version
-    set -l cur_pkgver (grep -m1 '^pkgver=' "$pkg_path/PKGBUILD" | cut -d= -f2 | string trim -c "'")
-    set -l cur_pkgrel (grep -m1 '^pkgrel=' "$pkg_path/PKGBUILD" | cut -d= -f2 | string trim -c "'")
+    set -l cur_pkgver (pkgbuild_var "$pkg_path" pkgver)
+    set -l cur_pkgrel (pkgbuild_var "$pkg_path" pkgrel)
 
     # Never downgrade the content version — repos can game vercmp with an epoch
     # (e.g. repo "1:7.1-1" vs local "7.2-1": 7.2 content is newer, keep it)
@@ -699,8 +721,8 @@ end
 # "ls -t | head -1" would install only one split. Filter by current
 # pkgver-pkgrel so stale packages from previous builds are never installed.
 function list_split_pkgs -a pkg_path
-    set -l pv (grep -m1 '^pkgver=' "$pkg_path/PKGBUILD" | cut -d= -f2 | string trim -c "'")
-    set -l pr (grep -m1 '^pkgrel=' "$pkg_path/PKGBUILD" | cut -d= -f2 | string trim -c "'")
+    set -l pv (pkgbuild_var "$pkg_path" pkgver)
+    set -l pr (pkgbuild_var "$pkg_path" pkgrel)
     # find (not fish globs): an unmatched glob is a FATAL error in fish, and
     # 2>/dev/null does not suppress it. find -name returns 0 with no matches.
     if test -n "$pv" -a -n "$pr"
@@ -1517,8 +1539,20 @@ function install_pkgs_now -a log_file
     # log_file: the package's build log — install output is appended there so
     # quiet (lane) mode keeps install forensics in the per-package log.
     set -l pkgs $argv[2..-1]
+    # An empty list is NOT success. It means discovery found no archive for the
+    # current pkgver-pkgrel, and returning 0 here is what let `-i` print "All
+    # builds succeeded!" without pacman ever running (2026-09-20: a trailing
+    # comment on pkgver= made list_split_pkgs return nothing). Installing
+    # nothing also leaves the system on the old version while later packages
+    # compile against it — precisely the failure the -i ordering exists to
+    # prevent. tests/install-archive-guard.sh pins both halves.
     if test (count $pkgs) -eq 0
-        return 0
+        if test "$_BUILD_QUIET" = "1"
+            printf '%s Install requested but no built package archive matched the current pkgver-pkgrel — refusing to report success\n' "$_UI_ICON_ERROR" >>"$log_file"
+        else
+            ui_error "install requested but no built package archive was found for the current pkgver-pkgrel"
+        end
+        return 1
     end
     # Never install a PGO phase-1 payload: libgcov would recreate its build tree
     # on every run, and under -i every later package would build against it.
