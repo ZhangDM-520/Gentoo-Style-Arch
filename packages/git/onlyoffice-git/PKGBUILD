@@ -192,18 +192,39 @@ _set_flags() {
     export CMAKE_POLICY_VERSION_MINIMUM=3.5
 }
 
+# makepkg does not abort on a failed command *inside* prepare() either: the
+# function's status is its last command's, so a rejected hunk would go unnoticed
+# and surface later as an unexplainable compile error — or, worse, as a build of
+# the wrong sources. `-N` keeps patch non-interactive, so an already-applied
+# patch is a clean failure rather than a prompt that waits forever.
+_patch() {
+    patch "$@" || { error "patch failed to apply: $*"; exit 1; }
+}
+
 # DesktopEditors' own tags are vX.Y.Z only; the build number lives in the
-# modules. `core` carries it, and pinning by commit does not hide it: the pinned
-# commit is the tag's commit, so describe still reports v9.4.0.130.
+# modules, and `core` carries it. Do not use `git describe` here: upstream tags
+# one commit with several build numbers (the pinned core commit carries
+# v9.4.0.126, .127, .129 *and* .130), so describe returns an arbitrary one of
+# them and would report 9.4.0.126 for a .130 tree. Ask which build tags point
+# *at* HEAD and take the highest.
 pkgver() {
-    cd "$srcdir/core"
+    cd "$srcdir/core" || exit 1
     local _v
-    _v="$(git describe --tags --abbrev=0)"
+    _v="$(git tag --points-at HEAD 2>/dev/null |
+        grep -E "^v${_oo_release//./\\.}\.[0-9]+$" | sort -V | tail -n1)"
+    [[ -n "$_v" ]] || { error "no v${_oo_release}.<build> tag points at the pinned core commit"; exit 1; }
     printf '%s' "${_v#v}"
 }
 
 prepare() {
     _set_flags
+
+    # makepkg's `error` prints but does not abort, so every assertion below ends
+    # in `exit 1`; without it a stale pin sails on into a multi-hour build.
+    _assert_tag() {
+        git -C "$1" tag --points-at HEAD 2>/dev/null | grep -Fxq "$2" ||
+            { error "$(basename "$1") is not tagged $2"; exit 1; }
+    }
 
     # Every module is its own source because makepkg 7.1 has no submodule
     # support, and build_tools addresses them as bare sibling directories
@@ -213,24 +234,27 @@ prepare() {
     for _module in core desktop-apps desktop-sdk sdkjs sdkjs-forms web-apps \
                    dictionaries build_tools core-fonts document-templates \
                    DesktopEditors depot_tools v8 icu; do
-        [[ -d "$srcdir/$_module" ]] || error "source $_module is missing from \$srcdir"
+        [[ -d "$srcdir/$_module" ]] ||
+            { error "source $_module is missing from \$srcdir"; exit 1; }
     done
 
     # The pins and the two version namespaces must agree with each other. This is
     # the assertion that makes the version trustworthy: `v9.4.0` exists in
     # DesktopEditors only, so a module pin that used the release name instead of
     # the build name would silently try to check out a ref that does not exist.
-    [[ "${_oo_build}" != "${_oo_release}" ]] || error 'build and release namespaces collapsed into one'
-    ( cd "$srcdir/core" && git describe --tags --abbrev=0 ) | grep -Fxq "v${_oo_build}" ||
-        error "core does not describe to v${_oo_build}"
-    ( cd "$srcdir/DesktopEditors" && git describe --tags --abbrev=0 ) | grep -Fxq "v${_oo_release}" ||
-        error "DesktopEditors does not describe to v${_oo_release}"
+    # Test tag *membership* of HEAD, never `git describe`: upstream tags one
+    # commit with several build numbers (the pinned core commit carries
+    # v9.4.0.126, .127, .129 and .130), so describe reports whichever it likes
+    # and its answer says nothing about which build this tree actually is.
+    [[ "${_oo_build}" != "${_oo_release}" ]] ||
+        { error 'build and release namespaces collapsed into one'; exit 1; }
+    _assert_tag "$srcdir/core" "v${_oo_build}"
+    _assert_tag "$srcdir/DesktopEditors" "v${_oo_release}"
     ( cd "$srcdir/v8" && git rev-parse HEAD ) | grep -Fxq "${_v8_commit}" ||
-        error "v8 is not at the pinned commit for ${_v8_tag}"
+        { error "v8 is not at the pinned commit for ${_v8_tag}"; exit 1; }
     for _module in desktop-apps desktop-sdk sdkjs sdkjs-forms web-apps \
                    dictionaries build_tools core-fonts document-templates; do
-        ( cd "$srcdir/$_module" && git describe --tags --abbrev=0 ) | grep -Fxq "v${_oo_build}" ||
-            error "$_module does not describe to v${_oo_build}"
+        _assert_tag "$srcdir/$_module" "v${_oo_build}"
     done
 
     cp -r "$srcdir/icu/icu4c" "$srcdir/core/Common/3dParty/icu/icu"
@@ -249,21 +273,21 @@ prepare() {
     ln -s /usr/lib/qt/plugins ./system_qt/gcc_64/plugins
 
     cd "$srcdir/build_tools"
-    patch -Np1 -i ../0001-Fix-boost-module-import.patch
-    patch -Np1 -i ../0001-Add-update-only-to-avoid-download-and-build-at-once.patch
-    patch -Np1 -i ../0002-Add-no-third-party-update-and-update-third-party-onl.patch
+    _patch -Np1 -i ../0001-Fix-boost-module-import.patch
+    _patch -Np1 -i ../0001-Add-update-only-to-avoid-download-and-build-at-once.patch
+    _patch -Np1 -i ../0002-Add-no-third-party-update-and-update-third-party-onl.patch
     # Do not let the build update the sources we pinned ourselves
-    patch -Np1 -i ../no-git-update.diff
+    _patch -Np1 -i ../no-git-update.diff
     # Read the Qt version from the environment instead of guessing it from a path
-    patch -Np1 -i ../0003-use-QT_VERSION-env-instead-of-guessing.patch
+    _patch -Np1 -i ../0003-use-QT_VERSION-env-instead-of-guessing.patch
     # Build only the tar target; the deb/rpm routes are dead weight here
-    patch -Np1 -i ../0004-Only-build-tar.patch
+    _patch -Np1 -i ../0004-Only-build-tar.patch
     # Link the bundled ICU against the system libstdc++ instead of a static one
-    patch -Np1 -i ../0001-Dynamically-link-libstdc-in-icu.patch
-    patch -Np0 -i ../do-not-build-commercial.diff
+    _patch -Np1 -i ../0001-Dynamically-link-libstdc-in-icu.patch
+    _patch -Np0 -i ../do-not-build-commercial.diff
     # libstdc++ dropped support for what the bundled V8 expects, so make it build
     # against a sysroot (upstream sets use_sysroot=false on linux)
-    patch -Np1 -i ../Ancient-V8-Use-Sysroot.diff
+    _patch -Np1 -i ../Ancient-V8-Use-Sysroot.diff
 
     # --update 0: the sources are already here, do not fetch them
     ./configure.py --module desktop --update 0 --qt-dir "$(realpath tools/linux/system_qt)"
@@ -295,7 +319,7 @@ EOF
     # V8 must use the system libstdc++, not the one it builds for itself
     ln -sf /usr/lib/libstdc++.so.6 \
         v8/third_party/llvm-build/Release+Asserts/lib/libstdc++.so.6
-    patch -Np1 -d v8 < "$srcdir/v8-89-fix-cstdint.diff"
+    _patch -Np1 -d v8 < "$srcdir/v8-89-fix-cstdint.diff"
 
     # Convert the official CEF distribution into the layout ONLYOFFICE expects
     # (Release/ and Resources/ side by side), then repack it as cef_binary.7z.
@@ -309,15 +333,15 @@ EOF
     # These only apply once the third-party update has unpacked the trees they
     # touch, which is why they are here and not above.
     cd "$srcdir"
-    patch -Np0 -i system-heif.diff
-    patch -Np0 -i fix-limits-include-1.diff
-    patch -Np0 -i fix-QDesktopWidget-include.diff
-    patch -Np0 -i system-heif-0.diff
-    patch -Np1 -d core < 0001-Disable-static-linking-of-libstdc.patch
-    patch -Np1 -d core < use-fpermissive.diff
+    _patch -Np0 -i system-heif.diff
+    _patch -Np0 -i fix-limits-include-1.diff
+    _patch -Np0 -i fix-QDesktopWidget-include.diff
+    _patch -Np0 -i system-heif-0.diff
+    _patch -Np1 -d core < 0001-Disable-static-linking-of-libstdc.patch
+    _patch -Np1 -d core < use-fpermissive.diff
     dos2unix core/Common/OfficeFileFormatChecker2.cpp
-    patch -Np0 -d core < fix-limits-include.diff
-    patch -Np1 -d desktop-apps < fix-glib-qt-macro-collision.diff
+    _patch -Np0 -d core < fix-limits-include.diff
+    _patch -Np1 -d desktop-apps < fix-glib-qt-macro-collision.diff
     # `#pragma region`/`endregion` breaks an if-else-if chain here
     sed -Ei '/pragma (end)?region/d' \
         core/MsBinaryFile/XlsFile/Format/Logic/Biff_structures/StringPtgParser.cpp
@@ -385,9 +409,8 @@ package() {
         patchelf --remove-needed libcef.so "$_desktopeditors"
     fi
     patchelf --add-needed libcef.so "$_desktopeditors"
-    if [[ "$(patchelf --print-needed "$_desktopeditors" | head -n1)" != libcef.so ]]; then
-        error 'failed to place libcef.so first in the DesktopEditors DT_NEEDED entries'
-    fi
+    [[ "$(patchelf --print-needed "$_desktopeditors" | head -n1)" == libcef.so ]] ||
+        { error 'failed to place libcef.so first in the DesktopEditors DT_NEEDED entries'; exit 1; }
 
     # We deliberately link the system Qt5 and ICU; shipping the bundled copies as
     # well would put a second Qt in the tree and diverge from the workspace stack.

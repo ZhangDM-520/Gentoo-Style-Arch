@@ -38,10 +38,23 @@ They are not interchangeable and mixing them is the classic mistake here:
   repositories and nowhere else.
 
 `pkgver()` reads `core`, not DesktopEditors, because only the modules carry the
-build number. Pinning `core` by commit does not defeat this: the pin is the
-tag's commit, so `git describe --tags --abbrev=0` still reports `v9.4.0.130`.
-`prepare()` asserts that every module describes to the same build tag, so a
-half-applied update fails before the build starts.
+build number. Pinning `core` by commit does not defeat this, but **`git
+describe` will lie to you here**: upstream tags one commit with several build
+numbers, and the pinned `core` commit carries `v9.4.0.126`, `.127`, `.129`
+*and* `.130`. `describe` returns whichever one it prefers — it reports
+`v9.4.0.126` for our `.130` tree — so neither `pkgver()` nor `prepare()` may use
+it. Both ask which tags point *at* HEAD instead
+(`git tag --points-at HEAD`); `pkgver()` takes the highest, and `prepare()`
+asserts that every module's HEAD carries the build tag we pinned it to. A
+half-applied update therefore fails before the build starts.
+
+When bumping, the same trap applies to your reading of upstream: `git tag
+--points-at <sha>` is authoritative, `git describe` is not, and a build tag
+several numbers *below* the newest can still be the newest one for a module.
+
+Note that makepkg's `error` only prints to stderr; it does not abort. Every
+assertion in `prepare()` therefore ends in `exit 1`, and adding one without
+that is adding a no-op.
 
 Ten sources, two origins
 ------------------------
@@ -88,6 +101,56 @@ This recipe pins the commit `_v8_commit`, which is the tip of
 `prepare()` asserts `v8` is at `_v8_commit`. Upstream's script deletes and
 re-clones V8 unless `v8.data` holds the version string it expects, which is why
 that sentinel file is written (`v8_version_1`).
+
+Two traps when touching the version logic
+-----------------------------------------
+
+Both cost a full build attempt; neither is obvious from the code.
+
+* **Do not use `git describe` to identify a build.** Upstream tags one commit
+  with several build numbers — the pinned `core` commit carries `v9.4.0.126`,
+  `.127`, `.129` *and* `.130`, and `web-apps` carries `.127/.129/.130/.131` —
+  so `git describe --tags --abbrev=0` returns whichever it prefers (`.126` for
+  `core`) and says nothing about which build the tree is. `pkgver()` and
+  `prepare()` therefore both ask which tags point **at** HEAD
+  (`git tag --points-at HEAD`); `pkgver()` takes the highest. The same rule
+  applies to a maintainer reading upstream: `git tag --points-at <sha>` is
+  authoritative, `git describe` is not, and a build number several steps below
+  the newest can still be the newest one *for that module*.
+* **makepkg's `error` does not abort.** It prints `==> ERROR:` to stderr and
+  returns; only `exit 1` ends the build. The assertions in `prepare()` once read
+  `git describe ... || error "..."`, so eight stale pins printed their complaint
+  and the build carried on regardless. Every assertion here ends in `exit 1`,
+  and `tests/onlyoffice-recipe.sh` enforces that for any future one added
+  (it accepts the deferred `_rc=1` … `return $_rc` form too). The same rule
+  covers patch application for the same reason — makepkg does not abort on a
+  failed command *inside* `prepare()` either, since a function's status is its
+  last command's, so all 18 patches go through `_patch`, which reports and exits.
+  A rejected hunk is therefore a stopped build, not a compile error twenty
+  minutes later.
+
+Network on the first build
+--------------------------
+
+`prepare()` is not offline, and neither is the V8 stage. Two separate fetches:
+
+* **`depot_tools` bootstraps through Google's CIPD service** —
+  `cipd_client ensure … bootstrap-2@3.11.8.chromium.35_bin`. It pulled ~840 MB
+  on 2026-09-20 and is what makes the first minutes of `prepare()` look idle.
+* **Upstream's V8 script then runs `gclient.py sync --force`**, which fetches
+  V8's entire `DEPS` set from `*.googlesource.com` with several parallel
+  connections — `chromium/src/build`, `deps/icu`, `tc39/test262`,
+  `google/protobuf`, `platform/external/perfetto`, `tools/depot_tools`, and more.
+  This is multi-GB, it is **not** covered by any checksum in this recipe, and it
+  is the real long pole before a single V8 file compiles.
+
+The `v8.data` sentinel stops upstream from re-cloning V8 itself; it does not stop
+the `DEPS` sync, and nothing here can pin that tree because upstream resolves it
+live. The practical consequences are that the first build needs working access to
+`googlesource.com` and to `chrome-infra-packages.appspot.com`, that the compiled
+V8 depends on third-party code the recipe does not record, and that a warm
+`v8_89` tree makes later builds dramatically faster. Everything the recipe *does*
+own — the 15 module sources and the CEF tarball — is a checksummed pin.
 
 Resource expectations
 ---------------------

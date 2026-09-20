@@ -10,6 +10,10 @@ fail() {
     exit 1
 }
 
+# The PKGBUILD's own commentary discusses `git describe` and makepkg's `error`,
+# so structural checks below must look at code only, never at comments.
+pkgcode=$(grep -v '^[[:space:]]*#' "$pkgbuild")
+
 # Local assets must be committed and must survive .gitignore. The root
 # .gitignore denies packages/*/*/*/ (every directory below a recipe), so a
 # future patch subdirectory would silently vanish from a clean checkout.
@@ -66,8 +70,14 @@ fi
 # own tags are vX.Y.Z only and carry no build number.
 grep -Fq 'cd "$srcdir/core"' "$pkgbuild" ||
     fail "pkgver() does not read the version from the core module"
-grep -Fq 'git describe --tags --abbrev=0' "$pkgbuild" ||
-    fail "pkgver() does not derive the version from the checked-out tree"
+# ...and it must ask which tags point at HEAD, never `git describe`: upstream
+# tags one commit with several build numbers (core's .130 commit also carries
+# .126/.127/.129), so describe answers arbitrarily and reported 9.4.0.126 here.
+[[ $pkgcode == *'git tag --points-at HEAD'* ]] ||
+    fail "pkgver() does not select the build tag by tag membership of HEAD"
+if [[ $pkgcode == *'git describe'* ]]; then
+    fail "git describe is unreliable here (multi-tagged commits); use tag --points-at"
+fi
 
 # --------------------------------------------------------------------- pins
 # A moving ref is not a pin. Every git source must name a commit or a tag, and
@@ -154,14 +164,14 @@ grep -Fq 'prefix = "v"' "$root/$recipe/.nvchecker.toml" ||
 # *not* appended is documentation, not an addition, and a comment cannot reach
 # the compiler.
 while IFS= read -r line; do
-    code=${line%%#*}                      # a trailing comment is not an addition
-    [[ $code == *'-O'* ]] || continue
-    [[ $code == *'${'*'-O'*'}'* ]] || fail "optimisation flag is added, not removed: $line"
+    stripped=${line%%#*}                  # a trailing comment is not an addition
+    [[ $stripped == *'-O'* ]] || continue
+    [[ $stripped == *'${'*'-O'*'}'* ]] || fail "optimisation flag is added, not removed: $line"
 done < <(grep -E -- '-O[0-9]' "$pkgbuild")
 
 while IFS= read -r line; do
-    code=${line%%#*}
-    [[ $code == *'-march='* || $code == *'-mtune='* ]] || continue
+    stripped=${line%%#*}
+    [[ $stripped == *'-march='* || $stripped == *'-mtune='* ]] || continue
     fail "hard-codes a host ISA flag: $line"
 done < "$pkgbuild"
 
@@ -192,8 +202,17 @@ has options '!lto' || fail "missing option: !lto"
 # ------------------------------------------------------- pin assertions exist
 # The recipe asserts its own pins so a half-applied update fails at prepare()
 # rather than producing a package whose version lies about its contents.
-grep -Fq 'does not describe to' "$pkgbuild" ||
-    fail "prepare() does not assert that the modules describe to the build tag"
+[[ $pkgcode == *'_assert_tag'* ]] ||
+    fail "prepare() does not assert that each module's HEAD carries the build tag"
+# makepkg's `error` only prints; it does not abort. An assertion without a
+# failure path is a no-op, which is exactly how eight wrong pins once reached a
+# build unnoticed. Each error call must either exit on the spot or set the
+# deferred-failure flag that the surrounding block returns (the idiom the PGO
+# recipes use: `_rc=1` ... `return $_rc`), so both are accepted here.
+while IFS= read -r line; do
+    [[ $line == *'error '* && $line != *'exit 1'* && $line != *'_rc=1'* ]] &&
+        fail "assertion calls error without a failure path (makepkg's error does not abort): $line"
+done <<<"$pkgcode"
 grep -Fq 'is not at the pinned commit' "$pkgbuild" ||
     fail "prepare() does not assert the V8 commit"
 grep -Fq 'v8.data' "$pkgbuild" ||
