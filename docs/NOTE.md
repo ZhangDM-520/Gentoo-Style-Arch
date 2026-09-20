@@ -32,6 +32,150 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-20 — `build-all.fish` audit: the harness was misreporting its own success
+
+- **Scope**: a full static read of `build-all.fish` (3561 lines, 73 functions)
+  against the documentation that describes it, plus the fixtures that were
+  supposed to pin it. Baseline `75bd2f6`. Fixture count 26 → 32. Repairs only:
+  no behaviour was redesigned, and no real build was run, so **every finding
+  here is proven by static reading or by a fixture, never by a completed
+  build**.
+- **Root cause, one family**: almost every defect was the builder making a
+  **claim about its own work that was not true**. Not a crash and not a wrong
+  build — a false report of success, of verification, or of coverage. That
+  shape is why they survived: a check that cannot fail its caller reports
+  success whether or not the thing it checks happened, and nothing downstream
+  contradicts it.
+
+Findings, in the order they were fixed:
+
+1. **`-i` reported success while pacman never ran** (`8a7a672`).
+   `list_split_pkgs` read `pkgver=` with `grep | cut | string trim -c "'"`,
+   which keeps a trailing PKGBUILD comment, so the split-archive pattern
+   matched nothing; `install_pkgs_now` then treated *no arguments* as success.
+   Reproduced end-to-end before touching anything: the run printed "All builds
+   succeeded!" and `pacman.log` stayed empty. Two defects hiding each other —
+   neither is visible alone. Fixed with `pkgbuild_var()`, which parses a *value*
+   rather than text (strips an unquoted trailing comment — `x=1#2` is one word
+   in bash, so the strip requires leading whitespace — and either quote style,
+   and whose every stage is fed by the pipeline above it so no stage can fall
+   back to reading stdin, which interactively is the terminal). Used for
+   pkgver/pkgrel/pkgbase in `list_split_pkgs` and `sync_stable_version`, where
+   the same defect bit from the other side: a trailing comment made an
+   already-current stable recipe differ from the repo version on **every** run,
+   so it was rewritten each time and a garbage operand reached `vercmp`, the
+   comparison the never-downgrade guard rests on. `install_pkgs_now` now fails
+   loudly on an empty list.
+2. **Invalid project config named nothing** (`ed2d444`). `load_project_config`
+   returned 1 silently from six places, and the caller can only say "project
+   configuration is invalid under <dir>" — so a malformed record, an unknown
+   package or dependency, an ungrouped package, or a missing file all left the
+   user bisecting their own config by hand. Each path now names the offender.
+   The numeric/parallelism defaults also named the internal variable
+   (`_MEMORY_PER_JOB_GIB`) instead of the key the user actually wrote
+   (`memory_per_job_gib`).
+3. **The resume command did not resume what was run** (`434940e`). The failure
+   summary's resume line carried only `--lanes/--jobs/--intensity`, so resuming
+   a run made with `-i` rebuilt the remaining packages **without installing
+   them** — the rule-11 ABI hazard `-i` exists to prevent — while the tip
+   printed directly beneath it said "add -s so already-built pkgs are skipped".
+   It now mirrors `--install`, `--no-deps`, `--no-sync` and
+   `--allow-broken-rustc`, and invents nothing that was not passed.
+   `read_group_config` rejected a bad entry with a bare `return 1`, so the only
+   message was "invalid package group: git" beside a 56-line list — and a
+   *missing* file was reported as *invalid*. It now names file and line (bad
+   character, unknown package, duplicate), and says "missing" when that is what
+   happened.
+4. **The interactive dashboard had no coverage at all** (`4c818ab`). ~200 lines
+   of terminal control; `_OUTPUT_INTERACTIVE` is gated on `test -t 1` and every
+   other fixture pipes the builder, so nothing had ever executed it.
+   `tests/dashboard.sh` drives the real thing under a pty (`script -qec` with a
+   controlled `stty cols`), and measures rendered rows with the same
+   `string length --visible` production uses, so escapes and multibyte icons
+   count the way the builder counts them. Also de-duplicated the log path
+   (finding 8 below).
+5. **An invariant three documents state had no fixture** (`e64a3ff`). "Core
+   runs solo" is asserted in README, docs/architecture.md and MEMORY.md;
+   `tests/scheduler-intensity.sh` pinned only the printed plan numbers, so
+   `GSA_CPU_THREADS`/`GSA_MEMORY_GIB` covered the formula, not the behaviour.
+   New `tests/scheduler-core-solo.sh` measures observed concurrency from the
+   stub's own timestamps.
+6. **The checksum verification the stable sync disables was invisible**
+   (`e417a7e`). `sync_stable_version` rewrites a stable recipe's pkgver/pkgrel
+   in place and deliberately leaves the committed sums describing the previous
+   version, so `build_package` adds `--skipchecksums` for that build — and
+   those sources are built, and with `-i` installed, without a committed sum.
+   `--skipchecksums` appeared **exactly once in the whole repository**, on the
+   line that adds it: not in `--help`, not in `build-guide.md`, not in
+   MEMORY.md. In the shipped flow it was not merely undocumented but
+   *unreachable*: `build_package` has one call site (`lane_job`, always
+   `quiet_flag=1`), every lane redirects its stdout/stderr into the per-package
+   log, and the single echo naming the argv is gated on the non-quiet flag that
+   nothing passes — so the flag reached neither the terminal nor any log. The
+   trade is deliberate (skipping the check is what makes a synced build
+   possible), so the fix is **disclosure, not a behaviour change**: the package
+   log states it unconditionally and ungated, because a multi-lane run's log is
+   the only record it leaves; `--help` explains it under `--no-sync`;
+   `build-guide.md` gains a section covering the rewrite, the skipped checks,
+   the fact that signature checks are **unaffected** (`--skipchecksums` is not
+   `--skippgpcheck`), and how to restore verification.
+7. **Coverage added that was not a defect**: `sync_stable_version` had never
+   been exercised by any fixture. `tests/stable-sync-checksums.sh` pins the
+   rewrite itself (so the rest cannot pass vacuously), the flag reaching
+   makepkg's argv, the disclosure in the log, and — in a second run — that
+   `--no-sync` disables all three, so the message cannot rot into unconditional
+   noise.
+8. Duplicate report, not a defect: the BUILD FAILED / "Last lines" / `-i` hint
+   block appears twice, but the two paths are mutually exclusive by
+   `_OUTPUT_INTERACTIVE`. Left alone.
+
+- **Method, and the part worth keeping**: every fixture was **falsified before
+  it was trusted**. `git stash push -- build-all.fish`, run, `git stash pop`;
+  the fixture must fail on the pre-fix builder. Two of them were wrong first
+  and the failure is the instructive part:
+  - `tests/dashboard.sh`'s interrupt case originally asserted "no lane child
+    survived" by grepping `ps` argv for the sandbox makepkg path. Replacing
+    `lane_processes` with something that cannot signal anything left it
+    **passing** — so it measured nothing. Cause: the builder execs makepkg by
+    **bare name** (`bash <dir>/bin/makepkg`), so the grep matched the fixture's
+    own command line. Lanes are now identified by recorded PID (`kill -0` plus
+    a `Z`-state check, the way `lane_pid_alive` decides it). Second cause, more
+    important: "nothing survived" is not a property of `stop_lane_process` at
+    all — the function ends in `wait $lane_pid`, so even a builder that signals
+    nothing returns only once its lanes finished by themselves. The property
+    that matters is **promptness**; the stub now runs 15 s and ignores TERM, so
+    a builder that waits instead of killing overruns a 6 s deadline, and the
+    SIGKILL escalation in `stop_lane_process` is genuinely exercised.
+  - The core-solo invariant needed **two scenarios**, because each direction
+    passes while the other's guard is removed. Uniform stub durations were
+    tried first and were wrong: every lane frees in the same poll, core is
+    dispatched into an already-idle pool and the guard is never reached. Phase
+    A needs staggered durations **and** an asserted precondition that core was
+    actually held back, plus a baseline that two normal packages overlapped, so
+    "core never overlapped" cannot be true for the wrong reason. Phase B places
+    core first and requires the other lane to stay idle with work ready.
+- **Rules recorded** (MEMORY.md §1.18 and §6): a *lowered guard must be
+  announced where the record is*; and the audit method — **grep a
+  security-relevant flag for its documentation, in both directions**.
+- **Validated**: `fish -n`; `--audit`; `--list`; dry-runs for git/stable/core;
+  `bash tests/run-all.sh` 32/32 PASS.
+- **Left open, deliberately**:
+  - the `--skipchecksums` **policy** question — should a synced stable build
+    refresh the sums (`updpkgsums`) instead of skipping verification? That is
+    the owner's decision, not the auditor's, and it is the one remaining hole
+    under finding 6.
+  - an unreproduced `tests/sudo-keepalive.sh` flake: it failed once inside a
+    battery and then passed 5/5 isolated, 3/3 under load and 32/32 twice. Its
+    failure text was lost to `tail` (the runner prints a failing fixture's
+    output *before* the summary, so piped output discards the only evidence).
+    The hypothesis — the fixture installs a stub `date` advancing 300 s per
+    call, so assertions counting dispatcher polls are load-sensitive by
+    construction — is recorded, not fixed.
+  - `install_all`'s `install-all.log` is dead: `run_pacman_locked` ignores its
+    `-a log_file`, and all four call sites redirect at the call site. Writing
+    it would either hide pacman output or add a `tee`; left alone.
+  - `assign_group` has no `case '*'`; unreachable today, recorded as latent.
+
 ## 2026-09-20 — cmake-git's PGO phase 2 never ran: the configure cache, not the rebuild, holds the flags
 
 - **Symptom**: the queued rebuild of `cmake-git` — the fix for the five
