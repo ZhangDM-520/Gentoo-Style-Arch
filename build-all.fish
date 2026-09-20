@@ -328,23 +328,40 @@ function read_group_config -a group_name
 end
 
 function load_project_config
-    test -f "$PACKAGE_MAP_FILE"; or return 1
-    test -f "$DEP_CONFIG_FILE"; or return 1
+    # Every return 1 below names its offender. The caller can only say
+    # "project configuration is invalid", so a bare return 1 leaves the user
+    # bisecting their config by hand (2026-09-20 audit).
+    test -f "$PACKAGE_MAP_FILE"; or begin
+        ui_error "package map not found: $PACKAGE_MAP_FILE"
+        return 1
+    end
+    test -f "$DEP_CONFIG_FILE"; or begin
+        ui_error "dependency config not found: $DEP_CONFIG_FILE"
+        return 1
+    end
     if not read_config_defaults
         ui_error "invalid build defaults: $DEFAULT_CONFIG_FILE"
         return 1
     end
-    for setting in _MEMORY_PER_JOB_GIB _CORE_MEMORY_PER_JOB_GIB _RESERVED_MEMORY_GIB
-        set -l value $$setting
+    # Name the key the user wrote in build-defaults.conf, not the internal
+    # variable that happens to hold it: they grep their config for the former.
+    for pair in _MEMORY_PER_JOB_GIB=memory_per_job_gib \
+        _CORE_MEMORY_PER_JOB_GIB=core_memory_per_job_gib \
+        _RESERVED_MEMORY_GIB=reserved_memory_gib
+        set -l parts (string split -m 1 '=' -- $pair)
+        set -l var_name $parts[1]
+        set -l value $$var_name
         if not string match -qr '^[1-9][0-9]*$' -- "$value"
-            ui_error "invalid numeric build default: $setting=$value"
+            ui_error "invalid numeric build default: $parts[2]=$value"
             return 1
         end
     end
-    for setting in _DEFAULT_LANES _DEFAULT_JOBS
-        set -l value $$setting
+    for pair in _DEFAULT_LANES=lanes _DEFAULT_JOBS=jobs
+        set -l parts (string split -m 1 '=' -- $pair)
+        set -l var_name $parts[1]
+        set -l value $$var_name
         if test "$value" != auto; and not string match -qr '^[1-9][0-9]*$' -- "$value"
-            ui_error "invalid parallelism default: $setting=$value"
+            ui_error "invalid parallelism default: $parts[2]=$value"
             return 1
         end
     end
@@ -394,12 +411,21 @@ function load_project_config
         test -n "$line"; or continue
         string match -q '#*' -- "$line"; and continue
         set -l fields (string split -m 1 ':' -- "$line")
-        test (count $fields) -eq 2; or return 1
+        if test (count $fields) -ne 2
+            ui_error "invalid dependency record (expected 'package:dependency,...'): $line"
+            return 1
+        end
         set -l pkg "$fields[1]"
-        contains "$pkg" $_PACKAGE_IDS; or return 1
+        if not contains "$pkg" $_PACKAGE_IDS
+            ui_error "dependency record names an unknown package: $pkg"
+            return 1
+        end
         for dep in (string split ',' -- "$fields[2]")
             test -n "$dep"; or continue
-            contains "$dep" $_PACKAGE_IDS; or return 1
+            if not contains "$dep" $_PACKAGE_IDS
+                ui_error "dependency record for $pkg names an unknown dependency: $dep"
+                return 1
+            end
         end
         set -a _DEPS "$line"
     end
@@ -420,7 +446,10 @@ function load_project_config
         end
     end
     for package_id in $_PACKAGE_IDS
-        contains "$package_id" $listed; or return 1
+        if not contains "$package_id" $listed
+            ui_error "$package_id is listed in $PACKAGE_MAP_FILE but in no group list under $GROUP_CONFIG_DIR"
+            return 1
+        end
     end
     topo_sort (string join ' ' $_PACKAGE_IDS) >/dev/null
     if test (count $_TOPO_BLOCKED) -gt 0
