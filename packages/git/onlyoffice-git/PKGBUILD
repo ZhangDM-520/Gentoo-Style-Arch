@@ -42,8 +42,12 @@ makedepends=(
     git python
     dos2unix
     nasm
-    # build_tools/tools/linux/deps.py
-    nodejs-lts-iron
+    # build_tools/tools/linux/deps.py. The plain `nodejs`, not `nodejs-lts-iron`:
+    # the LTS conflicts with `nodejs`, which this host already has as a
+    # dependency of npm/node-gyp, so asking for it would downgrade Node 26 -> 20
+    # machine-wide to satisfy one build. `yarn` and `grunt-cli` both depend on
+    # plain `nodejs` anyway, and the rest of this workspace does the same.
+    nodejs
     npm
     yarn
     grunt-cli
