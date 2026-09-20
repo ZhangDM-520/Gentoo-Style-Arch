@@ -9,7 +9,7 @@
 # This PKGBUILD is based on the official Arch cmake package.
 
 pkgname=cmake-git
-pkgver=4.4.3.936.g2ee33f507d
+pkgver=4.4.3.1063.g8683efde41
 pkgrel=1
 pkgdesc='A cross-platform open-source make system'
 arch=('x86_64')
