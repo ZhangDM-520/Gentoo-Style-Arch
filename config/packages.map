@@ -102,6 +102,7 @@ mimalloc-git|packages/git/mimalloc-git
 ninja-git|packages/git/ninja-git
 niri-spicy-git|packages/git/niri-spicy-git
 noctalia-git|packages/git/noctalia-git
+onlyoffice-git|packages/git/onlyoffice-git
 pango-git|packages/git/pango-git
 pixman-git|packages/git/pixman-git
 polkit-git|packages/git/polkit-git
