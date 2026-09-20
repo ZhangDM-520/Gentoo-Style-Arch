@@ -131,10 +131,10 @@ cleanup. There is no CI workflow and no compilable language here — fixtures an
 `makepkg` are the entire verification surface.
 
 `tools/` is deliberately outside the battery: host-side diagnostics that are
-heavy and mutating (currently `tools/texlive-split-probe.sh`, a PSI/D-state/
-IO sampler). Its contract is still fixture-pinned by `tests/probe-watchdog.sh`
-at a reduced scale — a watch mode must never kill the process it samples, and
-an abort must leave the sample log behind.
+heavy and mutating, so `tests/run-all.sh` never discovers them. Each one's
+contract is still fixture-pinned at reduced scale — `tools/go-modcache-check.sh`
+by `tests/modcache-check.sh`. Re-list the directory (`ls tools/`) rather than
+trusting a remembered inventory.
 
 Agent shells inject git config (`safe.bareRepository=explicit`), which breaks
 bare-repo and makepkg VCS operations. Prefix those with `GIT_CONFIG_COUNT=0`

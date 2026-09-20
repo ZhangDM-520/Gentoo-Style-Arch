@@ -64,7 +64,7 @@ diagnostics that are deliberately too heavy for that battery:
 ```sh
 bash tests/run-all.sh                  # every fixture
 bash tests/run-all.sh recipe           # substring filter
-tools/texlive-split-probe.sh --help    # sample or watch a build step
+tools/go-modcache-check.sh             # is the Go module cache intact?
 ```
 
 Build a selected group or package. Selection is mandatory; a bare invocation

@@ -574,6 +574,22 @@ dependency edges, and incident root causes are unaffected by the renames.
     the 5-minute default) and `SystemMaxUse=1G`, overriding the vendor 50 MB cap.
   - `gsa-heartbeat.service` — a timestamp to `/var/log/heartbeat.log` and the
     journal every 5 s, which separates "the kernel died" from "the display died".
+- **Closure (2026-09-20): the chain is gone, because it answered its question.**
+  CVE-2026-90432 in the sched_ext fork/exec path was the cause (2026-09-19 entry
+  above), the kernel moved past it, and a diagnostic left armed past its question
+  is only unmeasured overhead — so the list above was dismantled:
+  `/etc/sysctl.d/99-diagnostic.conf`, `gsa-heartbeat.service` with
+  `/usr/local/bin/gsa-heartbeat.sh` and `/var/log/heartbeat.log`,
+  `/etc/systemd/journald.conf.d/10-diagnostic.conf`, and the eight parameters
+  added to `/etc/default/limine` were all removed; `limine-update` regenerated
+  all four boot entries at 09:35 and the running boot keeps the old chain until
+  the next reboot. `tools/texlive-split-probe.sh` and `tests/probe-watchdog.sh`
+  went with them. Everything is backed up in
+  `/root/freeze-diag-backup-20260920/`, and the pre-cleanup command line is at
+  `/etc/default/limine.bak-20260920-pre-diag-cleanup`
+  (`/etc/default/limine.bak-20260919-freeze-diag` is the earlier, pre-diagnosis
+  one and still carries `nowatchdog`). The two lessons below are the durable
+  half and are why re-arming is worth doing *first*, not after.
 - **`efi_pstore` was disabled by default** (`pstore_disable=Y`), so
   `/sys/fs/pstore` had never been able to receive anything despite being mounted
   and empty since installation. Set to `N`, the chain was validated at 13:09 with
@@ -599,12 +615,13 @@ dependency edges, and incident root causes are unaffected by the renames.
   `default`, but **all AER counters are zero** on both the device and its root
   port, the NVMe error log is empty and SMART reports 0 media errors — absence of
   evidence, not evidence.
-- **Still queued**: a real ASPM-off differential (removing `pcie_aspm=powersave`
-  only moved the policy to `default`, which still enables L1 — it needs
-  `pcie_aspm=off`), `ananicy-cpp` (still active), the zram resize
+- **Still queued at the time** (all superseded by the CVE finding): a real
+  ASPM-off differential (removing `pcie_aspm=powersave` only moved the policy to
+  `default`, which still enables L1 — it needs `pcie_aspm=off`), `ananicy-cpp`
+  (still active), the zram resize
   (`zram-size = ram * 2.5` = 74.9 GB of RAM-backed swap on a 29 GiB machine, and
-  with `zswap.enabled=0` it is the only swap), and the phase-free 20 GB write
-  burst under `tools/texlive-split-probe.sh --watch-cmd`.
+  with `zswap.enabled=0` it is the only swap), and a phase-free 20 GB write
+  burst. The last one needed the probe, which no longer exists.
 - **Rule**: arm the capture chain *before* investigating a hard freeze — lockup
   detectors with `*_panic=1` so a wedge panics and reboots leaving a trace,
   `kernel.sysrq=1` so `Alt+SysRq`+`l`/`w`/`b` can dump and sync, a 1 s journal
@@ -723,16 +740,22 @@ dependency edges, and incident root causes are unaffected by the renames.
   hang leaves no trace) and `loglevel=3` (warnings off the console), and
   `kernel.sysrq=16` disables every SysRq recovery key — a hard reset was the only
   way out. The drive reports **63 unsafe shutdowns**.
-- **What measurement ruled out** (new `tools/texlive-split-probe.sh`): the split
+- **What measurement ruled out** (a temporary host sampler, `texlive-split-probe.sh`,
+  written for this investigation and [removed 2026-09-20](#2026-09-19--hard-freezes-the-capture-chain-is-armed-and-the-history-is-longer)
+  once the cause was known): the split
   loop itself. The real loop, extracted from the PKGBUILD at run time, running on
   a hardlink farm at full `fontsextra` scale — 105,846 files moved in 264 s —
   produced **io PSI 0.00 throughout, at most 2 processes in D state, peak device
   utilisation 16 %, memory flat, zram untouched**. The loop's work does not
-  saturate this machine; the trigger needs something that was present then (the
-  19 GB source fetch, a concurrent lane, or an intermittent device fault). Prime
-  suspect remains the NVMe link: ASPM L1 + L1.2 are enabled on a **WD SN560**
-  while the cmdline forces `pcie_aspm=powersave`; the differentials (ASPM off,
-  `ananicy-cpp` stopped, zram off) are queued for the maintainer to run.
+  saturate this machine; the trigger needed something that was present then (the
+  19 GB source fetch, a concurrent lane, or an intermittent device fault) — and
+  it turned out to be the kernel itself (CVE-2026-90432). The prime suspect
+  recorded here, the NVMe link (ASPM L1 + L1.2 on a **WD SN560**, which this
+  entry said the cmdline forced via `pcie_aspm=powersave`), **rests on a premise
+  that was never true**: checked 2026-09-20, there is no `pcie_aspm=` token in
+  `/proc/cmdline` or `/etc/default/limine` and the policy reads `default` — the
+  L1 state is the firmware default. The queued differentials (ASPM off,
+  `ananicy-cpp` stopped, zram off) are therefore moot rather than pending.
 - **Fixed regardless — the loop was the recipe's hot path**: 4,115 full rescans
   of the 18.7 MB tlpdb plus one `mkdir -p` + one `mv` per file (301k process
   spawns). It now cuts the tlpdb into per-package sections in ONE awk pass,
@@ -771,9 +794,10 @@ dependency edges, and incident root causes are unaffected by the renames.
   log; the recipe's own log did not exist (`.state/` was gone), and no lockup
   detector was armed (`nowatchdog`), no recovery key worked (`kernel.sysrq=16`),
   and a wildcard `rm -rf /tmp/texlive-split-probe.*` deleted the samples of a run
-  that was still in flight — a probe now keeps its evidence whenever a run does
-  not finish cleanly, and nobody should clean `/tmp` by glob while they are
-  sampling a live build.
+  that was still in flight. The probe is gone now, but the habit it taught is
+  not: a sampler that aborts without keeping its evidence has thrown away the
+  experiment, and nobody should clean `/tmp` by glob while a measurement is
+  running.
 - **Rule**: a bulk `prepare()` that moves files must (a) refuse to run on
   incomplete inputs instead of shipping a quietly broken package, and (b) be
   batched — these loops cost process spawns, not bytes. And when a machine

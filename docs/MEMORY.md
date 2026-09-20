@@ -417,9 +417,11 @@ going stale.
   `CONFIG_HZ=600`, ThinLTO Clang, with **no PREEMPT_RT and no `SCHED_BORE`** —
   a deliberate flavour change, not a silent one, but worth re-reading before a
   default rebuild swaps the machine onto rt-bore. `linux-cachyos-rt-bore-lto`
-  7.2.5-1 and `linux-cachyos-lts` 6.18.52-1 remain installed as fallbacks, and
-  `efi_pstore.pstore_disable=N` plus the panic parameters are live on the
-  running command line, so the capture chain survived the swap. The evidence is
+  7.2.5-1 and `linux-cachyos-lts` 6.18.52-1 remain installed as fallbacks. **The
+  `efi_pstore.pstore_disable=N` and the panic parameters that were added to the
+  command line for the freeze diagnosis were removed again on 2026-09-20** (see
+  the stand-down entry below), so the running 7.3-rc3 boot still carries them
+  but the next reboot does not. The evidence is
   upstream-documented plus circumstantial; the confirming A/B was skipped by
   decision, so read "identified" as strong, not proven.
 - **Decision needed at the next `linux-cachyos` rebuild: AutoFDO + Propeller
@@ -431,28 +433,42 @@ going stale.
   set both knobs, or accept the plain kernel deliberately. `prepare()` asserts
   the off state either way, so the swap shows up in the log rather than passing
   unnoticed.
-- **Capture chain armed (2026-09-19) — keep it, it is what makes a future freeze
-  readable.** `/etc/sysctl.d/99-diagnostic.conf` (`watchdog_thresh=30`, watchdog
-  plus both lockup detectors, `softlockup_panic`/`hardlockup_panic`/
-  `softlockup_all_cpu_backtrace`/`hung_task_panic`/`panic_on_oops`=1, `panic=10`,
-  `sysrq=1`, re-applied every boot); `nowatchdog` removed from
-  `/etc/default/limine` with the matching `*_panic=1`/`panic=10` parameters
-  added; journald `SyncIntervalSec=1s` + `SystemMaxUse=1G` in
-  `/etc/systemd/journald.conf.d/10-diagnostic.conf`; and `gsa-heartbeat.service`,
-  a 5 s timestamp to `/var/log/heartbeat.log` and the journal that separates a
-  dead kernel from a dead display. `efi_pstore` was **disabled by default**
-  (`pstore_disable=Y`), so `/sys/fs/pstore` could never have received anything;
-  set to `N`, the chain was validated with a deliberate `Alt+SysRq+c` — the
-  panic landed in pstore in 17 compressed records and the machine self-rebooted
-  in 27 s, and **never reached the journal**. pstore is the channel for a hard
-  crash, not journald; do not read an empty journal as "nothing happened".
-  **Recipe side (2026-09-19):** `_capture_chain` now defaults to `no`, so a
-  kernel built from the recipe no longer carries the chain itself. The two
-  options that matter are **config-only** — `WQ_WATCHDOG` and `PSTORE_CONSOLE`
-  cannot be set from a command line — so set `_capture_chain=yes` in the
-  environment for that build (the override reaches the lane child; verified
-  2026-09-19). The armed command line and the sysctl drop-in above are
-  independent of the recipe and stay.
+- **Capture chain stood down (2026-09-20) — the freeze it was armed for is fixed;
+  what it taught is kept.** The chain armed on 2026-09-19 for the texlive
+  freezes was removed once the cause was fixed (CVE-2026-90432, above): the
+  heartbeat witness, the sysctl drop-in, the journald drop-in and the panic
+  parameters on the command line are gone, because a diagnostic left running
+  past its question is just unmeasured overhead. Removed: `gsa-heartbeat.service`
+  plus `/usr/local/bin/gsa-heartbeat.sh` (a 5 s timestamp to
+  `/var/log/heartbeat.log` that separated a dead kernel from a dead display),
+  `/etc/sysctl.d/99-diagnostic.conf` (`watchdog_thresh=30`, both lockup
+  detectors, `*_panic=1`, `panic=10`, `sysrq=1`), the journald drop-in
+  `/etc/systemd/journald.conf.d/10-diagnostic.conf` (`SyncIntervalSec=1s` —
+  every freeze lost its final seconds at the 5-minute default),
+  `hardlockup_panic`/`softlockup_panic`/`softlockup_all_cpu_backtrace`/
+  `hung_task_panic`/`hung_task_timeout_secs`/`panic_on_oops`/`panic=10`/
+  `efi_pstore.pstore_disable=N` from `/etc/default/limine`, and
+  `tools/texlive-split-probe.sh` with its fixture `tests/probe-watchdog.sh`.
+  All of it is backed up at `/root/freeze-diag-backup-20260920/` and the
+  pre-cleanup command line at `/etc/default/limine.bak-20260920-pre-diag-cleanup`
+  (the earlier, pre-diagnosis one is `/etc/default/limine.bak-20260919-freeze-diag`,
+  which still carries `nowatchdog`). `limine-update` regenerated all four boot
+  entries on 2026-09-20 09:35; the running boot keeps the old chain until the
+  next reboot. **Re-arming is one command each** — the backup directory is the
+  recipe. Two facts outlive the chain and are why it is worth re-arming *before*
+  investigating a freeze rather than after:
+  - `efi_pstore` is **disabled by default** (`pstore_disable=Y`), so
+    `/sys/fs/pstore` never receives anything until it is set to `N`. Validated
+    with a deliberate `Alt+SysRq+c`: the panic landed in pstore as 17 compressed
+    records and the machine self-rebooted in 27 s, and **never reached the
+    journal**. pstore is the channel for a hard crash, not journald; an empty
+    journal is not evidence that nothing happened.
+  - The two kernel options that matter are **config-only** — `WQ_WATCHDOG` and
+    `PSTORE_CONSOLE` cannot be set from a command line — so they need
+    `_capture_chain=yes` in the environment for that kernel build. The recipe's
+    `_capture_chain` knob survives this cleanup and still defaults to `no`, so a
+    default rebuild carries no chain (the override reaches the lane child;
+    verified 2026-09-19).
 - **Still open: the 2026-09-01 cluster.** `last -x` over the whole wtmp (machine
   installed 2026-08-31 15:20) shows ~23 unclean shutdowns, but the first four
   are a separate event: inside 27 minutes, the first ten minutes after
