@@ -2,7 +2,7 @@
 
 pkgname=noctalia-git
 _pkgname=noctalia
-pkgver=5.1.0.r5545.ge4eb0ff97
+pkgver=5.1.0.r5568.ge7acd0654
 pkgrel=1
 pkgdesc='A sleek, customizable desktop shell crafted for Wayland'
 arch=('x86_64' 'aarch64')
@@ -61,8 +61,10 @@ makedepends=(
 options=('!debug' 'lto')
 provides=('noctalia')
 conflicts=('noctalia' 'noctalia-bin')
-source=("${_pkgname}::git+${url}.git#branch=main")
-sha256sums=('SKIP')
+source=("${_pkgname}::git+${url}.git#branch=main"
+        0001-idle-lock-resume-and-inhibit-tracking.patch)
+sha256sums=('SKIP'
+            '20c1ce43b4c1dc20324c49b68cc1d6696fecda3e3d9017f97c7160c7657d7706')
 
 pkgver() {
   cd "${_pkgname}"
@@ -70,6 +72,17 @@ pkgver() {
   local version
   version="$(sed -n "s/^  version: '\([^']*\)',/\1/p" meson.build)"
   printf '%s.r%s.g%s' "${version}" "$(git rev-list --count HEAD)" "$(git rev-parse --short=9 HEAD)"
+}
+
+prepare() {
+  cd "${_pkgname}"
+
+  # Locking must not undo the idle chain. Re-arming notifications ran the resume action of every
+  # already-idled behaviour, and screen_off's resume action is PowerOnMonitors - so the panel lit
+  # back up the moment the session locked, then had to wait out the blanking timeout again.
+  # Candidate upstream fix, PR #4002 (fixes #4190); drop this once it is merged.
+  # Verified on niri 26.04: /sys/class/drm/<connector>/dpms goes On at the lock without it.
+  git apply -3 ../0001-idle-lock-resume-and-inhibit-tracking.patch
 }
 
 # Run the PGO training workload: exercise the real shell under a headless sway

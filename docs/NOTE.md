@@ -3165,3 +3165,37 @@ User directive: root dirs = git group; `.Heavy/` renamed to `.Heavyweight/`
   falsified before being trusted; the full battery is 32/32. A partial clone
   (`--filter=blob:none`) proved unusable as a mirror — it renders an
   `export-subst` file differently and reports a false mismatch.
+
+## 2026-09-22 — `noctalia-git` carries the upstream idle fix, so locking stops waking the display
+
+- **Bug** (owner-reported, reproduced here): with `dim 50 s → screen off 70 s → lock 120 s`, the lock
+  lit the panel back up and the whole chain replayed. Root cause is in Noctalia, not in the config:
+  `IdleManager::setSessionLocked()` → `recreateBehaviorNotifications()` →
+  `recreateBehaviorNotification()` ran `runResumeBehavior()` for every behaviour whose
+  `phase == BehaviorPhase::Idled`, then destroyed and recreated the notification.
+  `action = "screen_off"` hard-wires `resumeAction = ScreenOn`
+  (`resolveIdleBehaviorActions()`), so a `screen_off` that had already blanked the display powered the
+  monitors back **on** at the lock, `dim`'s `resume_command` restored the backlight, and every
+  countdown restarted from the lock instant.
+- **Evidence, not logs**: `/sys/class/drm/card1-eDP-1/dpms` (kernel DRM state) goes `Off` at the
+  blanking stage and **back `On` 36 ms after** `[lockscreen] session is locked`, with
+  `idle behavior notifications re-armed` following at `+0.31 s`. Chain shortened to 10/15/20 s so a
+  cycle takes 20 s; reproduced twice on demand.
+- **Upstream, not bespoke**: issue **noctalia-dev/noctalia#4190** (open, `niri`) and PR **#4002**
+  (`mergeable`, "Closes #4190"). The PR was built and verified on niri from this host — panel stays
+  `Off` across the lock, no replay, backlight still restored on real input — and a review plus an
+  approving review were submitted upstream, together with the reproducer on #4190. **This recipe is a
+  stopgap for one host until that PR merges.**
+- **Change**: `prepare()` applies
+  `0001-idle-lock-resume-and-inhibit-tracking.patch` with `git apply -3`, following the
+  `xwayland-satellite-git` convention (`source=(... patch)`, `sha256sums` + verified hash). The patch
+  is PR #4002's diff unchanged, applied against `main` at `e7acd06`; plain and 3-way application were
+  both pre-flighted. `.SRCINFO` regenerated with `makepkg --printsrcinfo` — the patch appears as a
+  source, as it does for the sibling package.
+- **Why the host, not the recipe class**: `noctalia-git` is foreign and already in `IgnorePkg`, so a
+  locally built package survives updates; a `stable` recipe here would have had to pin a moving VCS
+  ref. Built with `./build-all.fish --no-deps -i noctalia-git` (9m08s), installed, shell restarted the
+  niri way (`kill <pid>` + `niri msg action spawn -- noctalia`); the running binary reports
+  `v5.1.0-70-ge7acd065406b-dirty`, where `-dirty` is the marker that the patch is in.
+- **Removal**: delete the patch, the `source`/`sha256sums` entry and `prepare()`, and regenerate
+  `.SRCINFO`, once #4002 lands. The `-dirty` suffix in the version string is the reminder.
