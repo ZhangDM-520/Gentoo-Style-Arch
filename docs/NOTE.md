@@ -32,6 +32,181 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-24 (sync anchoring) — one missing published checksum refused the recipe, and the refusal strangled the dispatch; sync now runs updpkgsums, and an unanchorable recipe defers
+
+- **Symptom**: `build-all.fish -g stable,core,git,third-party -s -i`
+  (unprivileged and root alike), `linux-tools` committed at 7.2.5 while the
+  repos served 7.2.7: `✗ linux-tools: BUILD FAILED (rc=1, 0m01s)` —
+  `refusing to build — the official packaging repo carries linux-tools 7.2.7
+  but publishes no checksum for: linux-7.2.7.tar.sign` plus the manual
+  `updpkgsums` line — makepkg never started — and the first lane failure
+  stopped everything: `✗ Build failed — stopped dispatching, drained
+  in-flight lanes.`, ~120 packages never dispatched, two consecutive runs.
+  (Both rows were measured by the plan; the mechanism is line-traced below
+  and both behaviours are reproduced at fixture scale. The full-scale run was
+  NOT re-executed — the tree already carries the 7.2.7 sums.)
+- **Root cause**, two defects plus one stance gap:
+  1. `source_filename`'s detached-signature suffix list was
+     `.sig|.asc|.signature` — missing `.sign`, the kernel.org spelling. So
+     the signature entered `anchor_names`, `srcinfo_sum_map` drops the
+     official SKIP value, and the grade step classified it "unanchored" and
+     refused *before* updpkgsums ever ran. Measured with `makepkg
+     --verifysource`: intact `.sign` → `linux-7.2.7.tar ... Passed`;
+     corrupted → `SIGNATURE NOT FOUND`, rc=1 — its integrity is
+     cryptographic (PGP against `validpgpkeys`, over a payload whose sha256
+     IS published: `4ac34c…` matched the on-disk tarball), not a hash of the
+     signature. Real `updpkgsums` preserves `SKIP` too (measured on a copy:
+     sums stayed `4ac34c/SKIP/2e187`).
+  2. The dispatcher treated ANY lane rc≠0 as a failed build →
+     `stop_starting` → drain. Anchoring-impossible (no official document,
+     refresh failure) is not a build failure.
+  3. Stance: the refusal's own remedy told the maintainer to run
+     `updpkgsums` by hand — the guard declined to automate exactly what it
+     prescribed, and one such entry parked a 126-package run.
+- **Fix** (the trust model, stated): entries the official `.SRCINFO`
+  publishes a value for are unchanged — anchored, verified against Arch after
+  the `updpkgsums` write; a disagreement still refuses and restores, and now
+  *stops* the dispatch (integrity signal, like a failed build). Entries it
+  publishes NO checksum for (SKIP or absent) are refreshed at sync-fire by
+  the same `updpkgsums` run and recorded LOUDLY as fetch-only: per entry in
+  the package log (`publishes no checksum for (refreshed from the fetch, NOT
+  anchored)` + the attestation line — PGP for a signature, #tag/#commit for a
+  VCS, TLS for a plain download) and in a new run-level
+  `Synced with the repo this run …` summary (`synced.list`, cleared per run)
+  carrying the review/commit instruction. Signature files are excluded from
+  checksum anchoring altogether (`.sign` added to `source_filename`). No
+  official document at our version still refuses and restores — nothing can
+  be classified without the document — but is DEFERRED:
+  `_ANCHOR_DEFER_RC` (99) rides the ordinary lane-rc field (the `pkgdir rc
+  seconds` protocol is untouched), the reap parks it (not `failed`, no
+  `stop_starting`), dependents are held back by `pick_next_ready` and
+  labelled `waits on a deferred package` (not "cycle"), the summary tails
+  the parked log (named error + manual recovery + `--no-sync`), and the run
+  exits non-zero with the parked packages in the resume command. Install
+  failures and makepkg failures still stop the run; root-mode ownership
+  semantics were not touched (concurrent log-ownership work left intact).
+- **Validation**: red-first — flipped case 5, new case 5b, and
+  `tests/anchor-defer.sh` were all red on the old code (the defer fixture's
+  RED output reproduced the measured stop-dispatch signature at scale-1:
+  `c-plain` never dispatched), green after; full battery **44/44**;
+  `fish -n`, `--audit`, `--list`, dry-runs git/core/stable all green. Also
+  regenerated the five stale `-git` `.SRCINFO`s (pre-existing battery red
+  from uncommitted version bumps) and `linux-firmware`'s (bumped externally
+  mid-session).
+- **Durable rules**: never fetch-alone for an entry Arch publishes — that
+  half of the guard is exactly as it was; refresh-only entries must always be
+  named (log + run summary), never silent; a checksum disagreement with Arch
+  stops the run; an anchoring that is merely *impossible* defers, never
+  aborts, and its dependents never build; the run-level sync summary is the
+  commit witness — a run never commits.
+
+## 2026-09-24 (harness) — sudo-keepalive's fake clock raced itself; never run two batteries at once
+
+- **Symptom**: `tests/sudo-keepalive.sh` failed ~2 runs in 3 — on the
+  pre-change baseline *and* on the log-ownership tree alike (proven by
+  stashing `build-all.fish` and re-running): `✗ p3/p4: BUILD FAILED (rc=125,
+  -60m00s)` with `result file bytes: 'p3 0 -5400'`.
+- **Root cause**: the fake `date` stub bumped a shared tick counter with an
+  unguarded read-truncate-write. Dispatcher and lane children call it
+  concurrently; a reader that opens the file between truncate and write gets
+  an empty read, resets the counter to 1, and the lane's duration
+  (`end - start`) turns negative — `lane_result_valid` rejects non-`[0-9]`
+  durations, so a *successful* build is reaped as malformed rc=125.
+- **Fix**: serialize the read-modify-write under `flock -x` on the counter
+  (tests/sudo-keepalive.sh); the clock contract (+300 s per call) is
+  unchanged.
+- **Validation**: 3/3 green after the fix (2/3 red before, on both trees).
+- **Durable rules**: fixture stub state shared across builder processes must
+  be serialized (`flock`); and never run two fixture batteries at once —
+  `signal-abort-lock.sh`'s survivor scan matches `--lane-job` processes
+  GLOBALLY, so another session's lanes trip it (observed twice: one
+  self-inflicted parallel run, one while a concurrent session ran its own
+  battery). Both times the fixture was green when run alone.
+- **Unproven row**: the first full battery showed `log-ownership-root.sh`
+  failing with the pre-fix signature (rc=125, EACCES, no repair
+  announcement) while every later run — battery-filtered and standalone —
+  was green. Never reproduced; interference from the concurrent session
+  during that battery is suspected. Named unproven, not fixed.
+
+## 2026-09-23 (log ownership) — a root-mode crash poisoned the next run's logs; state ownership is now settled at write time
+
+- **Symptom**: run A (`sudo fish build-all.fish …`, started 19:10) was killed
+  mid-flight at 19:34. Run B — unprivileged `fish build-all.fish -g
+  stable,core,git,third-party -s -i` at 22:33 — died in seconds:
+  `✗ util-linux / dbus / libisl-git: BUILD FAILED (rc=125, 0m00s)`, each row
+  preceded by fish's `warning: An error occurred while redirecting file
+  '.state/logs/<pkg>.log' / open: Permission denied`. Exactly six logs were
+  `root:root` (run A's in-flight set), `.state/` itself was root:root, and
+  `linux-api-headers` — user-owned log — built fine.
+- **Root cause**: every log open happens in the SUPERVISOR's shell, so root
+  mode created files root-owned at birth: the lane-spawn
+  `printf '' >"$child_log"` and `… >>"$child_log"` redirect,
+  build_package's truncate, the makepkg append
+  `sudo -u … makepkg >>"$log_file"` (fish opens the redirect before sudo
+  drops privileges), and `tee -a` in `install_pkgs_now`. The only repair was
+  `chown -R "$_BUILD_USER": "$pkg_path" "$LOG_DIR"` at build_package EXIT —
+  a crash window: a killed run leaves exactly its in-flight logs poisoned,
+  and the next unprivileged run dies at the SAME redirect (rc=125) before
+  build_package's `cannot write build log:` probe can print anything — hence
+  every row claiming 0m00s. `$_STATE_DIR` appears in NO chown argument,
+  which is the measured post-crash asymmetry: `.state` stayed root:root
+  while `logs/` had already been repaired by an exit chown.
+- **Fix — ownership is decided when a file is OPENED** (three helpers in
+  `build-all.fish`):
+  - `ensure_state_dirs` (startup, and at every former `mkdir -p "$LOG_DIR"`
+    site): root mode sweeps `chown -R "$_BUILD_USER": "$_STATE_DIR"` —
+    directories *and* files an earlier interrupted root run left behind;
+    unprivileged mode refuses to run when `LOG_DIR` is not writable, naming
+    the file/owner and the exact `sudo chown -R` remedy (`log_ownership_hint`).
+  - `ensure_log_writable <file>` (before every state-file create, truncate or
+    append): root mode repairs a wrong owner **in place**, loudly
+    (`⚠ repaired root-owned runtime file:`), and creates missing files with
+    `sudo -u "$_BUILD_USER" touch` — never as root, because root creation is
+    precisely what poisons the next run (no fallback to root on failure).
+    Unprivileged mode cannot chown, so an unopenable file is QUARANTINED to
+    `<path>.stale.<epoch>.<pid>` — a rename needs only directory write — with
+    a `⚠ preserved unopenable log:` announcement; the crashed run's forensics
+    are moved aside, never truncated. Root mode deliberately checks OWNER
+    only: real root can write a mode-0444 file, so mode is not the poison.
+  - Sites wired: lane spawn (before any lane state exists; a preparation
+    failure stops dispatch and is counted in `failed[]` so the run exits
+    non-zero), build_package, the `install_pkgs_now` transcript (before
+    pacman runs — rule-11 forensics must be recordable or the install is
+    refused), `write_lane_result`'s tmp (chowned before the atomic publish —
+    the `pkg rc seconds` protocol is untouched), the pacman-shim tmp, and
+    `dispatcher.log`/reap/escalate/signal forensics as guarded best-effort
+    (report, don't break, the run being recorded). The pacman mutex is the
+    stated exception: never rename a possibly-held lock inode — root
+    pre-creates it as the build user, unprivileged runs only verify readable
+    (flock(1) opens read-only; measured: `flock -x` succeeds on a 0444 file).
+  - `install-all.log` is a dead variable (`run_pacman_locked` never opens
+    its `log_file` argument); documented at the site instead of invented.
+- **Validation**: `tests/log-ownership.sh` (unprivileged quarantine contract:
+  sentinel preserved under `.stale.*`, no rc=125, no redirect error, run
+  green; red before the fix) and `tests/log-ownership-root.sh` (root-mode
+  in-place repair: per-file non-`-R` chown naming the poisoned log, loud
+  announcement, no quarantine, run green; red before the fix) — the fixture
+  cannot chown to root, so the poison is a 0644 log whose owner a `stat`
+  stub reports as root, which is exactly the predicate the builder tests.
+  Full battery green: 43/43 fixtures on the final tree, both log-ownership
+  halves included — `srcinfo-freshness` was closed by regenerating the two
+  `.SRCINFO`s whose PKGBUILDs the run-B auto-sync bump had invalidated
+  (`linux-firmware` 20260916, `linux-tools` 7.2.7: `makepkg --printsrcinfo`,
+  the recipe-checklist follow-through); `--audit`, `--list` and three
+  dry-runs (git/stable/core) green. See the 2026-09-24 harness entry for the
+  `sudo-keepalive` fake-clock race and the battery-concurrency rule. Live on the real tree: `sudo chown root:` on
+  `linux-api-headers.log`, then the unprivileged `-s` run quarantined it
+  loudly and finished `All builds succeeded!` (rc=0, no rc=125); the documented
+  `sudo chown -R zhangdm: .state` remedy then restored the whole state tree.
+  Two run-A leftovers that broke `nvcheck-aggregator` were also repaired:
+  `noctalia-git/pkg` and `vscodium-insiders-git/pkg` sat at mode 0111
+  (owner without read → `find` EACCES).
+- **Durable rule**: every `$LOG_DIR` open site must go through
+  `ensure_log_writable` before the first redirect touches the file; state
+  directories only through `ensure_state_dirs`; root never creates a state
+  file directly; the mutex inode is never renamed. Forensics appends stay
+  best-effort (guarded), everything else fails named.
+
 ## 2026-09-23 (night) — lanes died to an unnamed signal, the abort corrupted pacman, noctalia's training never ran, and zen trained on Speedometer 2.0
 
 One report, three isolatable defects, fixed by three parallel agents.

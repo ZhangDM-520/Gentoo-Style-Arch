@@ -19,9 +19,14 @@ set -g LOG_DIR "$_STATE_DIR/logs"
 # (no sudo timestamp to expire on long runs); makepkg + ALL workspace
 # artifacts run as the invoking user — makepkg refuses root, and --asroot
 # would scatter root-owned src/pkg files into the checkout plus root caches
-# (~/.ccache, ~/.cargo, ~/.cache/go-build) into /root. build_package restores
-# user ownership after each package so nothing root-owned ever lands in the
-# workspace. Unprivileged mode: everything as before (sudo -n installs).
+# (~/.ccache, ~/.cargo, ~/.cache/go-build) into /root. Ownership is settled
+# at WRITE time: ensure_state_dirs sweeps $_STATE_DIR at startup, every
+# runtime-state file open goes through ensure_log_writable, and build_package
+# still chowns the recipe tree + LOG_DIR at exit — so nothing root-owned
+# survives even a run killed mid-flight. (Repair only at exit had a crash
+# window: 2026-09-23, six root-owned logs aborted the next unprivileged run
+# at rc=125 before its builds even started.) Unprivileged mode: everything as
+# before (sudo -n installs).
 set -g _BUILD_USER (id -un)
 set -g _ROOT_MODE 0
 if test "$_BUILD_USER" = "root"
@@ -146,6 +151,13 @@ set -g _DASHBOARD_LANE_START
 set -g _DASHBOARD_SPINNER_FRAMES '-' "\\" '|' '/'
 set -g _DASHBOARD_SPINNER_INDEX 1
 set -g _RL_BLOCKED 0
+set -g _RL_DEFERRED
+# Lane rc meaning "this recipe's anchoring was refused — PARK it, do not stop
+# the dispatch": build_package returns it only from the anchor branch (before
+# makepkg ever runs), and run_lanes' reap turns it into a deferral instead of
+# a failed build (2026-09-24). 99 is clear of flock's 75 and the lane-spawn
+# anomaly's 125; no other path emits it.
+set -g _ANCHOR_DEFER_RC 99
 set -g _INTERRUPT_HANDLED 0
 # Signal forensics (2026-09-23 mass-TERM incident): which signal arrived, in
 # which mode the handler ran, and how long lane teardown may grace before the
@@ -814,6 +826,14 @@ function sync_stable_version -a pkg_path
         return 2
     end
 
+    # Run-level witness: a run never commits (the disposition of these edits is
+    # the owner's), so the end-of-run summary must name every recipe this run
+    # rewrote — best-effort append; the per-package log keeps the record
+    # either way.
+    printf '%s: %s → %s (synced with repo)\n' \
+        "$pkgbase" "$cur_pkgver-$cur_pkgrel" "$repo_pkgver-$repo_pkgrel" \
+        >>"$_STATE_DIR/synced.list" 2>/dev/null
+
     if test $pkgver_changed -eq 1
         return 1
     end
@@ -851,7 +871,12 @@ end
 # describes: the "name::" override when the entry has one, otherwise the
 # basename of the URL. Nothing is printed for a signature file (makepkg writes
 # SKIP for those) or for an in-tree file, because neither is a download that a
-# checksum published elsewhere can describe.
+# checksum published elsewhere can describe. The suffix list must cover every
+# spelling of a detached signature — '.sign' is the kernel.org one
+# (linux-7.2.7.tar.sign), and missing it is what made an official-SKIP entry
+# look unanchorable and refused the recipe (measured 2026-09-24: makepkg
+# verifies .sign with PGP against validpgpkeys — corrupting it fails the build
+# with 'SIGNATURE NOT FOUND' — so its integrity is cryptographic, not a hash).
 #
 # The override matters: 'udisks2::git+…' downloads to "udisks2", and
 # 'openshadinglanguage-…tar.gz::https://…/v1.15.3.0.tar.gz' downloads to
@@ -872,7 +897,7 @@ function source_filename -a entry
     if test -z "$name"
         return 1
     end
-    for suffix in .sig .asc .signature
+    for suffix in .sig .asc .signature .sign
         string match -q "*$suffix" -- $name; and return 1
     end
     echo $name
@@ -995,6 +1020,19 @@ end
 # the official packaging repo is the same source of truth the version itself was
 # synced from.
 #
+# One class is deliberately different (2026-09-24): an entry the official
+# .SRCINFO publishes NO checksum for (SKIP, or no entry at all) cannot be
+# anchored to anything Arch published — but refusing the recipe there parked a
+# whole dispatch over one entry, and the refusal itself told the maintainer to
+# run 'updpkgsums' by hand. The sync now runs exactly that command itself and
+# records each such entry LOUDLY as refresh-only: nothing official attests
+# these values, so the log and the run summary name every one and say what
+# does stand behind it (PGP for a detached signature — the signature entry is
+# already outside this list via source_filename —, #tag/#commit for a VCS
+# source, TLS for a plain download). Entries Arch DOES publish keep the full
+# anchor-or-refuse treatment: verified against Arch after the write, a
+# disagreement refuses and restores. That half is not weakened.
+#
 # Only the entries that actually moved are anchored. A pkgver rewrite that leaves
 # source=() alone — 26 of the 28 stable recipes pin literal versions in their
 # URLs — leaves the committed sums valid, so refusing those builds would be a
@@ -1006,10 +1044,10 @@ end
 # file. Every path fails closed, restoring the recipe where it was already
 # rewritten.
 #
-# Return: 0 = anchored and verified · 1 = nothing to anchor · 2 = could not
-#         fetch/write/verify (recipe restored) · 3 = unanchored (recipe
-#         untouched) · 4 = a source disagrees with Arch's checksum (recipe
-#         restored)
+# Return: 0 = anchored (and any refresh-only entries recorded) · 1 = nothing
+#         to anchor · 2 = could not fetch/write/verify (recipe restored) ·
+#         3 = no official document at our version (recipe untouched) ·
+#         4 = a source disagrees with Arch's checksum (recipe restored)
 function anchor_sums_from_official -a pkg_path
     set -l pkg_name (basename "$pkg_path")
     set -l pkgbase (pkgbuild_var "$pkg_path" pkgbase)
@@ -1125,20 +1163,17 @@ function anchor_sums_from_official -a pkg_path
     end
 
     # Grade before writing. An entry the official file does not cover cannot be
-    # anchored, and hashing the download ourselves is precisely the false
-    # verification this function exists to avoid.
-    set -l unanchored
+    # anchored to anything Arch published — no longer a refusal (2026-09-24):
+    # the documented manual remedy was always 'updpkgsums in that recipe', and
+    # the sync runs that itself, recording the entries as refresh-only below.
+    # Entries the official file DOES cover are still verified against Arch's
+    # value after the write (the verification loop further down); that half is
+    # unchanged — a disagreement still refuses and restores.
+    set -l refresh_only
     for fn in $anchor_names
         if not grep -qF -- (printf '%s\t' $fn) "$map"
-            set -a unanchored $fn
+            set -a refresh_only $fn
         end
-    end
-    if test (count $unanchored) -gt 0
-        ui_error "$pkg_name: refusing to build — the official packaging repo carries $published $pkgver but publishes no checksum for:"
-        printf '  %s\n' $unanchored
-        echo "$refuse_manual"
-        rm -rf -- "$tmp"
-        return 3
     end
 
     if not cp -- "$pkg_path/PKGBUILD" "$tmp/PKGBUILD.orig"
@@ -1183,6 +1218,12 @@ function anchor_sums_from_official -a pkg_path
     set -l bad
     for i in (seq (count $anchor_names))
         set -l fn $anchor_names[$i]
+        # Refresh-only entries have no published value to compare against —
+        # they were recorded as fetch-only above; only anchored entries are
+        # verified against Arch here.
+        if contains -- $fn $refresh_only
+            continue
+        end
         set -l e $anchor_entries[$i]
         set -l alg (awk -F'\t' -v f="$fn" '$1==f{print $2}' "$map")
         set -l want (awk -F'\t' -v f="$fn" '$1==f{print $3}' "$map")
@@ -1227,6 +1268,19 @@ function anchor_sums_from_official -a pkg_path
         return 4
     end
 
+    # Refresh-only entries: say so, here and at run level. This is what keeps
+    # the refresh from being a silent weakening — the sums describe what the
+    # fetch delivered, so the log names every such entry and what stands behind
+    # it, and the run summary (synced.list → print_synced_notes) carries the
+    # review/commit instruction to the owner.
+    set -l n_refresh (count $refresh_only)
+    set -l n_anchored (math (count $anchor_names) - $n_refresh)
+    if test $n_refresh -gt 0
+        ui_warning "$pkg_name: official $published $pkgver publishes no checksum for (refreshed from the fetch, NOT anchored):"
+        printf '  %s\n' $refresh_only
+        echo "  Attestation: a detached signature is PGP-verified against the anchored payload at build time, a VCS source is pinned by its #tag/#commit, and a plain download is attested by nothing but the fetch (TLS). Review these sums before committing; '--no-sync' builds the committed version as-is."
+    end
+
     # The sums are part of the committed .SRCINFO too. Refresh it when the
     # recipe ships one, so a synced-and-anchored recipe does not leave a stale
     # .SRCINFO pinning the previous version's checksums (srcinfo-freshness.sh).
@@ -1239,7 +1293,16 @@ function anchor_sums_from_official -a pkg_path
         end
     end
 
-    ui_info "$pkg_name: checksums re-anchored to the official $published $pkgver checksums, and verified against the fetched sources"
+    if test $n_anchored -gt 0
+        ui_info "$pkg_name: checksums re-anchored to the official $published $pkgver checksums, and verified against the fetched sources"
+    else
+        ui_info "$pkg_name: checksums refreshed for $pkgver — official $published publishes no checksum for any moved source"
+    end
+    set -l synced_note "$pkg_name: checksums re-anchored to official $published $pkgver"
+    if test $n_refresh -gt 0
+        set synced_note "$pkg_name: checksums refreshed at $pkgver — $n_anchored anchored to official $published, $n_refresh refresh-only (fetch-only sums: review before committing)"
+    end
+    printf '%s\n' "$synced_note" >>"$_STATE_DIR/synced.list" 2>/dev/null
     rm -rf -- "$tmp"
     return 0
 end
@@ -1308,10 +1371,12 @@ function install_all
     end
     # $pkgs are absolute (find_pkg_dirs → $SCRIPT_DIR) — safe under any cwd.
     # Explicit if/else: fish rejects an all-variable command with empty $pre.
-    if not mkdir -p "$LOG_DIR"
-        ui_error "cannot create log directory: $LOG_DIR"
+    if not ensure_state_dirs
         return 1
     end
+    # Passed for call-site symmetry only: run_pacman_locked never opens its
+    # log_file argument, so install-all output goes to the terminal and this
+    # path never creates a file that could go root-owned.
     set -l install_log "$LOG_DIR/install-all.log"
     # Single-transaction escape hatch: the payload check still has to hold —
     # this path never passes through install_pkgs_now.
@@ -1423,6 +1488,30 @@ function run_pacman_locked -a log_file
         ui_error "internal error: pacman command is empty" >&2
         return 2
     end
+    # Mutex file contract: flock(1) creates it if absent (with the umask), so
+    # root mode pre-creates it AS THE BUILD USER and repairs an owner left by
+    # an interrupted root run — a later unprivileged run must be able to open
+    # it (measured: flock opens read-only, so a root-owned 0644 lock still
+    # works, but 0600 would not). Never replace an EXISTING lock inode:
+    # renaming a mutex file splits exclusion between concurrent runs.
+    if not test -e "$_PACMAN_MUTEX"
+        if test "$_ROOT_MODE" = "1"
+            if not sudo -u "$_BUILD_USER" touch "$_PACMAN_MUTEX" 2>/dev/null
+                ui_error "cannot create pacman mutex as $_BUILD_USER: $_PACMAN_MUTEX"
+                return 2
+            end
+        else if not touch "$_PACMAN_MUTEX" 2>/dev/null
+            ui_error "cannot create pacman mutex: $_PACMAN_MUTEX"
+            log_ownership_hint
+            return 2
+        end
+    else if test "$_ROOT_MODE" = "1"
+        chown "$_BUILD_USER": "$_PACMAN_MUTEX" 2>/dev/null
+    else if not test -r "$_PACMAN_MUTEX"
+        ui_error "cannot read pacman mutex: $_PACMAN_MUTEX"
+        log_ownership_hint
+        return 2
+    end
     printf '%s\n' "$_UI_ICON_INFO waiting for builder pacman mutex: $_PACMAN_MUTEX" >&2
     flock -x -w "$_PACMAN_MUTEX_WAIT" "$_PACMAN_MUTEX" \
         "$command_name" $command_args
@@ -1450,7 +1539,7 @@ end
 # order cannot cycle. On flock timeout rc=75 propagates as a loud dep-install
 # failure — the accepted outcome.
 function ensure_pacman_shim
-    if not mkdir -p "$LOG_DIR"
+    if not ensure_state_dirs
         return 1
     end
     set -l shim "$LOG_DIR/.pacman-shim"
@@ -1462,6 +1551,13 @@ function ensure_pacman_shim
         return 1
     end
     if not chmod 755 "$tmp"
+        rm -f -- "$tmp"
+        return 1
+    end
+    # Write-time ownership: publish the shim as the build user (the exec'ing
+    # makepkg runs as them; a SIGKILL between here and mv only strands a
+    # .tmp file, never a root-owned shim — the next run replaces it by rename).
+    if test "$_ROOT_MODE" = "1"; and not chown "$_BUILD_USER": "$tmp" 2>/dev/null
         rm -f -- "$tmp"
         return 1
     end
@@ -2113,6 +2209,13 @@ function install_pkgs_now -a log_file
     # log_file: the package's build log — install output is appended there so
     # quiet (lane) mode keeps install forensics in the per-package log.
     set -l pkgs $argv[2..-1]
+    # The transcript must be writable BEFORE pacman runs: appending rule-11
+    # forensics into an unopenable log would swallow the record of exactly the
+    # failure this function exists to make loud. Refusing here aborts the run.
+    if not ensure_log_writable "$log_file"
+        ui_error "install transcript not writable: $log_file — refusing to install without a record"
+        return 1
+    end
     # An empty list is NOT success. It means discovery found no archive for the
     # current pkgver-pkgrel, and returning 0 here is what let `-i` print "All
     # builds succeeded!" without pacman ever running (2026-09-20: a trailing
@@ -2506,11 +2609,19 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
         ui_heading "Building: $pkg_name"
     end
 
-    if not mkdir -p "$LOG_DIR"
-        ui_error "cannot create log directory: $LOG_DIR"
+    if not ensure_state_dirs
         return 1
     end
     set -l log_file (package_log_file "$package_id")
+    # Settle ownership/openability BEFORE the first open (see
+    # ensure_log_writable); the truncate below stays as the probe that names
+    # the file if a write still cannot be made — it must never be the first
+    # touch of a poisoned log. The makepkg redirects and install_pkgs_now's
+    # appends below all reuse this open file, so they are covered here.
+    if not ensure_log_writable "$log_file"
+        ui_error "cannot write build log: $log_file"
+        return 1
+    end
     # Lane supervisors append their own diagnostics to this same log. Truncate
     # it once here, then append every build stream so the outer redirection
     # cannot be reordered by a later makepkg redirection.
@@ -2525,18 +2636,33 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
         # The sync moved a source URL, so the committed sums now describe the
         # previous version. They are re-anchored to the official Arch checksums
         # and the fetched sources are verified against those — not skipped (which
-        # builds unverified sources) and not re-hashed from the fetch alone
-        # (which verifies nothing). anchor_sums_from_official reports why it
-        # cannot, and every such path refuses the build.
+        # builds unverified sources), and for an entry Arch publishes, never
+        # re-hashed from the fetch alone either (an entry Arch publishes NO
+        # checksum for is refreshed at sync time and recorded as fetch-only —
+        # anchor_sums_from_official's header carries the full trust model).
         #
         # Neither the anchoring nor a refusal may be silent: build_package is
         # only ever called quiet (every lane redirects its stdout/stderr into
         # the per-package log), so that log is the only record a person can
         # inspect afterwards.
         anchor_sums_from_official "$pkg_path" $moved_sources
-        set -l anchor_rc $status
-        if test "$anchor_rc" -ne 0; and test "$anchor_rc" -ne 1
-            return 1
+        switch $status
+            case 0 1
+                # Anchored (0) or nothing to anchor (1) — build proceeds.
+            case 4
+                # A source disagrees with Arch's published checksum: an
+                # integrity signal, treated like a failed build — it stops the
+                # dispatch. Parking it would keep building the rest of the run
+                # over a possible tamper signal.
+                return 1
+            case '*'
+                # Anchoring is impossible right now (2: fetch/tool/refresh
+                # failure, recipe restored; 3: no official document at our
+                # version, recipe untouched). Defer instead of draining the
+                # dispatch: the lane result protocol is unchanged — the defer
+                # code rides in the same rc field — and the dispatcher parks
+                # the recipe with a named marker while the rest continues.
+                return $_ANCHOR_DEFER_RC
         end
     end
 
@@ -2666,6 +2792,115 @@ end
 
 function package_log_file -a pkg
     echo "$LOG_DIR/"(basename "$pkg")".log"
+end
+
+# What this run rewrote in the tree through the stable sync, as run-level
+# witness: a run never commits (the disposition of these edits is the owner's),
+# so the end-of-run summary must name every recipe whose PKGBUILD the sync or
+# the sum refresh touched — otherwise the dirty tree has only a per-package
+# log line nobody reads. Lane children append (best-effort); run_lanes clears
+# the file at run start.
+function print_synced_notes
+    set -l f "$_STATE_DIR/synced.list"
+    if not test -s "$f"
+        return 0
+    end
+    echo "Synced with the repo this run (uncommitted — review with 'git diff', then commit):"
+    sed 's/^/  /' "$f"
+end
+
+# ─── Runtime-state ownership: settled at write time ─────────────────────────
+# 2026-09-23 incident: root mode opened its logs through the SUPERVISOR's
+# shell redirects and repaired ownership only at build_package exit, so a run
+# killed mid-flight left the in-flight logs (and .state/ itself) root-owned.
+# The next unprivileged run aborted at the lane-spawn redirect with a
+# misleading "BUILD FAILED (rc=125, 0m00s)" — the build never started, and
+# the crashed run's log content was left unopenable. The contract now:
+#   * directories — ensure_state_dirs: root mode sweeps $_STATE_DIR to the
+#     build user at startup; unprivileged mode refuses to run when LOG_DIR is
+#     not writable and names the fix.
+#   * files — ensure_log_writable before every create/truncate/append: root
+#     mode creates as the build user (NEVER as root — root creation is what
+#     poisons the next run) and repairs wrong owners; unprivileged mode
+#     QUARANTINES an unopenable log by rename (forensics preserved under a
+#     .stale name, announcement on stderr — never a silent truncate) or fails
+#     with the exact chown/rm command.
+# Forensics sites call this best-effort: a broken forensics channel must
+# report, not break, the run that is recording in it.
+function log_ownership_hint
+    printf '    fix: sudo chown -R %s: %s\n' "$_BUILD_USER" "'$_STATE_DIR'" >&2
+    printf '    (or remove the named file: sudo rm <file>)\n' >&2
+end
+
+function ensure_state_dirs
+    if not mkdir -p "$_STATE_DIR" "$LOG_DIR"
+        ui_error "cannot create log directory: $LOG_DIR"
+        log_ownership_hint
+        return 1
+    end
+    if test "$_ROOT_MODE" = "1"
+        # One sweep repairs directories AND files an earlier interrupted root
+        # run left behind. Idempotent, and the tree is small (logs + lock +
+        # shim); build_package already pays an equal chown -R per package.
+        if not chown -R "$_BUILD_USER": "$_STATE_DIR" 2>/dev/null
+            ui_error "cannot restore ownership of runtime state: $_STATE_DIR"
+            log_ownership_hint
+            return 1
+        end
+    else if not test -w "$LOG_DIR"
+        ui_error "cannot write log directory: $LOG_DIR"
+        log_ownership_hint
+        return 1
+    end
+    return 0
+end
+
+function ensure_log_writable -a file
+    if test -z "$file"
+        ui_error "internal error: ensure_log_writable called without a path"
+        return 1
+    end
+    if test "$_ROOT_MODE" = "1"
+        if test -e "$file"
+            set -l owner (stat -c %U -- "$file" 2>/dev/null)
+            if test "$owner" = "$_BUILD_USER"
+                return 0
+            end
+            if not chown "$_BUILD_USER": "$file" 2>/dev/null
+                ui_error "cannot repair ownership of runtime file: $file (owner: $owner)"
+                log_ownership_hint
+                return 1
+            end
+            printf '⚠ repaired root-owned runtime file: %s -> %s\n' "$file" "$_BUILD_USER" >&2
+            return 0
+        end
+        # Create AS THE BUILD USER. A root fallback touch here would re-create
+        # the incident: root creation is precisely what poisons the next run.
+        if not sudo -u "$_BUILD_USER" touch "$file" 2>/dev/null
+            ui_error "cannot create runtime file as $_BUILD_USER: $file"
+            log_ownership_hint
+            return 1
+        end
+        return 0
+    end
+    # Unprivileged: the build user cannot chown, so an unopenable file (root-
+    # owned 0644 from a crashed root run, chmod'ed away, ...) is preserved
+    # under a unique .stale name — rename needs only directory write, which
+    # ensure_state_dirs has already gated — and a fresh log starts. The old
+    # content is the crashed run's forensics: never truncated in place.
+    if test -e "$file"; and not test -w "$file"
+        set -l stale "$file.stale."(date +%s)"."
+        set stale "$stale$fish_pid"
+        if not mv -- "$file" "$stale" 2>/dev/null
+            ui_error "cannot write runtime file (not writable by "(id -un)"): $file"
+            log_ownership_hint
+            printf '    or: sudo rm %s\n' "$file" >&2
+            return 1
+        end
+        printf '⚠ preserved unopenable log: %s -> %s (not writable by %s)\n' \
+            "$file" "$stale" (id -un) >&2
+    end
+    return 0
 end
 
 function require_command -a command_name
@@ -2832,6 +3067,15 @@ end
 function write_lane_result -a result_file pkg rc dur
     set -l tmp_result "$result_file.tmp.$fish_pid"
     if not printf '%s %s %s\n' "$pkg" "$rc" "$dur" >"$tmp_result"
+        rm -f -- "$tmp_result"
+        return 1
+    end
+    # Write-time ownership: in root mode the lane child creates this tmp as
+    # root, so hand it to the build user BEFORE the atomic publish — the
+    # published result must never be root-owned. The `pkg rc seconds` line
+    # and the atomic mv contract are unchanged; a SIGKILL between printf and
+    # chown strands only the tmp (next run rm -f's by directory permission).
+    if test "$_ROOT_MODE" = "1"; and not chown "$_BUILD_USER": "$tmp_result" 2>/dev/null
         rm -f -- "$tmp_result"
         return 1
     end
@@ -3082,8 +3326,13 @@ function stop_lane_process -a lane_pid reason pkg
         dispatcher_log "escalate: pid=$process_id pgid=$lane_pid pkg=$pkg_label SIGKILL after grace reason=$why"
         if test -n "$pkg"
             set -l pkg_log (package_log_file "$pkg")
-            printf '%s [DEBUG-gsa-term] escalate: pid=%s SIGKILL after %ss grace (reason=%s)\n' \
-                "$_UI_ICON_WARN" "$process_id" "$_LANE_STOP_GRACE_S" "$why" >>"$pkg_log"
+            # Best-effort forensics: quarantine/repair first, skip the line
+            # only if even that cannot make the log writable (the same event
+            # is already mirrored to dispatcher.log above).
+            if ensure_log_writable "$pkg_log"
+                printf '%s [DEBUG-gsa-term] escalate: pid=%s SIGKILL after %ss grace (reason=%s)\n' \
+                    "$_UI_ICON_WARN" "$process_id" "$_LANE_STOP_GRACE_S" "$why" >>"$pkg_log"
+            end
         end
         kill -KILL "$process_id" 2>/dev/null
     end
@@ -3159,6 +3408,28 @@ function check_rustc_sanity
     return 0
 end
 
+# True when $pkg transitively depends (within the build list) on a recipe this
+# run deferred — used to label unstarted packages honestly: waiting on a
+# parked recipe is not the dependency cycle the old message claimed. The graph
+# is acyclic (topo_sort validated it), so the recursion terminates.
+function waits_on_deferred -a pkg
+    if test (count $_lane_deferred) -eq 0
+        return 1
+    end
+    for dep in (deps_of $pkg)
+        if not contains "$dep" $_lane_sorted
+            continue
+        end
+        if contains "$dep" $_lane_deferred
+            return 0
+        end
+        if waits_on_deferred $dep
+            return 0
+        end
+    end
+    return 1
+end
+
 function pick_next_ready -a solo_ok
     # Print the first unstarted package whose workspace deps are all done.
     # solo_ok=0 skips core-group packages (they are only dispatched solo).
@@ -3177,6 +3448,13 @@ function pick_next_ready -a solo_ok
             # them, the readiness check must too (they will never be "done").
             if not contains "$dep" $_lane_sorted
                 continue
+            end
+            # A deferred dep IS in _lane_done (the lane finished, parked), but
+            # its package was never built or installed — dispatching the
+            # dependent would compile it against the wrong system state.
+            if test (count $_lane_deferred) -gt 0; and contains "$dep" $_lane_deferred
+                set ok 0
+                break
             end
             if test (count $_lane_done) -eq 0; or not contains "$dep" $_lane_done
                 set ok 0
@@ -3287,10 +3565,12 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     end
     set -g _RL_INTERRUPTED 0
     set -g _RL_BLOCKED 0
+    set -g _RL_DEFERRED
     set -g _RL_SUDO_NOTE ""
     set -g _lane_sorted $sorted
     set -g _lane_done
     set -g _lane_started
+    set -g _lane_deferred
 
     set -l total (count $sorted)
     if test "$total" -eq 0
@@ -3360,6 +3640,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -l failed_dur
     set -l stop_starting 0
     set -l blocked 0
+    set -l deferred
     set -l sudo_stopped 0
     # -i preflight: decide whether installs are possible BEFORE the first hour
     # of building is spent on packages that could never be installed. A prompt
@@ -3383,10 +3664,14 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -l last_sudo (date +%s)
     set -l disp_count 0
 
-    if not mkdir -p "$LOG_DIR"
-        ui_error "cannot create log directory: $LOG_DIR"
+    if not ensure_state_dirs
         return 1
     end
+    # One run's sync/refresh notes: never carry the previous run's recipes
+    # into this summary. Deleted by directory permission, so it works even
+    # when an earlier root run left the file root-owned.
+    rm -f -- "$_STATE_DIR/synced.list"
+    printf '' >"$_STATE_DIR/synced.list" 2>/dev/null
     # Generate the makepkg dep-install shim at run start so every lane child
     # (lane_job re-checks and exports PACMAN) shares the builder mutex.
     if not ensure_pacman_shim
@@ -3475,10 +3760,16 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     if test (count $res_raw) -gt 0
                         set raw_joined (string join ' | ' -- (string escape -- $res_raw))
                     end
-                    printf '%s\n' \
-                        "$_UI_ICON_ERROR lane supervisor produced no valid result (pid=$lane_pid[$i], state=$lane_state)" \
-                        "  result file bytes: $raw_joined" \
-                        "  Check the lane log: $log_file" >>"$log_file"
+                    # Best-effort forensics (mirrored to dispatcher.log
+                    # below): settle log openability first — this append used
+                    # to be the third "Permission denied" of the 2026-09-23
+                    # incident when the lane's log was root-owned.
+                    if ensure_log_writable "$log_file"
+                        printf '%s\n' \
+                            "$_UI_ICON_ERROR lane supervisor produced no valid result (pid=$lane_pid[$i], state=$lane_state)" \
+                            "  result file bytes: $raw_joined" \
+                            "  Check the lane log: $log_file" >>"$log_file"
+                    end
                     dispatcher_log "reap anomaly pkg=$p pid=$lane_pid[$i] state=$lane_state reason=missing-or-malformed raw=$raw_joined"
                     set stop_starting 1
                     set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR lane lost $p"
@@ -3503,6 +3794,14 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 if test $rc -eq 0
                     set -a succeeded $p
                     set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_OK completed $p"
+                else if test $rc -eq $_ANCHOR_DEFER_RC
+                    # Anchoring refused and build_package parked the recipe:
+                    # NOT a failed build. Dispatch keeps going; dependents of
+                    # $p are held back by pick_next_ready; $p stays out of
+                    # succeeded+failed so it lands in the resume command.
+                    set -a deferred $p
+                    set -a _lane_deferred $p
+                    set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_WARN deferred $p"
                 else
                     set -a failed $p
                     set -a failed_rc $rc
@@ -3519,6 +3818,12 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 if test "$_OUTPUT_INTERACTIVE" != "1"
                     if test $rc -eq 0
                         printf "  %s %s (%s)\n" "$_UI_ICON_OK" $p (fmt_dur $dur)
+                    else if test $rc -eq $_ANCHOR_DEFER_RC
+                        # The named error and its recovery lines live in the
+                        # log; the run summary tails it — this line only has
+                        # to park the recipe visibly without breaking pipes.
+                        printf "  %s %s: DEFERRED (anchoring refused) — log: %s\n" \
+                            "$_UI_ICON_WARN" $p (package_log_file "$p")
                     else
                         set -l log_file (package_log_file "$p")
                         printf "  %s %s: BUILD FAILED (rc=%s, %s) — log: %s\n" \
@@ -3608,12 +3913,26 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 if contains "$next" $_GROUP_core
                     set jobs $core_jobs
                 end
+                set -l rf "$LOG_DIR/.lane$i.result"
+                set -l child_log (package_log_file "$next")
+                # Settle log ownership/openability BEFORE the lane exists.
+                # A poisoned log used to die here — the spawn redirect failed
+                # and surfaced later as a bogus "BUILD FAILED (rc=125, 0m00s)"
+                # with the build never started (2026-09-23). Failure names
+                # the file and stops dispatch; counting it in failed[] makes
+                # run_lanes return non-zero (its stop contract).
+                if not ensure_log_writable "$child_log"
+                    ui_error "cannot prepare build log for $next — stopped dispatching"
+                    set -a failed $next
+                    set -a failed_rc 1
+                    set -a failed_dur 0
+                    set stop_starting 1
+                    continue
+                end
                 set -a _lane_started $next
                 set lane_busy[$i] 1
                 set lane_pkg[$i] $next
                 set lane_start[$i] (date +%s)
-                set -l rf "$LOG_DIR/.lane$i.result"
-                set -l child_log (package_log_file "$next")
                 rm -f "$rf"
                 # Clear before the child starts preflight/sync so the
                 # dashboard never shows a previous run's tail for this lane.
@@ -3659,10 +3978,28 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 if test $unstarted -gt 0
                     set blocked $unstarted
                     abort_dashboard
-                    ui_warning "$unstarted package(s) never became ready (dependency cycle or missing dep) — skipped:"
+                    # Honest labels: a package whose dependency was DEFERRED
+                    # waited on a parked recipe, not on a cycle (2026-09-24).
+                    set -l waiting 0
                     for pkg in $_lane_sorted
                         if not contains "$pkg" $_lane_started
-                            echo "    ? $pkg"
+                            if waits_on_deferred $pkg
+                                set waiting (math $waiting + 1)
+                            end
+                        end
+                    end
+                    if test $waiting -gt 0
+                        ui_warning "$unstarted package(s) not dispatched ($waiting wait on a deferred recipe) — skipped:"
+                    else
+                        ui_warning "$unstarted package(s) never became ready (dependency cycle or missing dep) — skipped:"
+                    end
+                    for pkg in $_lane_sorted
+                        if not contains "$pkg" $_lane_started
+                            if waits_on_deferred $pkg
+                                echo "    ⏸ $pkg — waits on a deferred package"
+                            else
+                                echo "    ? $pkg"
+                            end
                         end
                     end
                 end
@@ -3727,15 +4064,26 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
             end
         end
     end
+    if test "$_OUTPUT_INTERACTIVE" = "1"; and test (count $deferred) -gt 0
+        for p in $deferred
+            printf "  %s %s: DEFERRED (anchoring refused) — log: %s\n" \
+                "$_UI_ICON_WARN" $p (package_log_file "$p")
+        end
+    end
 
     # Expose results to main (lane jobs are forked processes — the dispatcher
     # is the only writer of these globals).
     set -g _RL_SUCCEEDED $succeeded
     set -g _RL_FAILED $failed
     set -g _RL_BLOCKED $blocked
+    set -g _RL_DEFERRED $deferred
     # A dispatch stopped by a lost sudo credential left packages unbuilt: that
-    # must never be reported as "All builds succeeded!" (2026-09-17).
+    # must never be reported as "All builds succeeded!" (2026-09-17). Nor may
+    # a run that parked a recipe — parked work needs the owner (2026-09-24).
     if test (count $failed) -gt 0 -o "$blocked" -gt 0; or test "$sudo_stopped" -eq 1
+        return 1
+    end
+    if test (count $deferred) -gt 0
         return 1
     end
     return 0
@@ -3803,12 +4151,18 @@ function usage
     echo "                     source=() URL moves with the version, the recipe's checksums"
     echo "                     are re-anchored to the value Arch published for that version"
     echo "                     (the official packaging repo's .SRCINFO) and the fetched"
-    echo "                     sources are verified against it — never skipped, and never"
-    echo "                     re-hashed from the fetch alone. If it cannot anchor (no"
-    echo "                     official revision at that version, or an entry Arch does not"
-    echo "                     publish) it REFUSES the build and restores the recipe rather"
-    echo "                     than build unverified sources. A bump that leaves source=()"
-    echo "                     alone builds against the committed sums unchanged."
+    echo "                     sources are verified against it — never skipped, and for an"
+    echo "                     entry Arch publishes, never re-hashed from the fetch alone."
+    echo "                     An entry Arch publishes NO checksum for (SKIP or absent) is"
+    echo "                     instead refreshed by updpkgsums at sync time — the old"
+    echo "                     manual remedy, now automatic — and recorded per entry in"
+    echo "                     the log and the run summary as fetch-only, for you to"
+    echo "                     review before committing. With no official revision at"
+    echo "                     that version the recipe cannot be classified at all: it"
+    echo "                     REFUSES, restores the recipe, and the run DEFERS it —"
+    echo "                     parked with its recovery lines in the summary while the"
+    echo "                     rest of the dispatch continues. A bump that leaves"
+    echo "                     source=() alone builds against the committed sums unchanged."
     echo "                     See docs/build-guide.md."
     echo "  --lanes N|auto     Run N makepkg lanes, or choose from CPU/RAM (default "(string join '' -- "$_DEFAULT_LANES")"). Interactive"
     echo "                    terminals get a compact dashboard with active log tails;"
@@ -4433,8 +4787,7 @@ function main
         echo ""
     end
 
-    if not mkdir -p "$LOG_DIR"
-        ui_error "cannot create log directory: $LOG_DIR"
+    if not ensure_state_dirs
         return 1
     end
 
@@ -4468,6 +4821,7 @@ function main
     end
 
     echo ""
+    print_synced_notes
     if test $run_rc -eq 0
         ui_heading "All builds succeeded!"
         echo "Built: "(count $succeeded)" packages"
@@ -4477,17 +4831,28 @@ function main
         return 0
     end
 
-    # Failure summary — dispatch stopped on first failure and in-flight lanes
-    # were drained, so anything unstarted is genuinely pending. With -i
-    # everything built so far is ALREADY installed (resume with -s -i).
     set -l remaining
     for pkg in $sorted
         if not contains "$pkg" $succeeded; and not contains "$pkg" $failed
             set -a remaining $pkg
         end
     end
-    if test -n "$sudo_note"; and test (count $failed) -eq 0 -a "$blocked" -eq 0
+    set -l deferred $_RL_DEFERRED
+    # Failure summary — dispatch stopped on first failure and in-flight lanes
+    # were drained, so anything unstarted is genuinely pending. With -i
+    # everything built so far is ALREADY installed (resume with -s -i).
+    # A DEFERRAL is the deliberate exception (2026-09-24): an unanchorable
+    # recipe parks itself and the dispatch CONTINUES, so this summary must not
+    # claim a stop that never happened — it names the parked recipes instead.
+    if test (count $failed) -gt 0
+        ui_error "Build failed — stopped dispatching, drained in-flight lanes."
+    else if test "$blocked" -eq 0; and test (count $deferred) -eq 0; and test -n "$sudo_note"
         ui_warning "Stopped early — $sudo_note."
+    else if test (count $deferred) -gt 0
+        ui_warning "(count $deferred) recipe(s) deferred — the rest of the dispatch continued; the parked recipes below were not built."
+        if test -n "$sudo_note"
+            ui_warning "Stopped early — $sudo_note."
+        end
     else
         ui_error "Build failed — stopped dispatching, drained in-flight lanes."
     end
@@ -4495,7 +4860,16 @@ function main
     echo "Successful builds: "(count $succeeded)
     echo "Failed builds:     "(count $failed)
     echo "Blocked:           $blocked"
+    echo "Deferred:          "(count $deferred)
     echo "Remaining:         "(count $remaining)
+    if test (count $deferred) -gt 0
+        echo ""
+        echo "Deferred recipes (not built — the log tail says why):"
+        for p in $deferred
+            echo "  $p"
+            print_log_tail (package_log_file "$p")
+        end
+    end
     if test (count $remaining) -gt 0
         # Mirror every flag that changes what a resume MEANS. Dropping -i was
         # the worst omission: the interrupted run was installing each package as
@@ -4540,7 +4914,17 @@ end
 function dispatcher_log -a message
     test -n "$message"; or return 0
     test -n "$LOG_DIR"; or return 0
-    mkdir -p "$LOG_DIR" 2>/dev/null; or return 0
+    # Best-effort by contract (signal forensics must never fail the run):
+    # shared helpers with stdout suppressed so a mid-dashboard call cannot
+    # garble the renderer — their quarantine/repair notices ride stderr — and
+    # a poisoned dispatcher.log is handled instead of silently losing this
+    # line behind the 2>/dev/null append below.
+    if not ensure_state_dirs >/dev/null
+        return 0
+    end
+    if not ensure_log_writable "$LOG_DIR/dispatcher.log" >/dev/null
+        return 0
+    end
     printf '%s [DEBUG-gsa-term] %s\n' (date '+%Y-%m-%dT%H:%M:%S%z') "$message" \
         >>"$LOG_DIR/dispatcher.log" 2>/dev/null
 end
@@ -4604,8 +4988,13 @@ function gsa_handle_signal -a sig rc binder
             if set -q _LANE_JOB_PKG; and test -n "$_LANE_JOB_PKG"
                 write_lane_result "$_LANE_JOB_RESULT" "$_LANE_JOB_PKG" "$rc" "$dur"
                 set -l pkg_log (package_log_file "$_LANE_JOB_PKG")
-                printf '%s lane child received %s (rc=%s, pid=%s) — honest signal result recorded\n' \
-                    "$_UI_ICON_WARN" "$sig" "$rc" "$fish_pid" >>"$pkg_log"
+                # Best-effort: the honest signal line must not turn the
+                # handler itself into a failure — skip only if the log is
+                # unwritable even after quarantine/repair.
+                if ensure_log_writable "$pkg_log"
+                    printf '%s lane child received %s (rc=%s, pid=%s) — honest signal result recorded\n' \
+                        "$_UI_ICON_WARN" "$sig" "$rc" "$fish_pid" >>"$pkg_log"
+                end
             else
                 write_lane_result "$_LANE_JOB_RESULT" unknown "$rc" "$dur"
             end

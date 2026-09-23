@@ -178,8 +178,17 @@
     packaging repo's `.SRCINFO` at the version it just synced to, matches every
     *moved* source against the checksums published there, writes with
     `updpkgsums`, and verifies the fetched source against Arch's published
-    checksum (algorithms need not match — the artifact mediates). Every path that
-    cannot anchor refuses and restores the recipe.
+    checksum (algorithms need not match — the artifact mediates). The stance
+    split on 09-24: an entry Arch publishes a value for is still
+    anchor-or-refuse (a disagreement refuses, restores, and *stops* the
+    dispatch — an integrity signal, like a failed build); an entry Arch
+    publishes NO checksum for (SKIP or absent) is refreshed by that same
+    `updpkgsums` run and recorded per entry as fetch-only — the documented
+    manual remedy, automated and loud; with no official document at that
+    version the recipe still refuses and restores, but is now DEFERRED
+    (parked via `_ANCHOR_DEFER_RC` with its recovery lines in the run
+    summary) instead of draining the whole dispatch — one unanchorable recipe
+    once cost ~120 packages their run.
     Three measurements shaped it, and each contradicted a first assumption:
     (a) **staleness is a moved source, not a moved version** — 26 of the 28
     `packages/stable` recipes pin a literal version inside their `source=()`
@@ -199,9 +208,33 @@
     `validpgpkeys` rather than with a checksum.
     **If the builder lowers a guard for a build, the log and the artifact must
     say so** — a weakening that leaves no record is indistinguishable from a
-    bug. **And if the builder auto-updates a value, the new value must be checked
+    bug (a refresh-only sum is exactly such a disclosed lowering: named in the
+    package log and in the run-level `Synced with the repo this run` summary,
+    never silent). **And if the builder auto-updates a value, the new value must be checked
     against a source the builder did not itself produce** — self-consistent is
     not verified.
+19. **Runtime state is owned at WRITE time** (09-23 log-ownership incident):
+    root mode's logs/locks/dirs are opened by the SUPERVISOR's shell, so
+    repair-at-package-exit had a crash window: a killed root run left its
+    in-flight logs root-owned (and `.state/` itself, which no chown ever
+    named), and the next unprivileged run died at the lane-spawn redirect
+    with `rc=125, 0m00s` before any build started. The contract now lives in
+    `ensure_state_dirs` (startup: root sweeps `chown -R` over
+    `$_STATE_DIR`; unprivileged refuses when `LOG_DIR` is unwritable, naming
+    the remedy) and `ensure_log_writable` (before EVERY state-file open:
+    root repairs wrong owners loudly and creates missing files via
+    `sudo -u touch` — never as root, no root fallback; unprivileged
+    QUARANTINES an unopenable file to `<path>.stale.<epoch>.<pid>` with a
+    `preserved` announcement — forensics are renamed aside, never truncated —
+    or fails named through `log_ownership_hint`). Any new `$LOG_DIR` open
+    site must call `ensure_log_writable` first; forensics appends guard it
+    best-effort (report, don't break, the run being recorded). The pacman
+    mutex is the exception that proves the rule: never rename a
+    possibly-held lock inode — root pre-creates it as the build user and
+    unprivileged runs only verify readable (flock(1) opens read-only;
+    measured: `flock -x` succeeds on root-owned 0644 and 0444 files). Pinned by
+    `tests/log-ownership.sh` (quarantine) and `tests/log-ownership-root.sh`
+    (root repair).
 
 ## 2. Workspace overview
 
@@ -611,11 +644,22 @@ recipe).
   builder now fetches the official `.SRCINFO` for the version it synced to,
   matches every *moved* source against Arch's published sums, writes with
   `updpkgsums`, and verifies the fetched source against Arch's checksum.
-  Anything it cannot anchor refuses the build and restores the recipe, and it
-  reports its work in the package log rather than silently skipping the check.
-  `tests/stable-sync-checksums.sh` pins eleven scenarios; each was falsified
+  Anything it cannot anchor used to refuse the build outright — and one
+  unanchorable entry cost a 126-package run ~120 undispatched packages. The
+  stance split on 09-24: an entry Arch publishes a value for is
+  anchor-or-refuse (mismatch refuses, restores, and stops the dispatch); an
+  entry Arch publishes NO checksum for is refreshed by that same `updpkgsums`
+  run and recorded LOUDLY as fetch-only — the manual remedy it used to
+  prescribe, automated, with the review/commit instruction in the run-level
+  `Synced with the repo this run` summary; with no official document the
+  recipe refuses, restores, and is DEFERRED — parked with a named marker and
+  its recovery lines while the dispatch continues, its dependents held back
+  and labelled `waits on a deferred package`.
+  `tests/stable-sync-checksums.sh` pins every scenario in its header and
+  `tests/anchor-defer.sh` pins the deferral end to end; each was falsified
   before being trusted — reverting the sum map, the `name::` rule, the source
-  diff, the VCS branch or the tag fallback each makes exactly one scenario fail.
+  diff, the VCS branch, the tag fallback, the refresh-only branch or the
+  defer switch each makes scenarios fail exactly where they should.
 
 - **Sources and checksums in a .SRCINFO line up only within one algorithm**
   (2026-09-20, same work): Arch publishes the same file list once *per*

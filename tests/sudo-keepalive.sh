@@ -78,10 +78,18 @@ cat >"$fixture/bin/date" <<'EOF'
 set -uo pipefail
 if [[ ${1:-} == '+%s' ]]; then
     : "${GSA_FAKE_DATE_COUNTER:?fixture forgot to set GSA_FAKE_DATE_COUNTER}"
+    # Serialize read-modify-write under flock: dispatcher and lane children
+    # call this concurrently, and an unguarded truncate+write let a reader
+    # observe an empty file, reset the counter to 1, and produce negative
+    # durations that lane_result_valid rejected as malformed (rc=125).
+    exec 9>>"$GSA_FAKE_DATE_COUNTER"
+    flock -x 9
     ticks=0
     [[ -s $GSA_FAKE_DATE_COUNTER ]] && read -r ticks <"$GSA_FAKE_DATE_COUNTER"
     ticks=$((ticks + 1))
     printf '%s\n' "$ticks" >"$GSA_FAKE_DATE_COUNTER"
+    flock -u 9
+    exec 9>&-
     printf '%s\n' "$((1700000000 + ticks * 300))"
     exit 0
 fi

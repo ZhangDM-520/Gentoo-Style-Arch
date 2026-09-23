@@ -49,7 +49,10 @@ sudo fish build-all.fish --group core
 
 The supervisor installs as root but runs `makepkg` as the invoking user and
 resolves that user's real home directory. A bare root shell without an
-invoking user is rejected.
+invoking user is rejected. Runtime-state ownership is settled at write time:
+the supervisor repairs wrong owners (announced), creates every state file as
+the invoking user — never as root — and a run killed mid-flight can no longer
+leave logs that poison the next one.
 
 ### Stable version sync and checksum verification
 
@@ -92,7 +95,11 @@ packaging repo**:
    version's sums describe different files.
 2. Match the moved `source=()` entries against the checksums it publishes, by
    the name `makepkg` gives each one (a `name::url` override wins over the URL
-   basename). Every moved entry must appear.
+   basename). Entries it publishes a value for are *anchored* (step 4);
+   entries it publishes **no** checksum for (SKIP, or absent from its source
+   list — e.g. the kernel recipes' concatenated local sources) are
+   *refresh-only*: the same `updpkgsums` run refreshes them, and the package
+   log and the run summary each name them as fetch-only (see below).
 3. Write the refreshed sums with makepkg's own `updpkgsums`, so the recipe keeps
    its formatting and its choice of algorithm.
 4. Verify the fetched sources against Arch's published checksum. The algorithm
@@ -116,25 +123,65 @@ that exists:
   and verified against the fetched sources
 ```
 
-**Every path that cannot anchor refuses the build**, and the recipe is restored
-byte-for-byte where it was already rewritten: `curl` or `updpkgsums` missing; no
-official revision carries our version; its sources and checksums do not line up
-(an unparseable file is never an anchor); an entry is not published there at all
-(the Linux-kernel recipes rebuild upstream patches as concatenated local
-sources, which no official PKGBUILD describes); the checkout could not be
-recomputed; or a source disagrees with Arch's checksum. Nothing is built or
-installed in those cases, and the message names the failing entry:
+**A source that disagrees with Arch's checksum refuses the build** — that is
+the integrity signal, and it *stops the dispatch* like a failed build — and the
+recipe is restored byte-for-byte where it was already rewritten. The same
+refusal, now carried as a **deferral** (below), covers the paths where
+anchoring is impossible at all: `curl` or `updpkgsums` missing; no official
+revision carries our version; its sources and checksums do not line up (an
+unparseable file is never an anchor); the checkout could not be recomputed;
+or `updpkgsums` itself fails. Nothing is built or installed in those cases,
+and the message names the failing entry:
 
 ```
 ✗ <package>: refusing to build — a source does not match the official Arch checksum
     <file>: Arch's sha512 is <want>, the fetched source hashes to <got>
 ```
 
-`--no-sync` avoids the whole path: no rewrite, no anchoring, no refusal, and the
-committed version and sums build as-is, at the cost of not tracking the repo
-version. **`--skipchecksums` is never passed by the builder.** Refreshing by
-hand when the anchor cannot help is `updpkgsums` in the recipe, then commit and
-rebuild. Signature verification is a separate check throughout — it is enforced
+Refresh-only entries get the loud record instead of a refusal:
+
+```
+⚠ <package>: official <pkg> <ver> publishes no checksum for (refreshed from
+  the fetch, NOT anchored):
+    <file>
+  Attestation: a detached signature is PGP-verified against the anchored
+  payload at build time, a VCS source is pinned by its #tag/#commit, and a
+  plain download is attested by nothing but the fetch (TLS). Review these
+  sums before committing; '--no-sync' builds the committed version as-is.
+```
+
+**One unanchorable recipe no longer strangles the dispatch** (2026-09-24):
+the impossible-to-anchor paths *defer* the recipe instead of failing it. The
+lane result protocol is unchanged — `_ANCHOR_DEFER_RC` (99) rides in the
+ordinary rc field — but the reap parks the recipe (`DEFERRED`, never counted
+failed, dispatch keeps going), `pick_next_ready` holds back its dependents
+(printed `waits on a deferred package`, not "dependency cycle"), the run
+summary tails the parked recipe's log (the named error plus both recovery
+lines), and the run exits non-zero with every parked or waiting package in the
+resume command. Before this, ONE recipe whose official `.SRCINFO` published no
+checksum for a moved source cost the other ~120 packages their dispatch —
+twice in a row. Signature files are outside checksum anchoring altogether
+(`.sign` joins `.sig`/`.asc`): makepkg verifies them with PGP against
+`validpgpkeys` over the anchored payload, which is why refreshing their hash
+would prove nothing.
+
+At the end of every run that touched the tree, the sync's dispositions are
+printed at run level — a run never commits; that stays the maintainer's:
+
+```
+Synced with the repo this run (uncommitted — review with 'git diff', then commit):
+  <pkg>: <old-ver> → <new-ver> (synced with repo)
+  <pkg>: checksums refreshed at <ver> — <n> anchored to official <pub>, <m> refresh-only (fetch-only sums: review before committing)
+```
+
+`--no-sync` avoids the whole path: no rewrite, no anchoring, no refusal, no
+refresh-only record, and the committed version and sums build as-is, at the
+cost of not tracking the repo version. **`--skipchecksums` is never passed by
+the builder.** Every refusal carries the same recovery line: refresh by hand
+with `updpkgsums` in the recipe, then commit and rebuild — which is exactly
+what the sync now runs itself for refresh-only entries; the manual step
+remains the remedy when no official document can anchor the recipe at all.
+Signature verification is a separate check throughout — it is enforced
 wherever the recipe has a `validpgpkeys` source, and 13 of the 28
 `packages/stable` recipes anchor authenticity that way rather than by checksum.
 
@@ -175,6 +222,13 @@ archives follow its `SRCDEST`/`PKGDEST` configuration:
 GSA_STATE_DIR="$HOME/.local/state/gentoo-style-arch" \
   fish build-all.fish --group git
 ```
+
+State files are owned by the build user from the moment they are created. If
+a previous root-mode run was killed mid-flight and left an unopenable file
+behind, an unprivileged run preserves it under a
+`<file>.stale.<epoch>.<pid>` name — announced — and starts a fresh log rather
+than failing; running the same command once under `sudo` repairs ownership of
+the whole state directory at startup instead.
 
 `--cleanup` removes package archives. `--nuclear` interactively removes
 downloaded sources, VCS clones, and makepkg staging directories while keeping

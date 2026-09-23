@@ -27,7 +27,10 @@ set -euo pipefail
 #      auto-updpkgsums would have accepted, which is what makes this a test;
 #   5. no official checksum at our version (404, or a repo carrying another
 #      version): refuse, leaving the recipe untouched;
-#   6. an entry Arch does not publish: refuse, naming the entry;
+#   6. an entry Arch publishes NO checksum for (SKIP or absent): refreshed by
+#      updpkgsums at sync-fire instead of refusing, recorded LOUDLY per entry
+#      as fetch-only (no official value attests it) — the 2026-09-24 stance.
+#      An entry Arch DOES publish is still verified against it (cases 1/2);
 #   7. a version bump that does not move source=(): nothing is re-anchored and
 #      the build runs against the sums already committed;
 #   8. an official file publishing two algorithms for the same sources: still
@@ -38,7 +41,13 @@ set -euo pipefail
 #      fetched instead of anchoring to a version that is not ours;
 #  11. a VCS source: anchored, and verified the way makepkg verifies it
 #      (`git archive --format tar <tag>` hashed, not a directory);
-#  12. --no-sync disables the whole path.
+#  12. --no-sync disables the whole path;
+#  13. the refresh itself fails (network down, upstream gone): the named
+#      'updpkgsums' error plus the manual recovery line ('Refresh them by
+#      hand', '--no-sync' builds the committed version as-is), the recipe
+#      restored, makepkg never started — and the run DEFERS the recipe
+#      (parked with a named marker) instead of killing the dispatch, which
+#      tests/anchor-defer.sh pins end to end.
 #
 # All four collaborators (pacman, curl, updpkgsums, makepkg) are stubs on PATH,
 # so this runs with no network and never builds anything.
@@ -360,27 +369,74 @@ fi
 grep -q "^sha256sums=('$staged_sum')$" "$(pkgfile "$dir")" \
     || fail 'the recipe was modified although the official version did not match'
 
-# ─── Case 5: an entry the official file does not cover ──────────────────────
+# ─── Case 5: an entry the official file does not cover is refreshed, LOUDLY ─
+# The official document matched our pkgver but publishes no checksum for a
+# moved source (SKIP, or no entry at all). The old stance refused the recipe
+# for that; since 2026-09-24 the sync runs updpkgsums over it instead — that
+# is exactly the documented manual remedy, now automated — and records which
+# entries were refreshed fetch-only, because nothing official attests them.
+# What must NOT appear: a silent refresh (the entries are named), a build with
+# verification disabled, or any weakening for entries Arch DOES publish
+# (cases 1/2 pin that half independently).
 dir="$fixture/unanchored"
 make_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = https://example.invalid/s1-$repo_version.tar.xz" \
     "	sha256sums = $published_sha"
 set_delivery "$dir" "$published_payload"
-run_build "$dir" 'unanchored' fail
+run_build "$dir" 'unanchored' 0
 
-grep -q 'publishes no checksum for:' "$(recipe_log "$dir")" \
-    || fail 'the refusal does not say that an entry could not be anchored'
-grep -q 's1-2.0.0.tar.gz' "$(recipe_log "$dir")" \
-    || fail 'the refusal does not name the entry it could not anchor'
-if [[ -s $dir/fake/makepkg_argv ]]; then
-    fail 'makepkg ran although one source had no anchor at all'
+[[ -s $dir/fake/updpkgsums_calls ]] \
+    || fail 'unanchored: the sums were never refreshed — this case is vacuous'
+[[ -s $dir/fake/makepkg_argv ]] \
+    || fail 'unanchored: the build did not proceed after the refresh'
+if grep -q -- '--skipchecksums' "$dir/fake/makepkg_argv"; then
+    fail 'unanchored: the build disabled checksum verification'
 fi
-if [[ -s $dir/fake/updpkgsums_calls ]]; then
-    fail 'updpkgsums rewrote the sums although one source had no anchor'
+grep -q 'publishes no checksum for' "$(recipe_log "$dir")" \
+    || fail 'the refresh does not record that official publishes no checksum for the entry'
+grep -q 's1-2.0.0.tar.gz' "$(recipe_log "$dir")" \
+    || fail 'the refresh does not name the fetch-only entry'
+grep -q 'attested by nothing but the fetch' "$(recipe_log "$dir")" \
+    || fail 'the refresh-only entry is recorded without saying what attests it'
+grep -q "^sha256sums=('$published_sha')$" "$(pkgfile "$dir")" \
+    || fail 'unanchored: the recipe does not carry the refreshed sum'
+# The run-level surface: the owner must be told what to review and commit.
+grep -q 'Synced with the repo this run' "$dir/out.txt" \
+    || fail 'the run summary does not list the synced recipe as uncommitted work'
+grep -q 'refresh-only' "$dir/out.txt" \
+    || fail 'the run summary does not flag the fetch-only refresh'
+
+# ─── Case 5b: the refresh itself fails → named error + recovery, parked ─────
+# Network down, upstream gone: updpkgsums exits non-zero. The recipe must be
+# restored, the build refused with the 'updpkgsums' error and BOTH recovery
+# lines (manual refresh, --no-sync), makepkg never started — and the run must
+# DEFER the recipe (named marker in the summary) rather than drop the whole
+# dispatch. The dispatch half is re-pinned end to end in tests/anchor-defer.sh;
+# here the refusal itself and the parking marker are asserted.
+dir="$fixture/refresh-fails"
+make_workspace "$dir" "$repo_version-1"
+set_official_srcinfo "$dir" "$repo_version" \
+    "	source = https://example.invalid/s1-$repo_version.tar.xz" \
+    "	sha256sums = $published_sha"
+set_delivery "$dir" none                       # the updpkgsums stub exits 1
+run_build "$dir" 'refresh-fails' fail
+
+grep -q "'updpkgsums' could not refresh the checksums" "$(recipe_log "$dir")" \
+    || fail 'refresh failure: the log does not carry the named updpkgsums error'
+grep -q "Refresh them by hand" "$(recipe_log "$dir")" \
+    || fail 'refresh failure: the manual recovery line is missing'
+grep -q -- "'--no-sync' builds the committed version as-is" "$(recipe_log "$dir")" \
+    || fail 'refresh failure: the --no-sync escape is no longer documented in the error'
+if [[ -s $dir/fake/makepkg_argv ]]; then
+    fail 'refresh failure: makepkg ran although nothing could be refreshed'
 fi
 grep -q "^sha256sums=('$staged_sum')$" "$(pkgfile "$dir")" \
-    || fail 'the recipe was modified although an entry could not be anchored'
+    || fail 'refresh failure: the recipe was not restored to its pre-refresh sums'
+grep -q 'DEFERRED' "$dir/out.txt" \
+    || fail 'refresh failure: the recipe was not parked with a DEFERRED marker'
+grep -q '^  build-all.fish ' "$dir/out.txt" \
+    || fail 'refresh failure: no resume command for the parked recipe'
 
 # ─── Case 6: a bump that does not move source=() is not treated as stale ────
 # 26 of the 28 stable recipes pin a literal version in the URL, so nothing they
