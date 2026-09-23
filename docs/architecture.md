@@ -11,7 +11,7 @@ Gentoo_Style_Arch has four deliberately separate modules:
    ignore rules — most recipes default-deny, see `CONTRIBUTING.md`.
 2. **Topology** under `config/` maps package IDs to recipe paths
    (`packages.map`, exactly `package-id|recipe-path` per record), defines
-   logical groups (`groups/{git,stable,core,misc,third-party}.list`), and
+   logical groups (`groups/{git,stable,core,misc,third-party,app}.list`), and
    records local dependency edges (`dependencies.conf`). It is declarative so
    maintainers can review graph changes without editing scheduler
    implementation.

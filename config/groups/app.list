@@ -1,0 +1,16 @@
+# Optional applications (group: app).
+#
+# Members are drawn from the git, third-party and stable recipe categories —
+# membership here does not remove a package from its category group, and a
+# package must be listed in at least one group file.
+#
+# Semantics (see 'build-all.fish -h'):
+#   - On a TTY, a build or -n run prompts to multi-select from this list;
+#     confirming with everything unchecked builds every entry below, checking
+#     any entry builds only the checked ones.
+#   - Non-TTY runs and -l use the whole list without prompting.
+#   - App packages are leaf builds: their dependency chain is never expanded
+#     (they are ABI consumers, so installed dependencies are assumed current).
+#
+# One package ID per line; '#' starts a comment. Membership is wired
+# separately — this file intentionally starts empty.

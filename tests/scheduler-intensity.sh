@@ -18,7 +18,7 @@ reserved_memory_gib=2
 state_dir=auto
 EOF
 : >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party; do
+for group in git stable core misc third-party app; do
     : >"$fixture/config/groups/$group.list"
 done
 

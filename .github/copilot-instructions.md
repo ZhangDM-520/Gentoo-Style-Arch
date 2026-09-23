@@ -1,6 +1,6 @@
 # Copilot instructions — Gentoo_Style_Arch
 
-A curated Arch Linux package set: ~126 `PKGBUILD` recipe directories plus an
+A curated Arch Linux package set: 128 `PKGBUILD` recipe directories plus an
 automatic-parallelism build scheduler. The repo holds recipes and topology
 only — never upstream sources, package archives, downloaded signatures, PGP
 caches, or build output.
@@ -75,9 +75,11 @@ bash tests/recipe-sources.sh         # run one fixture directly
 
 `tests/run-all.sh` discovers `tests/*.sh` and needs no edit for a new fixture.
 The filter is a plain substring of the filename, so `pgo` runs the whole PGO
-family; `texlive`, `recipe`, `project`, `scheduler`, `sudo` and `probe` each
+family; `texlive`, `recipe`, `project`, `scheduler` and `sudo` each
 narrow to one area (`project` covers both `project-config` and `project-cli-hints`),
-and `mkinitcpio`/`bpftune` isolate the two single-recipe hook fixtures.
+and `mkinitcpio`/`bpftune` isolate the two single-recipe hook fixtures. A
+filter that matches nothing still exits 0 with `PASS (0 fixture(s))` — check
+that count before trusting a green run.
 
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
@@ -94,7 +96,7 @@ implementation, so nothing there runs standalone.
 
 Scheduler, install and cleanup fixtures never exercise the real repository.
 They build a synthetic workspace under `$TMPDIR` — copy `build-all.fish`, then
-write a minimal `config/` (all five group files, an empty `dependencies.conf`,
+write a minimal `config/` (all six group files, an empty `dependencies.conf`,
 a hand-written `packages.map`, one-line `PKGBUILD`s) — and prefix `PATH` with
 stub `makepkg`/`sudo`/`pacman` executables. The fixture drives those stubs
 through variables the *stub* defines, not the builder: `GSA_FAKE_SUDO_MODE`,
@@ -102,12 +104,13 @@ through variables the *stub* defines, not the builder: `GSA_FAKE_SUDO_MODE`,
 `GSA_FAKE_MARKER_DIR`, `GSA_FAIL_PACKAGE`, `GSA_SPAWN_LOG`.
 `tests/sudo-keepalive.sh` also stubs `date`, so the 150 s sudo keepalive
 elapses on a virtual clock inside a run that lasts seconds. Those `GSA_FAKE_*`
-names are fixture-side only: the builder honours exactly the eight variables
+names are fixture-side only: the builder honours exactly the seven variables
 `--help` lists — `GSA_LANES`, `GSA_JOBS`, `GSA_INTENSITY`, `GSA_CPU_THREADS`,
-`GSA_MEMORY_GIB`, `GSA_STATE_DIR`, `GSA_BUILD_JOBS`, `GSA_TARGET_CPU` — and
+`GSA_MEMORY_GIB`, `GSA_STATE_DIR`, `GSA_TARGET_CPU` — and
 `GSA_CPU_THREADS`/`GSA_MEMORY_GIB` are the deterministic way to pin a profile
-assertion. Prefer expressing a scenario with a stub over adding a test knob to
-the builder.
+assertion. `GSA_BUILD_JOBS` is an output, not an input: `lane_job` exports the
+lane's job count for recipes to read. Prefer expressing a scenario with a stub
+over adding a test knob to the builder.
 
 Validation for a change:
 
@@ -146,6 +149,16 @@ A bare package name is **not** a leaf build: it expands the whole transitive
 dependency chain, so `build-all.fish niri-spicy-git` also rebuilds llvm, rust,
 mesa and everything between. `--no-deps` is the only way to rebuild one package
 whose installed dependencies are known current.
+
+The `app` group is the exception that proves the rule: `-g app` is a leaf
+selection by construction — a TTY build or `-n` run first prompts to
+multi-select (all unchecked + Enter = build every app, any checked = build only
+those, `q` aborts non-zero), non-TTY runs and `-l` silently take the whole
+group, and the group's members are never run through `expand_deps`, so an app
+package's local dependency edge must not drag its dependency chain into the
+run. The prompt is a filter layer in front of the normal pipeline: whatever it
+returns becomes the group's contribution to the selection and every later step
+(topo sort, ranges, lanes) is the existing code.
 
 ```sh
 fish build-all.fish --no-deps niri-spicy-git   # leaf rebuild only
@@ -204,13 +217,13 @@ Four modules, deliberately separated (`docs/architecture.md`):
 2. **Topology** — declarative, under `config/`. `packages.map` binds a package
    ID to a recipe path and is *the only* place that does so; the loader
    rejects any record that is not exactly `package-id|recipe-path`.
-   `groups/{git,stable,core,misc,third-party}.list` define logical groups, and
+   `groups/{git,stable,core,misc,third-party,app}.list` define logical groups, and
    `dependencies.conf` records local build-order edges as
    `package-id:dependency-id,dependency-id` (a lone `package-id:` is a
    deliberate no-edge record). `build-defaults.conf` holds the GiB-per-job
    baselines (`memory_per_job_gib`, `core_memory_per_job_gib`,
    `reserved_memory_gib`) and the default `lanes`/`jobs`/`intensity`/`state_dir`.
-   Only those five group names are ever read, so any other file in
+   Only those six group names are ever read, so any other file in
    `config/groups/` is unreachable state that silently goes stale —
    `tests/project-config.sh` fails on it.
 3. **Builder** — `build-all.fish` resolves IDs, expands and topologically sorts
@@ -223,7 +236,7 @@ Four modules, deliberately separated (`docs/architecture.md`):
 
 Consequences worth internalising:
 
-- The loader validates the map, all five group files, the dependency graph, and
+- The loader validates the map, all six group files, the dependency graph, and
   a complete topological sort on **every** invocation. One malformed record
   breaks `--list`, `--help`, and every build, not just the affected package.
 - Do not infer build order or group membership from directory names. `core` is
@@ -244,7 +257,7 @@ Consequences worth internalising:
 - Resource planning is entirely host-derived; the profiles and formulas are in
   `docs/portability.md`. Never predict a plan — read the `parallelism:` line the
   builder prints. `--lanes`/`--jobs` override `--intensity`.
-- `build-all.fish` is one ~3 100-line fish program with no includes, so there
+- `build-all.fish` is one ~4 100-line fish program (4 165 lines) with no includes, so there
   is no module to look for: every helper, the lane dispatcher, and the
   `INTENSITY_*` constants (inside `configure_intensity`) live in that file.
 

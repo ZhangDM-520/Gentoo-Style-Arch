@@ -36,6 +36,7 @@ live under `packages/core/`, while `autofdo-git`, `libclc-git` come from
 | `core` | 41 | Heavy, ABI-coupled, source-heavy, and ROCm packages |
 | `misc` | 1 | Optional CachyOS kernel recipe |
 | `third-party` | 2 | Additional application recipes |
+| `app` | 0 | Optional applications; a TTY build/`-n` run prompts to multi-select (all unchecked = build all), leaf builds with no dependency expansion |
 
 The package map, group membership, and local dependency graph are declarative
 files under `config/`; do not infer build order from directory names.

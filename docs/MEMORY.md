@@ -219,7 +219,10 @@
   recipe directories carry ignore rules; both classes are ignored runtime
   state.
 - The current logical groups are `git` (58), `stable` (29), `core` (41),
-  `misc` (1), and `third-party` (2). `core` intentionally overlaps stable
+  `misc` (1), `third-party` (2), and `app` (0 — optional applications; on a
+  TTY a build/`-n` run prompts to multi-select them, non-TTY runs take the
+  whole list, and app members are leaf builds whose dependency chain is never
+  expanded). `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
 - No upstream checkout, package archive, downloaded signature, PGP cache,
   encrypted CI artifact, or host profile belongs in the public tree.

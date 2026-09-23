@@ -153,6 +153,7 @@ set -g _GROUP_stable
 set -g _GROUP_core
 set -g _GROUP_misc
 set -g _GROUP_third_party
+set -g _GROUP_app
 set -g _DEFAULT_LANES auto
 set -g _DEFAULT_JOBS auto
 set -g _DEFAULT_INTENSITY xhigh
@@ -198,6 +199,8 @@ function assign_group -a group_name
             set -g _GROUP_misc $values
         case third-party
             set -g _GROUP_third_party $values
+        case app
+            set -g _GROUP_app $values
     end
     return 0
 end
@@ -412,7 +415,7 @@ function load_project_config
         set -a _PACKAGE_MAP "$id|$relative_path"
     end
 
-    for group_name in git stable core misc third-party
+    for group_name in git stable core misc third-party app
         # read_group_config names the offending file and line itself; a second
         # generic "invalid package group" here would just follow it.
         if not read_group_config "$group_name"
@@ -446,7 +449,7 @@ function load_project_config
     end
 
     set -l listed
-    for group_name in git stable core misc third-party
+    for group_name in git stable core misc third-party app
         switch "$group_name"
             case git
                 set -a listed $_GROUP_git
@@ -458,6 +461,8 @@ function load_project_config
                 set -a listed $_GROUP_misc
             case third-party
                 set -a listed $_GROUP_third_party
+            case app
+                set -a listed $_GROUP_app
         end
     end
     for package_id in $_PACKAGE_IDS
@@ -478,6 +483,14 @@ end
 function topo_sort -a pkgs_str
     # pkgs_str is a space-separated list of package IDs.
     set -l pkgs (string split ' ' $pkgs_str)
+    # Drop empty tokens: splitting an empty string yields one empty element,
+    # which would otherwise be "sorted" as a package and then reported as a
+    # blocked/cyclic member (an empty -g app selection did exactly that).
+    set -l pkgs_filtered
+    for p in $pkgs
+        test -n "$p"; and set -a pkgs_filtered $p
+    end
+    set pkgs $pkgs_filtered
     set -g _TOPO_BLOCKED
 
     # Build dependency map: $dep_of[pkg] = "dep1 dep2 ..."
@@ -583,7 +596,12 @@ function topo_sort -a pkgs_str
         end
     end
 
-    printf '%s\n' $sorted
+    # Same empty-input trap as above: printf with no arguments still runs the
+    # format once, so an empty result would print a newline and re-inject the
+    # phantom member at the output seam.
+    if test (count $sorted) -gt 0
+        printf '%s\n' $sorted
+    end
     test (count $_TOPO_BLOCKED) -eq 0
 end
 
@@ -1620,7 +1638,7 @@ function audit_workspace
     end
 
     set -l listed $_GROUP_git $_GROUP_stable $_GROUP_core \
-        $_GROUP_misc $_GROUP_third_party
+        $_GROUP_misc $_GROUP_third_party $_GROUP_app
     set listed (printf '%s\n' $listed | awk '!seen[$0]++')
     set -l actual $_PACKAGE_IDS
     set -l unlisted
@@ -3485,11 +3503,15 @@ function usage
     echo ""
     echo "Main options:"
     echo "  -g, --group GRP   Build package group(s) — A SELECTION IS REQUIRED:"
-    echo "                    git, stable, core, misc, third-party (or package names)."
+    echo "                    git, stable, core, misc, third-party, app (or package names)."
     echo "                    Multiple groups: repeat the flag or comma-separate,"
     echo "                    e.g. -g git -g core  /  -g git,core"
     echo "                    core = heavyweight, source-heavy, ABI-critical, and ROCm packages;"
     echo "                    auto-enables -i (installs immediately, rule 11)"
+    echo "                    app = optional applications; on a TTY a build or -n run"
+    echo "                    prompts to multi-select (all unchecked = build every app);"
+    echo "                    non-TTY and -l build/list the whole group. App packages are"
+    echo "                    leaf builds — their dependency chain is never rebuilt."
     echo "  -l, --list        List packages and their dependency order. Honours a"
     echo "                    selection: '-l -g git' prints the 56 git packages, and"
     echo "                    the indices it prints are exactly what a range selects."
@@ -3605,6 +3627,8 @@ function usage
     echo "            auto-installs and runs core builds solo)"
     echo "  misc      Auxiliary packages ("(count $_GROUP_misc)" packages)"
     echo "  third-party  Additional package recipes ("(count $_GROUP_third_party)" packages)"
+    echo "  app       Optional applications ("(count $_GROUP_app)" packages; leaf builds —"
+    echo "            dependency chain is never expanded, no auto -i)"
 end
 
 # ─── List packages ───────────────────────────────────────────────────────────
@@ -3637,6 +3661,7 @@ function list_packages -a all_flag
     echo "  core:     "(count $_GROUP_core)" packages"
     echo "  misc:     "(count $_GROUP_misc)" packages"
     echo "  third-party: "(count $_GROUP_third_party)" packages"
+    echo "  app:      "(count $_GROUP_app)" packages"
 end
 
 # ─── Resolve one group name to its package list ──────────────────────────────
@@ -3655,16 +3680,119 @@ function resolve_group -a grp
             printf '%s\n' $_GROUP_misc
         case third-party third_party 3rdp
             printf '%s\n' $_GROUP_third_party
+        case app
+            # printf with no arguments still runs the format once, printing a
+            # lone newline — an empty app.list would then yield one phantom
+            # empty member that topo_sort flags as a blocked package. Print
+            # only when there is something to print.
+            if test (count $_GROUP_app) -gt 0
+                printf '%s\n' $_GROUP_app
+            end
         case '*'
             # This function's stdout is a data channel — the caller captures it
             # with a command substitution — so diagnostics must go to stderr or
             # they vanish silently (they did: `-g gti` exited 1 saying nothing).
             ui_error "unknown group '$grp'" >&2
-            set -l near (printf '%s\n' git stable core misc third-party \
+            set -l near (printf '%s\n' git stable core misc third-party app \
                 | _nearest_lines "$grp" 2 | sort -n | head -1 | cut -d' ' -f2-)
             test -n "$near"; and echo "  Did you mean '$near'?" >&2
-            echo "Available groups: git, stable, core, misc, third-party" >&2
+            echo "Available groups: git, stable, core, misc, third-party, app" >&2
             return 1
+    end
+    return 0
+end
+
+# ─── app group multi-select prompt ──────────────────────────────────────────
+# Filters the app group's members down to the user's checked subset — a layer
+# in FRONT of the normal pipeline: whatever this prints becomes the group's
+# contribution to build_list, and everything downstream (topo sort, ranges,
+# lanes, install) is the code that already exists.
+#
+# Semantics: confirming with everything unchecked returns the WHOLE group
+# (build all — the default state is all-unchecked); confirming with any entry
+# checked returns only the checked subset; 'q' aborts with status 1.
+#
+# One line of input, whitespace-separated tokens:
+#   N     toggle entry N          'a' check all
+#   'c'   clear all               empty Enter confirm
+#   'q'   abort the run
+# Anything else re-renders with a notice. Display order is dependency order
+# (topo_sort over just these members), so the menu reads like the build.
+#
+# stdout is the data channel (chosen IDs, one per line) — the menu, notices
+# and the input hint all go to stderr so a command substitution cannot
+# swallow them. The caller must only invoke this on a TTY (test -t 0);
+# off-terminal runs never reach it, so there is no hang path in a pipe.
+function prompt_app_selection
+    set -l items $argv
+    test (count $items) -gt 0; or return 0
+    set -l ordered (topo_sort (string join ' ' $items))
+    set -l checked
+    while true
+        printf '%s\n' "app group — choose what to build ("(count $ordered)" packages):" >&2
+        printf '%s\n' "  default: nothing checked = build EVERY app package" >&2
+        set -l i 1
+        for pkg in $ordered
+            if contains -- "$i" $checked
+                printf '  [x] %2d. %s\n' $i $pkg >&2
+            else
+                printf '  [ ] %2d. %s\n' $i $pkg >&2
+            end
+            set i (math $i + 1)
+        end
+        if test (count $checked) -gt 0
+            printf '  %d checked — confirming now builds ONLY those\n' (count $checked) >&2
+        end
+        printf '%s\n' "numbers toggle (e.g. '1 3'), 'a' all, 'c' clear, Enter build, 'q' abort" >&2
+        read -l input_line
+        or begin
+            ui_error "app selection aborted (input closed)" >&2
+            return 1
+        end
+        set -l tokens (string match -ra '\S+' -- "$input_line")
+        if test (count $tokens) -eq 0
+            break # confirm
+        end
+        set -l invalid 0
+        for token in $tokens
+            switch $token
+                case q quit
+                    ui_error "app selection aborted" >&2
+                    return 1
+                case a all
+                    set checked (seq (count $ordered))
+                case c clear
+                    set checked
+                case '*'
+                    if string match -qr '^[0-9]+$' -- $token
+                        and test $token -ge 1
+                        and test $token -le (count $ordered)
+                        set -l at (contains -i -- "$token" $checked)
+                        if test $status -eq 0
+                            set -e checked[$at]
+                        else
+                            set -a checked $token
+                        end
+                    else
+                        set invalid 1
+                    end
+            end
+        end
+        if test $invalid -eq 1
+            printf '%s\n' " unrecognized token — use numbers, 'a', 'c' or 'q'" >&2
+        end
+        printf '\n' >&2
+    end
+    if test (count $checked) -eq 0
+        printf '%s\n' $ordered # all-unchecked = build the whole group
+        return 0
+    end
+    set -l i 1
+    for pkg in $ordered
+        if contains -- "$i" $checked
+            printf '%s\n' $pkg
+        end
+        set i (math $i + 1)
     end
     return 0
 end
@@ -3838,6 +3966,24 @@ function main
             if test $status -ne 0
                 return 1
             end
+            # ── app prompt layer (decisions: TTY build/-n prompt, -l and
+            # non-TTY take the whole group; filtered $gl then flows through
+            # the unchanged pipeline below) ──────────────────────────────
+            if test "$g" = app
+                if test (count $gl) -eq 0
+                    ui_warning "-g app: the app list is empty — populate config/groups/app.list"
+                else if test "$list_flag" = 1
+                    # -l lists the whole group, no prompt.
+                else if test -t 0
+                    set -l chosen (prompt_app_selection $gl)
+                    if test $status -ne 0
+                        return 1
+                    end
+                    set gl $chosen
+                else
+                    ui_info "-g app: no TTY — building the whole app group (prompt skipped)"
+                end
+            end
             if test "$g" = core; and test $install_flag -eq 0
                 # Rule 11: core rebuilds are only sound with immediate
                 # installs — later packages must compile against freshly
@@ -3896,11 +4042,12 @@ function main
     else if test "$list_flag" = 1 -o "$dry_run" = 1
         # Read-only action with no selection: cover the whole set rather than
         # demanding one (see the header above).
-        set build_list $_GROUP_git $_GROUP_stable $_GROUP_core $_GROUP_misc $_GROUP_third_party
+        set build_list $_GROUP_git $_GROUP_stable $_GROUP_core \
+            $_GROUP_misc $_GROUP_third_party $_GROUP_app
         set build_list (printf '%s\n' $build_list | awk '!seen[$0]++')
     else
         ui_error "no packages selected — pass -g GROUP and/or package names"
-        echo "Groups: git, stable, core, misc, third-party   (see -h for examples)"
+        echo "Groups: git, stable, core, misc, third-party, app   (see -h for examples)"
         echo "Read-only: -l lists packages, -n shows the build order without building."
         return 1
     end

@@ -30,7 +30,7 @@ reserved_memory_gib=2
 state_dir=auto
 EOF
     : >"$dir/config/dependencies.conf"
-    for group in git stable core misc third-party; do
+    for group in git stable core misc third-party app; do
         : >"$dir/config/groups/$group.list"
     done
     : >"$dir/config/packages.map"

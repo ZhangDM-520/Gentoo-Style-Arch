@@ -32,6 +32,63 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-23 — new `app` group: a TTY multi-select prompt as a layer in front of the normal selection pipeline
+
+- **Decision (user-confirmed)**: isolate a sixth logical group `app` for
+  optional applications drawn from the git/third-party/stable categories —
+  mechanism only, membership wired separately. Four confirmed behaviors:
+  (1) app packages are **leaf builds, never `expand_deps`** — they are ABI
+  *consumers*, so installed dependencies are assumed current and a local
+  dependency edge must not drag a costly chain into the run; (2) non-TTY stdin
+  skips the prompt and builds the whole group; (3) the prompt is a
+  fish-native numbered toggle loop (no fzf/gum dependency); (4) it triggers on
+  real builds and `-n` only — `-l` lists the whole group, unprompted.
+- **Design**: `prompt_app_selection` prints the menu on **stderr** (stdout is
+  the data channel the seam captures) and returns checked-only, or the whole
+  group when everything is unchecked (all-unchecked = build all; `q` aborts
+  non-zero). The seam sits immediately after `resolve_group` in the `-g` loop:
+  whatever comes back becomes that group's contribution to `build_list`, and
+  topo sort, ranges, lanes, install are the unchanged existing pipeline.
+  Group selections were *already* leaf selections — `expand_deps` only runs
+  for positional names — so requirement (1) needed pinning, not new blocking
+  logic.
+- **Bug found while testing (empty-group phantom)**: fish `printf` with **no
+  arguments still runs the format once**, so an empty `app.list` produced a
+  phantom `""` member: `resolve_group` emitted one newline, `topo_sort` read
+  `""` as a package and reported `blocked: (empty)`, and the final
+  `printf '%s\n' $sorted` re-injected it at the output seam ("Total: 1
+  packages" with an empty entry). Fixed in all three places: the `app` case
+  prints only when non-empty, `topo_sort` drops empty input tokens, and its
+  output is guarded. An empty `app.list` now warns (`populate
+  config/groups/app.list`) and exits non-zero with the standard no-selection
+  error.
+- **Fixture learnings (`tests/app-group.sh`, PTY via `script -qec`)**:
+  (a) emptying `app.list` with single-membership members trips the loader's
+  "listed in no group" rule *before* the seam — mirror reality (members keep
+  their category group) by moving them aside for that scenario; (b) fish's DA
+  terminal query has no responder under `script`'s PTY and **consumes the
+  piped toggle input as bogus query replies** (the `2` vanished mid-exchange,
+  the next read hung until timeout) — run the PTY scenarios with `TERM=dumb`,
+  which skips the queries while the FD-level `test -t 0` the seam keys on
+  stays true; (c) the PTY slave maps `\n`→`\r\n` (ONLCR), so extracted fields
+  compare as `app1\r` — strip CR before string comparisons. Also: an inverted
+  `[ ! -f ] && fail` assertion "passed" whenever the file was correctly
+  absent — assertions of absence need the positive form.
+- **Wiring**: six group files exactly (`app.list` starts comments-only);
+  `project-config.sh` now pins six, the ten synthetic-workspace fixtures loop
+  six names, and the loader/resolve/help/audit/bare-list enumerations all
+  gained `app`. No auto `-i` for app (unlike core — consumers, not ABI
+  providers).
+- **Validation**: `fish -n`; `--audit`, `--list`, `-n -g git|stable|core`
+  green; empty `-n -g app` refuses with the hint; `bash tests/run-all.sh`
+  (full battery, incl. the new fixture — loader strictness, empty-list
+  refusal, non-TTY whole-group + no-expansion pin, `-l` silence on a PTY,
+  Enter/toggle/`q` on a PTY, combined `-g app -g git`, real-build subset).
+- **Durable rules**: `config/groups/` holds exactly six files; `-g app` is a
+  leaf selection whose prompt is a front-layer filter (never re-plumb the
+  pipeline for it); the prompt reads stdin only after `test -t 0`, so pipes
+  can never hang.
+
 ## 2026-09-23 — added `vencord-git`: desktop standalone Discord client mod in the git group
 
 - **Scope decisions (user-confirmed)**: package https://github.com/Vendicated/Vencord
