@@ -1,6 +1,6 @@
 pkgbase = libinput-git
 	pkgdesc = Input device management and event handling library
-	pkgver = 1.31.901.r0.g6672cf15
+	pkgver = 1.32.0.r0.g5cf833b5
 	pkgrel = 1
 	url = https://gitlab.freedesktop.org/libinput/libinput
 	arch = x86_64

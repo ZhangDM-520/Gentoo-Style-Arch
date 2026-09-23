@@ -2,7 +2,7 @@
 # Contributor: Andreas Radke <andyrtr@archlinux.org>
 
 pkgname=libinput-git
-pkgver=1.31.901.r0.g6672cf15
+pkgver=1.32.0.r0.g5cf833b5
 pkgrel=1
 pkgdesc="Input device management and event handling library"
 url="https://gitlab.freedesktop.org/libinput/libinput"

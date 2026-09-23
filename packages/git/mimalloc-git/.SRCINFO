@@ -1,6 +1,6 @@
 pkgbase = mimalloc-git
 	pkgdesc = General-purpose allocator with excellent performance characteristics
-	pkgver = 3.5.2.r15.gd184163c
+	pkgver = 3.5.3.r39.g52444dc1
 	pkgrel = 1
 	url = https://github.com/microsoft/mimalloc
 	arch = x86_64

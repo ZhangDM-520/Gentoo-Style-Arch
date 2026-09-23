@@ -1,6 +1,6 @@
 pkgbase = libva-git
 	pkgdesc = Video Acceleration (VA) API for Linux (git version)
-	pkgver = 2.24.1.r3.g6b07f710
+	pkgver = 2.24.1.r6.gf3fefceb
 	pkgrel = 1
 	url = https://01.org/linuxmedia/vaapi/
 	arch = x86_64
