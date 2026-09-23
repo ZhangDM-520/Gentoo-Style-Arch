@@ -133,6 +133,10 @@ function ui_info
 end
 
 set -g _ACTIVE_LANE_PIDS
+# Package for the parallel _ACTIVE_LANE_PIDS entry at the same index — lets
+# cleanup escalations land in the right package log (kept in lockstep by the
+# dispatch append, forget_lane_pid and cleanup_active_lanes).
+set -g _ACTIVE_LANE_PKGS
 set -g _DASHBOARD_ROWS 0
 set -g _DASHBOARD_ACTIVE 0
 set -g _DASHBOARD_LAST_EVENT ""
@@ -143,6 +147,13 @@ set -g _DASHBOARD_SPINNER_FRAMES '-' "\\" '|' '/'
 set -g _DASHBOARD_SPINNER_INDEX 1
 set -g _RL_BLOCKED 0
 set -g _INTERRUPT_HANDLED 0
+# Signal forensics (2026-09-23 mass-TERM incident): which signal arrived, in
+# which mode the handler ran, and how long lane teardown may grace before the
+# single SIGKILL sweep — see gsa_handle_signal / stop_lane_process.
+set -g _LAST_SIGNAL none
+set -g _LANE_JOB_ACTIVE 0
+set -g _LANE_SIGNAL_RC 0
+set -g _LANE_STOP_GRACE_S 30
 
 # ─── Project configuration ───────────────────────────────────────────────────
 set -g _PACKAGE_MAP
@@ -1280,6 +1291,12 @@ function install_all
     if test "$_ROOT_MODE" != "1"; and not require_command sudo
         return 1
     end
+    # Same lock preflight as -i: a busy db.lck would hard-fail the whole
+    # single-transaction install anyway — refuse up front with recovery text.
+    if not check_pacman_lock (pacman_db_lock_path)
+        ui_error "refusing -ia while the pacman database lock is busy (recovery hint above)"
+        return 1
+    end
     set -l pkgs (find_built_pkgs)
     if test (count $pkgs) -eq 0
         ui_warning "No built packages found."
@@ -1413,7 +1430,47 @@ function run_pacman_locked -a log_file
     if test "$rc" -eq 75
         printf '%s\n' "$_UI_ICON_ERROR builder pacman mutex timed out after $_PACMAN_MUTEX_WAIT seconds" >&2
     end
+    if test "$rc" -ne 0
+        # Lock-failure path (install_pkgs_now and -ia funnel through here): a
+        # failed pacman commonly means db.lck — report holders, or clear a
+        # provably stale lock so the NEXT attempt can proceed (2026-09-23:
+        # six runs died on "could not lock database: File exists").
+        check_pacman_lock (pacman_db_lock_path)
+    end
     return $rc
+end
+
+# makepkg's `-s` syncdeps runs pacman THROUGH $PACMAN, OUTSIDE the builder's
+# flock (run_pacman in /usr/bin/makepkg: `PACMAN=${PACMAN:-pacman}` ~line
+# 1203, resolved as PACMAN_PATH=$(type -P $PACMAN) for both -T probes and -S
+# installs — verified 2026-09-23). Six dep-pacmans raced the builder's
+# `pacman -U` at 19:33:58 that day. The shim pins those calls to the SAME
+# mutex run_pacman_locked uses. No deadlock: run_pacman_locked is a leaf
+# (flock → /usr/bin/pacman directly, never re-entering makepkg), so the lock
+# order cannot cycle. On flock timeout rc=75 propagates as a loud dep-install
+# failure — the accepted outcome.
+function ensure_pacman_shim
+    if not mkdir -p "$LOG_DIR"
+        return 1
+    end
+    set -l shim "$LOG_DIR/.pacman-shim"
+    set -l tmp "$shim.tmp.$fish_pid"
+    # %d → _PACMAN_MUTEX_WAIT; mutex path baked absolute; "$@" is literal sh.
+    if not printf '#!/bin/sh\n# build-all.fish: makepkg -s dep installs must share the builder mutex.\nexec flock -x -w %d %s /usr/bin/pacman "$@"\n' \
+            "$_PACMAN_MUTEX_WAIT" "$_PACMAN_MUTEX" >"$tmp"
+        rm -f -- "$tmp"
+        return 1
+    end
+    if not chmod 755 "$tmp"
+        rm -f -- "$tmp"
+        return 1
+    end
+    # Atomic replace: a lane already executing the old inode keeps running.
+    if not mv -f -- "$tmp" "$shim"
+        rm -f -- "$tmp"
+        return 1
+    end
+    return 0
 end
 
 # -cc / --cleanup: delete every built package archive (including stale
@@ -2512,6 +2569,12 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
         if set -q GSA_TARGET_CPU; and test -n "$GSA_TARGET_CPU"
             set -a env_prefix GSA_TARGET_CPU=$GSA_TARGET_CPU
         end
+        # sudo strips the environment; pass the pacman shim explicitly so
+        # root-mode makepkg dep installs share the builder mutex too
+        # (lane_job exports PACMAN; see ensure_pacman_shim).
+        if set -q PACMAN; and test -n "$PACMAN"
+            set -a env_prefix PACMAN=$PACMAN
+        end
         sudo -u "$_BUILD_USER" $env_prefix makepkg $makepkg_args >>"$log_file" 2>&1
     else
         makepkg $makepkg_args >>"$log_file" 2>&1
@@ -2613,6 +2676,87 @@ function require_command -a command_name
     return 0
 end
 
+# Resolve the pacman database lock the way makepkg itself does —
+# "$(pacman-conf DBPath)/db.lck" — falling back to the stock path. Besides
+# honouring a non-default DBPath, this gives fixtures a PATH-stubbable
+# `pacman-conf` seam so they never probe (or touch) the host's real
+# /var/lib/pacman/db.lck. No GSA_* test knob exists for this.
+function pacman_db_lock_path
+    if command -q pacman-conf
+        set -l db_path (pacman-conf DBPath 2>/dev/null | string trim)
+        if test -n "$db_path"; and string match -q '/*' -- "$db_path"
+            echo "$db_path/db.lck"
+            return 0
+        end
+    end
+    echo /var/lib/pacman/db.lck
+end
+
+# One "holder pid=N cmd=..." line per live lock holder on stdout. Empty
+# output = proven idle; any line (including an "unknown" line when pgrep is
+# missing) = treat as busy and NEVER remove the lock.
+function pacman_lock_holder_lines
+    if not command -q pgrep
+        echo "  holder unknown: pgrep is unavailable — cannot prove the lock idle"
+        return 0
+    end
+    set -l holder_pids
+    for name in pacman packagekitd pamac
+        set -a holder_pids (pgrep -x "$name" 2>/dev/null)
+    end
+    for pid in $holder_pids
+        set -l cmd (ps -o args= -p "$pid" 2>/dev/null | string trim)
+        test -n "$cmd"; or set cmd "(cmdline unavailable)"
+        printf '  holder pid=%s cmd=%s\n' "$pid" "$cmd"
+    end
+end
+
+function pacman_lock_busy_report -a lock_path
+    ui_warning "pacman database lock exists: $lock_path"
+    for line in $argv[2..-1]
+        echo "$line"
+    end
+    echo "  Recovery: wait for a running transaction to finish; if its process has"
+    echo "  crashed (stale lock), verify nothing holds it and remove it manually:"
+    echo "    sudo rm -f $lock_path"
+end
+
+# check_pacman_lock <path> — report-only probe PLUS guarded stale removal.
+# Reconciliation note (2026-09-23): the older never-remove todo predates the
+# user's explicit re-approval of idle-removal that same day after the lock
+# storm (plan.md decision `lock_strategy = both`). Merged rule: NEVER remove
+# while any holder exists; remove ONLY when two probes ~1 s apart both find
+# nothing — that closes the appear-between-probes race.
+# rc 0 = absent or removed (clear to install), rc 1 = busy/unremovable.
+function check_pacman_lock -a lock_path
+    if test -z "$lock_path"; or not test -e "$lock_path"
+        return 0
+    end
+    set -l holders (pacman_lock_holder_lines)
+    if test (count $holders) -gt 0
+        pacman_lock_busy_report "$lock_path" $holders
+        return 1
+    end
+    sleep 1
+    set holders (pacman_lock_holder_lines)
+    if test (count $holders) -gt 0
+        pacman_lock_busy_report "$lock_path" $holders
+        return 1
+    end
+    # Provably idle twice — the case that hard-failed six installs on
+    # 2026-09-23. LOUD on purpose: this mutates host state.
+    if rm -f -- "$lock_path"
+        ui_warning "STALE pacman lock removed (no holder on two probes 1 s apart): $lock_path"
+        echo "  Why: the previous pacman/packagekitd/pamac died without unlocking its"
+        echo "  database (2026-09-23 lock-storm incident). If installs fail next,"
+        echo "  re-check the database before forcing anything else."
+        return 0
+    end
+    ui_error "cannot remove the stale lock: $lock_path (permission denied?)"
+    echo "  Remove it manually: sudo rm -f $lock_path"
+    return 1
+end
+
 function check_runtime_prereqs -a install_flag needs_stable_sync
     set -l required fish makepkg nproc ps awk tail sed getent
     if test "$install_flag" = "1"; or test "$needs_stable_sync" = "1"
@@ -2630,6 +2774,17 @@ function check_runtime_prereqs -a install_flag needs_stable_sync
         if not require_command "$command_name"
             return 1
         end
+    end
+    # db.lck preflight (2026-09-23 lock storm): a stale or held lock only
+    # matters when this run will install — busy → refuse -i up front with the
+    # recovery text above; build-only runs just warn and keep building.
+    if not check_pacman_lock (pacman_db_lock_path)
+        if test "$install_flag" = "1"
+            ui_error "refusing to start an -i run while the pacman database lock is busy"
+            echo "  Builds would succeed but every install would hard-fail on the held lock."
+            return 1
+        end
+        ui_warning "pacman database lock is busy — building anyway; -i/-ia would be refused until it clears"
     end
     return 0
 end
@@ -2856,13 +3011,21 @@ function forget_lane_pid -a pid
     for i in (seq (count $_ACTIVE_LANE_PIDS))
         if test "$_ACTIVE_LANE_PIDS[$i]" = "$pid"
             set -e _ACTIVE_LANE_PIDS[$i]
+            # Erase the SAME index of the parallel package list so the two
+            # arrays stay paired (cleanup_active_lanes reads them by index).
+            if test $i -le (count $_ACTIVE_LANE_PKGS)
+                set -e _ACTIVE_LANE_PKGS[$i]
+            end
             return 0
         end
     end
 end
 
 function lane_processes -a lane_pid
-    ps -eo pid=,pgid= 2>/dev/null | awk -v target="$lane_pid" '$2 == target {print $1}'
+    # Zombies excluded: a finished-but-unreaped lane head must not consume
+    # the whole stop grace — SIGKILL on a zombie is a no-op anyway.
+    ps -eo pid=,pgid=,stat= 2>/dev/null \
+        | awk -v target="$lane_pid" '$2 == target && $3 !~ /^Z/ {print $1}'
 end
 
 function lane_pid_alive -a lane_pid
@@ -2873,37 +3036,83 @@ function lane_pid_alive -a lane_pid
     kill -0 "$lane_pid" 2>/dev/null
 end
 
-function stop_lane_process -a lane_pid
+function stop_lane_process -a lane_pid reason pkg
     if test -z "$lane_pid"
         return 0
     end
+    set -l why "$reason"
+    test -n "$why"; or set why unspecified
+    set -l pkg_label '-'
+    test -n "$pkg"; and set pkg_label "$pkg"
     set -l lane_process_ids (lane_processes "$lane_pid")
-    for process_id in $lane_process_ids
-        kill "$process_id" 2>/dev/null
+    # Precompute the join: a failed substitution (string join with an EMPTY
+    # list) makes fish skip the whole statement — forensics must survive an
+    # already-empty pgrp.
+    set -l pid_list '-'
+    if test (count $lane_process_ids) -gt 0
+        set pid_list (string join ',' -- $lane_process_ids)
     end
-    for attempt in (seq 20)
+    dispatcher_log "stop begin reason=$why pgid=$lane_pid pkg=$pkg_label pids=$pid_list"
+    # ONE TERM per PID, then a real grace window before a single SIGKILL
+    # sweep. The 2026-09-23 incident: the previous loop re-TERMed the whole
+    # pgrp every 50 ms and SIGKILLed at ~0.5 s, so a running `pacman -U` was
+    # interrupted DURING its db.lck unlock — six installs on the next run
+    # died on "could not lock database: File exists". A transaction that
+    # survived the TERM needs time to finish unlocking; a child that IGNORES
+    # TERM must still not survive, hence the bounded grace below.
+    for process_id in $lane_process_ids
+        kill -TERM "$process_id" 2>/dev/null
+    end
+    # Wall-clock deadline (not a poll count): each poll also pays a ps+awk,
+    # so counting iterations would stretch "30 s" to 35+ s under load.
+    set -l grace_deadline (math (date +%s) + $_LANE_STOP_GRACE_S)
+    while true
         set lane_process_ids (lane_processes "$lane_pid")
         if test (count $lane_process_ids) -eq 0
             break
         end
-        # A child that ignores TERM must not survive the interrupted build.
-        if test "$attempt" -eq 10
-            for process_id in $lane_process_ids
-                kill -KILL "$process_id" 2>/dev/null
-            end
+        if test (date +%s) -ge $grace_deadline
+            break
         end
-        sleep 0.05
+        sleep 0.1
+    end
+    set lane_process_ids (lane_processes "$lane_pid")
+    for process_id in $lane_process_ids
+        # Escalation is exceptional and must be auditable in BOTH logs.
+        dispatcher_log "escalate: pid=$process_id pgid=$lane_pid pkg=$pkg_label SIGKILL after grace reason=$why"
+        if test -n "$pkg"
+            set -l pkg_log (package_log_file "$pkg")
+            printf '%s [DEBUG-gsa-term] escalate: pid=%s SIGKILL after %ss grace (reason=%s)\n' \
+                "$_UI_ICON_WARN" "$process_id" "$_LANE_STOP_GRACE_S" "$why" >>"$pkg_log"
+        end
+        kill -KILL "$process_id" 2>/dev/null
+    end
+    if test (count $lane_process_ids) -gt 0
+        # Brief post-KILL settle: lane_processes ignores zombies, so this only
+        # waits for stragglers actually still running after SIGKILL.
+        for poll in (seq 20)
+            set lane_process_ids (lane_processes "$lane_pid")
+            test (count $lane_process_ids) -eq 0; and break
+            sleep 0.1
+        end
     end
     wait "$lane_pid" 2>/dev/null
 end
 
 function cleanup_active_lanes
+    dispatcher_log "cleanup begin count="(count $_ACTIVE_LANE_PIDS)
     set -l active_pids $_ACTIVE_LANE_PIDS
-    for lane_pid in $active_pids
-        stop_lane_process "$lane_pid"
+    for i in (seq (count $active_pids))
+        set -l pkg ''
+        if test $i -le (count $_ACTIVE_LANE_PKGS)
+            set pkg $_ACTIVE_LANE_PKGS[$i]
+        end
+        stop_lane_process "$active_pids[$i]" interrupt "$pkg"
     end
     set -g _ACTIVE_LANE_PIDS
+    set -g _ACTIVE_LANE_PKGS
     find "$LOG_DIR" -maxdepth 1 -name '.lane*.result' -delete 2>/dev/null
+    dispatcher_log "cleanup done"
 end
 
 function check_rustc_sanity
@@ -2989,6 +3198,15 @@ end
 function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip_flag no_sync_flag
     # Runs in a separate fish process with its stdout/stderr redirected by the
     # parent: no tty for sudo, no shared mutable state — communicates by result file.
+    # Route this lane's makepkg -s dep installs through the builder mutex
+    # (see ensure_pacman_shim); fall back to plain pacman, never to a
+    # nonexistent path — makepkg resolves $PACMAN with `type -P` and an
+    # empty PACMAN_PATH would break every dep check.
+    if ensure_pacman_shim
+        set -gx PACMAN "$LOG_DIR/.pacman-shim"
+    else
+        echo "warning: could not generate $LOG_DIR/.pacman-shim — dep installs run unlocked" >&2
+    end
     set -gx GSA_BUILD_JOBS "$total_jobs"
     set -l make_flags
     if set -q MAKEFLAGS
@@ -3169,7 +3387,13 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
         ui_error "cannot create log directory: $LOG_DIR"
         return 1
     end
+    # Generate the makepkg dep-install shim at run start so every lane child
+    # (lane_job re-checks and exports PACMAN) shares the builder mutex.
+    if not ensure_pacman_shim
+        ui_warning "could not generate $LOG_DIR/.pacman-shim — makepkg dep installs will not share the builder mutex"
+    end
     set -g _ACTIVE_LANE_PIDS
+    set -g _ACTIVE_LANE_PKGS
     set -l lane_busy
     set -l lane_pkg
     set -l lane_start
@@ -3193,7 +3417,12 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
             cleanup_active_lanes
             abort_dashboard
             printf '\n'
+            # Post-teardown lock probe: a lane's pacman may have died during
+            # the cleanup TERM sweep — a provably-stale db.lck is removed
+            # loudly here, a live holder is only reported.
+            check_pacman_lock (pacman_db_lock_path)
             ui_warning "Build interrupted"
+            dispatcher_log "Build interrupted (last signal: $_LAST_SIGNAL)"
             set -g _RL_INTERRUPTED 1
             return 130
         end
@@ -3232,9 +3461,25 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     set dur $res[3]
                 else
                     set -l log_file (package_log_file "$p")
+                    # Reap forensics (2026-09-23: the raw symptom was a bare
+                    # rc=125 with no evidence of what the lane was doing):
+                    # name the lane's process state and show the result-file
+                    # bytes exactly as seen, then mirror one line to
+                    # dispatcher.log so the incident is self-describing.
+                    set -l lane_state "(gone)"
+                    if test -n "$lane_pid[$i]"
+                        set lane_state (ps -o stat= -p "$lane_pid[$i]" 2>/dev/null | string trim)
+                        test -n "$lane_state"; or set lane_state "(gone)"
+                    end
+                    set -l raw_joined "(no bytes)"
+                    if test (count $res_raw) -gt 0
+                        set raw_joined (string join ' | ' -- (string escape -- $res_raw))
+                    end
                     printf '%s\n' \
-                        "$_UI_ICON_ERROR lane supervisor produced no valid result (pid=$lane_pid[$i])" \
+                        "$_UI_ICON_ERROR lane supervisor produced no valid result (pid=$lane_pid[$i], state=$lane_state)" \
+                        "  result file bytes: $raw_joined" \
                         "  Check the lane log: $log_file" >>"$log_file"
+                    dispatcher_log "reap anomaly pkg=$p pid=$lane_pid[$i] state=$lane_state reason=missing-or-malformed raw=$raw_joined"
                     set stop_starting 1
                     set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR lane lost $p"
                 end
@@ -3247,7 +3492,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 set lane_pid[$i] ""
                 if test -n "$finished_pid"
                     if test "$result_malformed" -eq 1
-                        stop_lane_process "$finished_pid"
+                        stop_lane_process "$finished_pid" malformed "$p"
                     else
                         wait "$finished_pid" 2>/dev/null
                     end
@@ -3384,6 +3629,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     $skip_flag $no_sync_flag >>"$child_log" 2>&1 &
                 set lane_pid[$i] $last_pid
                 set -a _ACTIVE_LANE_PIDS $last_pid
+                set -a _ACTIVE_LANE_PKGS $next
                 set -g _DASHBOARD_LANE_BUSY $lane_busy
                 set -g _DASHBOARD_LANE_PKG $lane_pkg
                 set -g _DASHBOARD_LANE_START $lane_start
@@ -4202,6 +4448,7 @@ function main
     if test "$_INTERRUPT_HANDLED" = "1"
         printf '\n'
         ui_warning "Build interrupted"
+        dispatcher_log "Build interrupted (last signal: $_LAST_SIGNAL, before dispatch)"
         return 130
     end
 
@@ -4285,7 +4532,118 @@ if not load_project_config
     exit 1
 end
 
+# ─── Signal handling ─────────────────────────────────────────────────────────
+# dispatcher_log: one timestamped, [DEBUG-gsa-term]-tagged line per forensics
+# event in $LOG_DIR/dispatcher.log. The 2026-09-23 incident left dispatcher
+# and all six lanes dead at 19:34:01 with NO record of who sent what — this
+# file is what names the signal on the next one.
+function dispatcher_log -a message
+    test -n "$message"; or return 0
+    test -n "$LOG_DIR"; or return 0
+    mkdir -p "$LOG_DIR" 2>/dev/null; or return 0
+    printf '%s [DEBUG-gsa-term] %s\n' (date '+%Y-%m-%dT%H:%M:%S%z') "$message" \
+        >>"$LOG_DIR/dispatcher.log" 2>/dev/null
+end
+
+# One-line pid/comm ancestry, newest first: who could have sent a signal.
+function process_chain_snapshot
+    set -l parts
+    set -l pid $fish_pid
+    for depth in (seq 6)
+        set -l comm (ps -o comm= -p "$pid" 2>/dev/null | string trim)
+        set -l ppid (ps -o ppid= -p "$pid" 2>/dev/null | string trim)
+        test -n "$ppid"; or break
+        test -n "$comm"; or set comm "?"
+        set -a parts "$pid($comm)"
+        if test -z "$ppid"; or test "$ppid" = 0
+            break
+        end
+        set pid $ppid
+        if test "$pid" = 1
+            set -a parts "1(init)"
+            break
+        end
+    end
+    if test (count $parts) -eq 0
+        echo "(unavailable)"
+        return 0
+    end
+    string join ' <- ' -- $parts
+end
+
+# Shared handler body; the three binders below name their own signal + rc
+# (fish offers no reliable "which signal" query inside a handler).
+#
+# Dispatcher mode (_LANE_JOB_ACTIVE unset/0): forensics FIRST (timestamped
+# line naming the signal + ancestry), then _INTERRUPT_HANDLED is set exactly
+# as the old combined handle_interrupt did — the run drains lanes through
+# cleanup_active_lanes and exits 130 via the permanent "Build interrupted"
+# event. HUP joins INT/TERM here: it previously had NO handler and orphaned
+# live lanes outright.
+#
+# Lane mode (marker set by the --lane-job branch before any work): write an
+# honest signal result (129 HUP / 130 INT / 143 TERM + pid/signal text in the
+# package log) so the dispatcher records a real failure instead of rc=125
+# "lane supervisor produced no valid result", then terminate immediately.
+# fish 4.9.3 runs `exit` inside an event handler but discards the status
+# (measured: always 0), so the child ERASES its own handler and re-raises the
+# same signal: kernel default then yields 143/129 for TERM/HUP. INT is the
+# documented exception — fish keeps an internal SIGINT path and a self-INT
+# always exits 0 (measured even on a handler-less script), so a lane killed
+# by INT exits 0 as a process; the honest 130 lives in the result file,
+# which is the only channel the dispatcher reads.
+function gsa_handle_signal -a sig rc binder
+    if test "$_LANE_JOB_ACTIVE" = "1"
+        set -g _LANE_SIGNAL_RC $rc
+        if set -q _LANE_JOB_RESULT; and test -n "$_LANE_JOB_RESULT"
+            set -l dur 0
+            if set -q _LANE_JOB_START
+                set -l now (date +%s)
+                set dur (math "max(0, $now - $_LANE_JOB_START)")
+            end
+            if set -q _LANE_JOB_PKG; and test -n "$_LANE_JOB_PKG"
+                write_lane_result "$_LANE_JOB_RESULT" "$_LANE_JOB_PKG" "$rc" "$dur"
+                set -l pkg_log (package_log_file "$_LANE_JOB_PKG")
+                printf '%s lane child received %s (rc=%s, pid=%s) — honest signal result recorded\n' \
+                    "$_UI_ICON_WARN" "$sig" "$rc" "$fish_pid" >>"$pkg_log"
+            else
+                write_lane_result "$_LANE_JOB_RESULT" unknown "$rc" "$dur"
+            end
+        end
+        # Die NOW: erase this handler, re-raise, then a best-effort exit
+        # (see the fish-status caveat in the header — rc lands in the file).
+        functions -e "$binder"
+        command kill -s "$sig" $fish_pid 2>/dev/null
+        exit $rc
+    end
+    # Dispatcher (or any non-lane mode): name the signal, then latch the flag.
+    set -g _LAST_SIGNAL $sig
+    dispatcher_log "signal: $sig received (pid=$fish_pid, prior_flag=$_INTERRUPT_HANDLED) chain="(process_chain_snapshot)
+    set -g _INTERRUPT_HANDLED 1
+end
+
+function gsa_on_int --on-signal INT
+    gsa_handle_signal INT 130 gsa_on_int
+end
+
+function gsa_on_term --on-signal TERM
+    gsa_handle_signal TERM 143 gsa_on_term
+end
+
+function gsa_on_hup --on-signal HUP
+    gsa_handle_signal HUP 129 gsa_on_hup
+end
+
 if test (count $argv) -gt 0; and test "$argv[1]" = --lane-job
+    # Marker globals BEFORE any work: gsa_handle_signal needs them to record
+    # an honest outcome if this lane is signalled mid-build (2026-09-23: a
+    # signal death used to leave no result at all → dispatcher rc=125).
+    set -g _LANE_JOB_ACTIVE 1
+    if test (count $argv) -ge 4
+        set -g _LANE_JOB_PKG "$argv[2]"
+        set -g _LANE_JOB_RESULT "$argv[3]"
+        set -g _LANE_JOB_START (date +%s)
+    end
     if test (count $argv) -ne 8
         echo "Error: --lane-job expects package, result file, job count, and four flags" >&2
         exit 2
@@ -4304,9 +4662,16 @@ if test (count $argv) -gt 0; and test "$argv[1]" = --lane-job
     exit $status
 end
 
-# ─── Signal handling ─────────────────────────────────────────────────────────
-function handle_interrupt --on-signal INT --on-signal TERM
-    set -g _INTERRUPT_HANDLED 1
+# Hidden fixture seam (same precedent as --lane-job): run the production lock
+# probe against an arbitrary path. rc 0 = absent/removed, 1 = busy/unremovable.
+# No GSA_* test knob — the builder honours exactly the seven --help lists.
+if test (count $argv) -gt 0; and test "$argv[1]" = --stale-lock-check
+    if test (count $argv) -ne 2
+        echo "Error: --stale-lock-check expects exactly one lock path" >&2
+        exit 2
+    end
+    check_pacman_lock "$argv[2]"
+    exit $status
 end
 
 main $argv

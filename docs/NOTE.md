@@ -32,6 +32,171 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-23 (night) — lanes died to an unnamed signal, the abort corrupted pacman, noctalia's training never ran, and zen trained on Speedometer 2.0
+
+One report, three isolatable defects, fixed by three parallel agents.
+
+### A. Builder: unexpected TERM, rc=125 "invalid outcome", and the lock storm they fed
+
+- **Symptom**: a `sudo fish build-all.fish … 25..` run (started 19:33:53) had
+  its dispatcher and all six lanes die **simultaneously at 19:34:01** —
+  `dbus.log`, `util-linux.log`, `vencord-git.log`, `libisl-git.log`,
+  `xcb-imdkit-git.log`, `texlive-texmf.log` all show `ERROR: TERM signal caught`
+  mid-`git clone`/mid-`pacman -S`. The user account for exactly one interrupt
+  all evening (a wrong `14..` range, ^C); for this event they did nothing.
+  Follow-on: six logs of `waiting for builder pacman mutex → could not lock
+  database: File exists` killed the next run in 5 s, and the recurring
+  complaint was a lane raising `lane supervisor produced no valid result`
+  (rc=125) *after pacman had installed successfully*.
+- **Root cause chain, established from the journal, `sudo` session gantt, and
+  fish history** (all runs sequential on pts/0 — no overlap):
+  1. In code the dispatcher TERMs lanes only via `cleanup_active_lanes`,
+     which runs **after the dispatcher itself receives INT/TERM** (the
+     malformed-result branch's message appears in no log). So the dispatcher
+     was signalled — by whom is **not provable post-hoc**: nothing in
+     `build-all.fish`, no second run, no timer, no session teardown. One ^C
+     is admitted; the 19:34:01 signal source remains unidentified, so the fix
+     makes the *next* incident self-identifying instead of guessing.
+  2. Lane children ran the dispatcher's `handle_interrupt` (INT+TERM bound to
+     a bare flag-setter) and therefore **swallowed** signals, and a child
+     killed before `write_lane_result` produced the rc=125 "invalid outcome"
+     with no clue why.
+  3. `stop_lane_process` TERMed every PID in the lane PGID **every 50 ms,
+     SIGKILL at ~0.5 s**. A pacman caught in that blast was re-signalled
+     while unlocking, so it never removed `/var/lib/pacman/db.lck` (dir mtime
+     19:34; cleaned by hand via pkexec at 19:34:33) — the stale lock is what
+     made every later install hard-fail. Independently, makepkg's own `-s`
+     dependency installs run `pacman` **outside** the builder flock (six
+     dep-pacmans raced the builder's `pacman -U` at 19:33:58; `util-linux.log`
+     shows pacman politely waiting, the `-U` side failing).
+- **Fix (`build-all.fish`)**:
+  - Handlers split: `gsa_on_int/term/hup` → `gsa_handle_signal`. Dispatcher
+    mode appends timestamped `[DEBUG-gsa-term] signal: … (pid, ancestry)` to
+    the new **`$LOG_DIR/dispatcher.log`** then sets `_INTERRUPT_HANDLED` as
+    before; **HUP is newly bound** (it used to orphan live lanes silently).
+    Lane mode (marker set at `--lane-job` entry) writes an honest result
+    (`129/130/143`) + `lane child received <SIG>` to the package log and
+    re-raises — fish's `exit` inside a handler always yields rc 0, so the
+    child erases its handler and re-raises; INT is the exception (fish exits
+    0 even handler-less), which is why the result *file* carries the honest
+    130: the dispatcher reads only that file.
+  - `stop_lane_process`: **one** TERM sweep, deadline-based `_LANE_STOP_GRACE_S
+    = 30` (0.1 s polls that `ps` cost cannot stretch), single SIGKILL of
+    survivors afterwards, escalations logged to dispatcher.log *and* the
+    package log; zombies excluded from `lane_processes`. The WHY-comment
+    cites this incident: the old 50 ms blitz re-interrupted pacman's unlock.
+  - Reap forensics: a missing/malformed result now records the lane pid's
+    `ps` state plus the escaped raw result bytes (and an empty pid list no
+    longer silently skips the statement — fish drops commands whose
+    substitution failed).
+  - `check_pacman_lock`: holder probe (PATH-stubbable `pgrep` on
+    pacman/packagekitd/pamac) with recovery instructions, **never removes
+    while a holder is alive**; removal only after two idle probes 1 s apart,
+    loudly. Path from `pacman-conf DBPath` (fallback
+    `/var/lib/pacman/db.lck`) so fixtures never touch host state; hidden
+    `--stale-lock-check <path>` mode is the fixture seam (no new `GSA_*`
+    knob — the builder still honours exactly seven). Wired into
+    `check_runtime_prereqs` (refuse `-i`/`-ia` while busy, warn build-only),
+    `install_all`, after `cleanup_active_lanes`, and `run_pacman_locked`'s
+    failure path. *Reconciliation*: the older report-only todo said "NEVER
+    remove"; the user's later explicit approval chose idle-removal — both are
+    honored (report always, remove only when provably idle), recorded in the
+    code comment.
+  - `ensure_pacman_shim`: install runs generate `$LOG_DIR/.pacman-shim` (0755,
+    baked absolute mutex, `flock -x -w 300 /usr/bin/pacman "$@"`) and
+    `lane_job` exports `PACMAN=<shim>` (makepkg honours `PACMAN=${PACMAN:-pacman}`,
+    verified at `/usr/bin/makepkg:1203`) — makepkg's dep installs now
+    serialize on the builder mutex. Leaf/no-deadlock: `run_pacman_locked` is
+    flock→pacman directly.
+- **Validation**: `fish -n`, `--audit`, `--list`, dry-runs git/stable/core
+  (58/29/41) all pass; new fixtures `tests/signal-abort-lock.sh` (stale/busy
+  lock probe, honest `143` result instead of rc=125, INT/TERM/HUP → exit 130 +
+  named signal in dispatcher.log + exactly-one-TERM + zero survivors,
+  busy-preflight `-i` refusal, static 30 s/one-TERM/KILL-after-grace shape)
+  and `tests/pacman-mutex-shim.sh` pass; manual PTY proofs: interrupt exits
+  130 with SIGKILL at exactly +30 s. `tests/dashboard.sh` case C was rebased
+  (6 s → 60 s deadline, stub ticks 300 → 900): the old bound encoded the very
+  TERM-blast being removed — the stub lanes now run ~45 s so the post-grace
+  KILL, not their own loop, is what ends them.
+- **Durable rules**: a run's signal story must be readable after the fact —
+  dispatcher.log names the signal, the result file names the lane's death;
+  rc=125 without forensics is a bug. Never blast-TERM a process group that
+  may hold a package database lock: one TERM, grace, then KILL. Every pacman
+  invocation a lane can reach (yours *or* makepkg's) goes through the one
+  flock.
+
+### B. noctalia-git: the training sway died on `sun_path`, so PGO never trained
+
+- **Symptom**: `==> WARNING: PGO profile incomplete (1 .gcda files)` then
+  `ERROR: Value "none" … not one of the choices. Possible choices … "off",
+  "generate", "use"` → `A failure occurred in build()`.
+- **Root cause**: `_pgo_train` sandboxed `XDG_RUNTIME_DIR` under the deep
+  `$srcdir/pgo-work`; sway's `sway-ipc.<pid>.<rand>.sock` then exceeded the
+  **108-byte Unix `sun_path`** (`src/pgo-work/sway.log`: `Socket path won't
+  fit into ipc_sockaddr->sun_path`; journal shows the training sway SEGVing at
+  19:29:48 and 19:33:20 — the second was the user's manual `makepkg -si`).
+  Dead sway → no GUI workload → 1 `.gcda` → the fallback's
+  **`-Db_pgo=none`, a value meson does not have** (the enum is
+  off/generate/use) hard-failed the build.
+- **Fix**: fallback → `-Db_pgo=off`; `XDG_RUNTIME_DIR` now
+  `mktemp -d /tmp/nct-pgo-rt.XXXXXX` (700, removed on exit — house precedent
+  mold-git/easyeffects-git train under `/tmp`); the training tree launches
+  under `setsid` and is torn down as a **group** (TERM → 5 s bounded grace →
+  KILL) so no stray sway survives; CLI subcommands run `env -u WAYLAND_DISPLAY`
+  so they always take the exit-through-main() path that flushes profiles.
+  `pkgrel=2`, `.SRCINFO` regenerated.
+- **Validation**: acceptance build `fish build-all.fish --no-deps noctalia-git`
+  exit 0 (7m36s): **315 fresh `.gcda`** (baseline cleared first), log says
+  `PGO profile collected (315 …)` + meson `b_pgo : use`, zero `sun_path`
+  errors in the new sway.log, no journal SEGV, no strays, no `/tmp/nct-pgo-rt.*`
+  leftovers. Fixtures `tests/noctalia-pgo.sh` + `tests/noctalia-pgo-train.sh`
+  pass and were red-checked against the old PKGBUILD.
+- **Pitfalls pinned**: sandbox paths have a **length budget** — anything a
+  compositor/socket puts in `XDG_RUNTIME_DIR` must fit `sun_path`; and stock
+  `update_pkgver()` rewrites the PKGBUILD and **resets `pkgrel=1`** whenever
+  `pkgver()` moves — for `-git` recipes bump `pkgrel` after the first
+  post-sync build (this build moved r5568→r5570 and undid the bump once).
+
+### C. zen-browser: profile collection ran deprecated Speedometer 2.0
+
+- **Symptom/decision**: the PGO profile phase's workload entry was the
+  deprecated **Speedometer 2.0** with a single scenario; user decision
+  *sp3-only* — replace it, keep everything else.
+- **Audit (1.07 GB `zen.source.tar.zst`, 1.22.3b = FF156 base)**: the tree
+  *already* carries a correct SP3 setup — `profileserver.py` starts
+  `sp3_httpd` on port 8000 with docroot `third_party/webkit/PerformanceTests/Speedometer3`
+  (a real 62 MB tree; `params.mjs` honours `startAutomatically`) plus the
+  `http://localhost:8000/index.html?startAutomatically=true` entry with the
+  120 s extended timeout. SP3 **requires a root path** ("will fail if it is
+  not"), which is exactly why the second httpd exists — so the planned
+  relative `webkit/…` entry would have been wrong. The fix is therefore a
+  deletion: `0007-pgo-speedometer3.patch` removes only the SP2 entry (zero
+  additions), applied in `prepare()` after 0004/0005; `pkgrel=2`.
+- **Bonus finding**: `sha256sums[0]` was still the **1.22.1b** sum — commit
+  `5f4078b` (update zen upstream track) bumped `pkgver` without re-pinning the
+  tarball, so the recipe could not have fetched at all. Re-pinned to
+  `5dafd8ae…`, verified against **GitHub's server-side asset digest** (exact
+  hash + 1,068,387,924 size — anchored, not TOFU); `.SRCINFO` regenerated
+  (was stale at 1.22.1b too). Root `.gitignore:21 *.tar.*` already covers the
+  fetched tarball.
+- **Validation**: `tests/zen-pgo-workload.sh` + `tests/zen-pgo-speedometer.sh`
+  pass (red-checked on drift), real-tree `patch -Np1 --dry-run` rc=0,
+  `bash -n` clean; the full three-pass build is deliberately left to the
+  user's next big run (the fetched tarball is kept as its resume cache).
+- **Durable rule**: an upstream-track bump that changes `pkgver` must re-pin
+  every version-spelled sum in the same commit, and a benchmark swap must
+  check *root-path* requirements before choosing a URL shape.
+
+### D. Battery and cross-lane integration
+
+Three agents worked disjoint file sets (`build-all.fish`+fixtures;
+`packages/git/noctalia-git`; `packages/third-party/zen-browser-pgo`+fixtures),
+each running only its filtered fixtures; the parent ran the **full battery
+once: 41 fixtures** — 40 pass, `recipe-sources.sh` flags the new untracked
+`0007-…patch` until it is committed (by design: sources must be committed).
+The sweep also caught a **pre-existing** stale `.SRCINFO` on `gcc-snapshot`
+(from `8dd4f46 update gcc upstream track`) — regenerated mechanically.
+
 ## 2026-09-23 — vencord-git initiates injection: wrapper + official-compatible shim, and the scriptlet phases have no fallback
 
 - **Symptom**: phase 1 (`f5811c1`) shipped the payload only — the installed

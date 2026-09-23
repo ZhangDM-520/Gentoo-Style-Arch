@@ -21,8 +21,13 @@ set -euo pipefail
 #      the polite TERM.
 #
 # Case C is the only timing-sensitive assertion in the battery: it fails if the
-# builder does not return within ~6s of the interrupt. That is deliberate — a
-# builder that waits for its lanes instead of killing them is the defect.
+# builder does not return within 60s of the interrupt. That is deliberate — a
+# builder that waits for its lanes to finish on their own is the defect. The
+# bound sits above stop_lane_process' 30s abort grace (one TERM, then a
+# deadline poll, then a single SIGKILL — the 2026-09-23 fix that stopped the
+# old 50ms TERM blitz from re-interrupting a running pacman's unlock) and far
+# below the stub lanes' natural ~45s runtime, so a pass proves the escalation
+# killed the lanes rather than their own loop ending.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-dashboard.XXXXXX")
@@ -204,10 +209,11 @@ done
 #
 # The property under test is promptness, not merely "nothing survived". A
 # lane outliving the interrupt would keep compiling for hours on a machine the
-# user believes is idle, so the run must return within seconds — and it must
-# return 130 even when a lane child ignores TERM, because stop_lane_process
-# escalates to SIGKILL. Both halves are load-bearing and both were falsified
-# before this assertion was trusted:
+# user believes is idle, so the run must return once the abort grace expires —
+# never by waiting out the lanes' natural runtime — and it must return 130
+# even when a lane child ignores TERM, because stop_lane_process escalates to
+# SIGKILL after the grace. Both halves are load-bearing and both were
+# falsified before this assertion was trusted:
 #   - making lane_processes match nothing (so no lane pid is ever signalled)
 #     leaves the builder blocked in stop_lane_process' `wait` until the lanes
 #     finish on their own: the run then overruns the deadline below;
@@ -223,22 +229,26 @@ stty cols 40 rows 24
 export PATH="$dir/bin:\$PATH"
 export GSA_STATE_DIR="$dir/state"
 export GSA_CPU_THREADS=8 GSA_MEMORY_GIB=16
-export GSA_FAKE_TICKS=300
+# 900 ticks x 0.05s = ~45s natural lane runtime, deliberately LONGER than
+# stop_lane_process' 30s grace: the lanes must be ended by the post-grace
+# SIGKILL escalation, not by their own loop running out.
+export GSA_FAKE_TICKS=900
 export GSA_LANE_MARKER="$dir/pids"
 fish "$dir/build-all.fish" --allow-broken-rustc --no-deps --no-sync --lanes 2 p1 p2 p3 &
 builder=\$!
 sleep 1.4
 kill -INT "\$builder" 2>/dev/null
-# A zombie still answers kill -0, so "exited" is decided the way the builder
-# decides it: no such pid, or a Z state.
+# A zombie still answers kill -0, so \"exited\" is decided the way the builder
+# decides it: no such pid, or a Z state. The 60s deadline clears the 30s
+# abort grace with 2x margin for a loaded machine.
 attempts=0
 while :; do
     state=\$(ps -o stat= -p "\$builder" 2>/dev/null | tr -d ' ')
     if test -z "\$state" || test "\${state#*Z}" != "\$state"; then break; fi
     attempts=\$((attempts + 1))
-    if test "\$attempts" -ge 60; then
-        printf 'interrupt: the builder was still running 6s after SIGINT —\\n' >&2
-        printf 'the lanes were not signalled, so it waited for them\\n' >&2
+    if test "\$attempts" -ge 600; then
+        printf 'interrupt: the builder was still running 60s after SIGINT —\\n' >&2
+        printf 'past the 30s abort grace, so the lanes were never signalled\\n' >&2
         kill -KILL "\$builder" 2>/dev/null
         break
     fi

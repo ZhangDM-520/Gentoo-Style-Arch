@@ -4,7 +4,7 @@
 
 pkgname=zen-browser
 pkgver=1.22.3b
-pkgrel=1
+pkgrel=2
 pkgdesc='Firefox-based web browser built from upstream release source snapshot'
 url='https://zen-browser.app'
 arch=('x86_64')
@@ -85,11 +85,13 @@ source=(
   "$pkgname.desktop"
   '0004-Use-wasm32-wasip1-target.patch'
   '0005-Fix-cbindgen-BudgetType_VALUES-COUNT-issue.patch'
+  '0007-pgo-speedometer3.patch'
 )
-sha256sums=('7ece743694e7b7e6276fbaabe1f300804bdbc0ed0d23eea27bc252822bddeb0f'
+sha256sums=('5dafd8ae04726cb70b381723aa448f40507edab9232a20296e7d046037bd0b45'
             'af16fec9a88cbfffee34a6a4eb5b3074931477fcefee252840d77cf146568851'
             '28b086f5492d8e6731fe0dfe34a2e4c6d4d502a9eefa15a31e44b5788cf4df89'
-            '0d24f2a45fa0f7fe108a91a50ae55708f66899b0229df7722fb87962f7a2a243')
+            '0d24f2a45fa0f7fe108a91a50ae55708f66899b0229df7722fb87962f7a2a243'
+            'b2050b23273ea77a98bc645af5ee4e35e79fb9d76dd142f8e553eabd5334bdec')
 noextract=("$_srcroot-$pkgver.tar.zst")
 
 prepare() {
@@ -104,6 +106,8 @@ prepare() {
 
   patch -Np1 -i "$srcdir/0004-Use-wasm32-wasip1-target.patch"
   patch -Np1 -i "$srcdir/0005-Fix-cbindgen-BudgetType_VALUES-COUNT-issue.patch"
+  # SP2 workload entry -> Speedometer 3 (SP3 entry + sp3_httpd already in tree)
+  patch -Np1 -i "$srcdir/0007-pgo-speedometer3.patch"
 
   # Fix standard header isolation for std::ifstream
   sed -i '/#include <string>/a #include <fstream>' ipc/chromium/src/base/file_path.h

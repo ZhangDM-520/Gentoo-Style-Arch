@@ -2,8 +2,8 @@
 
 pkgname=noctalia-git
 _pkgname=noctalia
-pkgver=5.1.0.r5568.ge7acd0654
-pkgrel=1
+pkgver=5.1.0.r5570.g61aa22730
+pkgrel=2
 pkgdesc='A sleek, customizable desktop shell crafted for Wayland'
 arch=('x86_64' 'aarch64')
 url='https://github.com/noctalia-dev/noctalia'
@@ -87,18 +87,35 @@ prepare() {
 
 # Run the PGO training workload: exercise the real shell under a headless sway
 # session plus every headless CLI subcommand, so GCC's atexit handler can write
-# the .gcda profile data. All XDG state is sandboxed under $work.
+# the .gcda profile data. XDG config/cache/data state is sandboxed under $work;
+# XDG_RUNTIME_DIR is a short private /tmp dir (created here, removed on the
+# single fall-through exit path below).
 _pgo_train() {
   local work="$1"
   local bin="build-release/noctalia"
 
+  # 2026-09-23 incident: sway's IPC socket (sway-ipc.<pid>.<rand>.sock) lives
+  # inside XDG_RUNTIME_DIR, and the whole path must fit the 108-byte Unix
+  # sun_path — the ~93-char $srcdir sandbox path plus the socket name overflowed
+  # it ("Socket path won't fit into ipc_sockaddr->sun_path"), the training sway
+  # SEGVed, GUI training never ran, and only 1 .gcda was collected. Train under
+  # a short private /tmp dir instead (house precedent: mold-git, easyeffects-git).
+  local rt_dir
+  if ! rt_dir="$(mktemp -d /tmp/nct-pgo-rt.XXXXXX)"; then
+    # mktemp created nothing on failure, so there is no dir to tear down here;
+    # build()'s gcda-count check falls back to -Db_pgo=off for this run.
+    error "could not create the short XDG_RUNTIME_DIR for PGO training"
+    return 1
+  fi
+  chmod 700 "$rt_dir"   # mktemp already creates it mode 700; pin it anyway
+
   export XDG_CONFIG_HOME="$work/config"
   export XDG_CACHE_HOME="$work/cache"
   export XDG_DATA_HOME="$work/data"
-  export XDG_RUNTIME_DIR="$work/xdg-runtime"
+  export XDG_RUNTIME_DIR="$rt_dir"
   export NOCTALIA_ASSETS_DIR="$PWD/${_pkgname}/assets"
   export NOCTALIA_CONFIG_HOME="$work/noctalia-config"
-  mkdir -p -m 700 "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+  mkdir -p -m 700 "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
     "$XDG_DATA_HOME" "$NOCTALIA_CONFIG_HOME"
 
   local sway_pid=""
@@ -109,9 +126,16 @@ _pgo_train() {
 output HEADLESS-1 mode 1920x1080
 seat * hide_cursor 10000
 EOF
-  env WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
+  # setsid gives the whole training tree (dbus-run-session -> sway -> children)
+  # its own session/process group, so teardown below can signal the group:
+  # TERMs sent to $! alone only reached dbus-run-session and let sway stray
+  # (2026-09-23 incident). makepkg is non-interactive (no job control), so
+  # setsid execs in place and $! remains the group/session leader — the pgid
+  # bookkeeping for the wait below stays valid.
+  setsid env WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
     dbus-run-session -- sway -c "$work/sway-config" >"$work/sway.log" 2>&1 &
   sway_pid=$!
+  local pgid="$sway_pid"
 
   # Wait for the Wayland socket to appear (up to ~10 s).
   for _ in $(seq 1 100); do
@@ -136,19 +160,46 @@ EOF
   fi
 
   # CLI subcommands always exit through main(), so they always flush profiles.
-  "$bin" --help                       >/dev/null 2>&1 || true
-  "$bin" --version                    >/dev/null 2>&1 || true
+  # Run them with WAYLAND_DISPLAY unset: with the variable still exported they
+  # probe the (dead or foreign) socket instead of taking the CLI path that is
+  # guaranteed to exit through main().
+  env -u WAYLAND_DISPLAY "$bin" --help          >/dev/null 2>&1 || true
+  env -u WAYLAND_DISPLAY "$bin" --version       >/dev/null 2>&1 || true
   for sub in msg config theme ipc; do
-    "$bin" "$sub" --help              >/dev/null 2>&1 || true
+    env -u WAYLAND_DISPLAY "$bin" "$sub" --help >/dev/null 2>&1 || true
   done
   for sh in bash zsh fish; do
-    "$bin" completions "$sh"          >/dev/null 2>&1 || true
+    env -u WAYLAND_DISPLAY "$bin" completions "$sh" >/dev/null 2>&1 || true
   done
 
+  # Bounded group teardown: TERM the entire setsid group, wait a bounded grace
+  # (50 x 0.1 s) for its live (non-zombie) members to exit, escalate with one
+  # KILL sweep for anything that ignored TERM, then reap the direct child.
+  # Group signalling is what guarantees no stray sway/dbus-run-session survives
+  # the build (2026-09-23 incident). Zombies are ignored in the liveness probe:
+  # the unwaited leader stays a zombie until the wait below, and treating it as
+  # alive would always burn the full grace window.
   if [[ -n "$sway_pid" ]]; then
-    kill -TERM "$sway_pid" 2>/dev/null || true
+    local i
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for i in $(seq 1 50); do
+      ps -eo pgid=,stat= | awk -v g="$pgid" \
+        '$1 == g && $2 !~ /^Z/ { alive = 1 } END { exit !alive }' || break
+      sleep 0.1
+    done
+    if ps -eo pgid=,stat= | awk -v g="$pgid" \
+        '$1 == g && $2 !~ /^Z/ { alive = 1 } END { exit !alive }'; then
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
     wait "$sway_pid" 2>/dev/null || true
   fi
+
+  # Whatever runs later in build()/package() (completions generation) must not
+  # see the dead training socket either — take the clean CLI path there too.
+  unset WAYLAND_DISPLAY
+
+  # Single fall-through exit path: remove the short runtime dir created above.
+  rm -rf "$rt_dir"
 }
 
 build() {
@@ -201,7 +252,9 @@ build() {
       meson configure build-release -Db_pgo=use -Db_lto=true
     else
       warning "PGO profile incomplete (${gcda_count} .gcda files); building without PGO"
-      meson configure build-release -Db_pgo=none -Db_lto=true
+      # b_pgo's enum is off/generate/use — there is no "none" (a `-none` run
+      # died with: Value "none" ... not one of the choices, 2026-09-23).
+      meson configure build-release -Db_pgo=off -Db_lto=true
     fi
     meson compile -C build-release
   fi

@@ -212,9 +212,12 @@
   2026-09-17). Group files and `config/dependencies.conf` are the scheduler's
   source of truth.
 - `.state/` (or `GSA_STATE_DIR`) holds builder-owned state only: `logs/`, the
-  per-package logs inside it, the pacman mutex, and the lane result files.
-  `LOG_DIR` is the only path derived from `_STATE_DIR` — there are no builder
-  caches there. makepkg's own source trees and archives land **beside each
+  per-package logs inside it, the pacman mutex, the lane result files, and —
+  since 2026-09-23 — `dispatcher.log` (timestamped `[DEBUG-gsa-term]` signal
+  receipts, lane-stop escalations, reap anomalies) plus the generated
+  `.pacman-shim`. `LOG_DIR` is the only path derived from `_STATE_DIR` —
+  there are no builder caches there. makepkg's own source trees and archives
+  land **beside each
   recipe** (`SRCDEST`/`PKGDEST` default to `$startdir`), which is why the
   recipe directories carry ignore rules; both classes are ignored runtime
   state.
@@ -892,3 +895,53 @@ recipe).
   conflict-replace installs; transcript jsonl is a reliable crash-recovery
   source; transient `curl 56 SSL_read` on huge fetches → resume with
   `git -C src/<repo> submodule update <path>`.
+- **A signal storm corrupts what it kills** (2026-09-23): `stop_lane_process`
+  used to TERMed every lane PID every 50 ms with SIGKILL at 0.5 s; a pacman
+  caught mid-unlock never removed `db.lck`, so every later install hard-failed
+  (`could not lock database: File exists`) and runs died seconds after start.
+  Now: **one** TERM, a deadline-based 30 s grace (`_LANE_STOP_GRACE_S`), one
+  logged SIGKILL of survivors. Two standing contracts came with it: a stale
+  `db.lck` is removed only after two idle holder-probes 1 s apart (busy →
+  report + recovery text, refuse `-i`/`-ia`, never remove) with the path from
+  `pacman-conf DBPath`; and **every pacman a lane can reach goes through the
+  one flock** — `lane_job` exports `PACMAN=$LOG_DIR/.pacman-shim`
+  (`flock -x -w 300 … pacman "$@"`) because makepkg's own `-s` dep installs
+  otherwise race the builder's `pacman -U` (makepkg honours `PACMAN=`, verified
+  `/usr/bin/makepkg:1203`). Deadlock-free: `run_pacman_locked` is a leaf.
+- **A lane must record its own death, and the run must name its signal**
+  (2026-09-23): a 19:34:01 event killed dispatcher+lanes simultaneously and
+  nothing on disk said who — in code lanes are only TERMed by the interrupt
+  path, but post-hoc that was unprovable. Lane children used to *swallow*
+  INT/TERM via the dispatcher's handler, so a signalled child produced the
+  clueless `lane supervisor produced no valid result` (rc=125). Now the
+  handlers are split: dispatcher mode logs `[DEBUG-gsa-term] signal: …` to
+  `$LOG_DIR/dispatcher.log` (INT/TERM/**HUP** — HUP used to orphan lanes
+  silently) and lane mode writes an honest result (129/130/143) before
+  re-raising. Fish trap: `exit` inside a handler always yields rc 0 — erase
+  the handler and re-raise; the result *file* is the channel that matters
+  (fish exits 0 on INT even handler-less). rc=125 without forensics = bug.
+- **Sandbox paths have a length budget** (2026-09-23, noctalia): anything a
+  compositor/socket writes under `XDG_RUNTIME_DIR` must fit the 108-byte Unix
+  `sun_path`; sandboxing it under a deep `$srcdir/pgo-work` made sway die at
+  startup (`Socket path won't fit into ipc_sockaddr->sun_path`, SEGV in
+  journal), the GUI training never ran (1 `.gcda`), and the build failed. Put
+  runtime dirs for sockets in a short `mktemp -d /tmp/…` (700, removed on
+  exit), tear the training tree down as a **group** (`setsid` + TERM → bounded
+  grace → KILL) so no stray sway survives, and run CLI-only training with
+  `WAYLAND_DISPLAY` unset.
+- **meson's `b_pgo` enum is off/generate/use — there is no `none`**, and a
+  `-git` `pkgrel` bump does not survive its own acceptance build
+  (2026-09-23, noctalia): the incomplete-profile fallback `-Db_pgo=none`
+  hard-failed `build()` exactly when training had already degraded (the
+  fallback path runs least often and was never exercised). Use `-Db_pgo=off`.
+  Separately, stock `update_pkgver()` rewrites the PKGBUILD and resets
+  `pkgrel=1` whenever `pkgver()` moves — bump `pkgrel` **after** the first
+  post-sync build of a `-git` recipe, and regenerate `.SRCINFO` last.
+- **An upstream-track bump must re-pin version-spelled sums; a benchmark swap
+  must check root-path requirements** (2026-09-23, zen): `5f4078b` bumped
+  `pkgver` to 1.22.3b while `sha256sums[0]` still held the 1.22.1b digest —
+  the recipe could not fetch at all; re-pinned against **GitHub's server-side
+  asset digest** (hash + exact size, anchored not TOFU). Speedometer 3
+  *requires a root path* (`sp3_httpd` on port 8000 exists for exactly this),
+  so the fix for the deprecated SP2 workload was a **deletion-only** patch
+  (`0007-pgo-speedometer3.patch`), never a relative `webkit/…` entry.
