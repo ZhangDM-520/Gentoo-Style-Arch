@@ -10,20 +10,23 @@
 pkgname=vencord-git
 _pkgname=Vencord
 pkgver=1.15.6.r4.g59a542865
-pkgrel=1
+pkgrel=3
 pkgdesc='The cutest Discord client mod (git build)'
 arch=('any')
 url="https://github.com/Vendicated/${_pkgname}"
 license=('GPL-3.0-or-later')
 provides=('vencord')
 conflicts=('vencord')
+install=vencord-git.install
 # Nothing is compiler-built: the payload is plain JavaScript and esbuild runs
 # from its prebuilt helper, so there is no ISA/LTO/PGO phase to apply. The
 # Electron/JavaScript standard (docs/MEMORY.md §4): strip would rewrite
 # nothing useful, debug packages would duplicate the source, and LTO flags
 # could only leak into an incidental native addon build.
 options=('!strip' '!debug' '!lto')
-depends=()
+# Loader choice stays an optdepend; python is the one real runtime depend —
+# /usr/bin/vencord-inject (stdlib only) is what initiates the payload.
+depends=('python')
 optdepends=(
   'discord: official host client the desktop patcher modifies'
   'vesktop: desktop client with Vencord support built in'
@@ -36,8 +39,16 @@ makedepends=(
   # dependency reuses the cache and links through mold when present.
   'ccache'
 )
-source=("${_pkgname}::git+${url}.git#branch=main")
-sha256sums=('SKIP')
+source=("${_pkgname}::git+${url}.git#branch=main"
+        discord-vencord
+        vencord-inject
+        vencord-discord-desktop
+        vencord-discord-desktop.hook)
+sha256sums=('SKIP'
+            'd26eb9b6c1dbd204d9e1a287aa7feca57c2482e563b65ac3dbd32ce5d50adcad'
+            '5cfb7c12b5d4e5af750aaa76e47604b976a63ab79f0bd8875f28261eb33062ff'
+            'b9ada45f032c7722cb667b5e0273eba143d50a756cfdec104d84840411456384'
+            '8c1ef45e980f264948d70230e80832b303bd502a6f07efe2a2f6901d563dcdda')
 
 pkgver() {
   cd "${_pkgname}"
@@ -104,4 +115,20 @@ package() {
   # Loader contract: a package.json must sit beside the payloads (same shim
   # the AUR recipe writes).
   printf '{}\n' > "${pkgdir}/usr/lib/vencord/package.json"
+
+  # Initiation contract: the payload above is inert until injected.
+  #   * discord-vencord  — launcher that re-asserts the patch every start,
+  #                        which is what survives Discord self-updates;
+  #   * vencord-inject   — the injector (official-compatible asar shim),
+  #                        repointed at the pacman-owned payload;
+  #   * libalpm hook+script — re-wrap the stock discord.desktop Exec line
+  #                        after every discord package install/upgrade;
+  # vencord-git.install wires the first wrap into post_install and the
+  # unpatch+unwrap into pre_remove (still inside the package's lifetime).
+  install -Dm755 "${srcdir}/discord-vencord" "${pkgdir}/usr/bin/discord-vencord"
+  install -Dm755 "${srcdir}/vencord-inject" "${pkgdir}/usr/bin/vencord-inject"
+  install -Dm755 "${srcdir}/vencord-discord-desktop" \
+    "${pkgdir}/usr/share/libalpm/scripts/vencord-discord-desktop"
+  install -Dm644 "${srcdir}/vencord-discord-desktop.hook" \
+    "${pkgdir}/usr/share/libalpm/hooks/vencord-discord-desktop.hook"
 }

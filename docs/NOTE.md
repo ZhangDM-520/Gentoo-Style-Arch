@@ -32,6 +32,77 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-23 — vencord-git initiates injection: wrapper + official-compatible shim, and the scriptlet phases have no fallback
+
+- **Symptom**: phase 1 (`f5811c1`) shipped the payload only — the installed
+  files were inert, exactly the "stale scripts" reported. Worse, the host had
+  already been injected by the *official* installer (root-owned shim written
+  10:58 requiring `~/.config/Vencord/dist/patcher.js`, its own downloaded
+  copy), so nothing at all pointed Discord at the pacman-owned
+  `/usr/lib/vencord`.
+- **Root causes (three)**:
+  1. the official installer cannot be repointed at a pacman payload — it
+     downloads its own Vencord build into `~/.config/Vencord/dist` and would
+     hit EACCES writing under `/usr/lib` as a user;
+  2. this host's `discord` is the self-updating bootstrap — every self-update
+     lands a pristine `app-*/resources` tree, so any one-shot patch dies on
+     the next update;
+  3. **pacman has no scriptlet-phase fallback**: an upgrade calls
+     `pre_upgrade`/`post_upgrade`, never `pre_install`/`post_install`. Proven
+     live — the pkgrel=2 upgrade executed nothing (no output, desktop
+     unwrapped) even though `pacman -Qp` reported "Install Script: Yes"
+     (pacman 7's `.PKGINFO` has no `install =` key at all; the `.INSTALL`
+     archive member is the scriptlet, and PKGBUILD(5) names each phase).
+- **Fix (`pkgrel=3`, all in `packages/git/vencord-git/`)** — the initiation
+  contract:
+  - `vencord-inject` (python, stdlib only): byte-equivalent port of the
+    official `WriteAppAsar` — verified against the *live* official shim
+    (identical framing `4I` header, identical JSON shape, round-trip parse).
+    `inject` renames `app.asar`→`_app.asar` on a pristine tree and always
+    rewrites the shim to `require("/usr/lib/vencord/patcher.js")`, so it is
+    idempotent **and** adopts an official-installer patch in place;
+    `uninject` restores the original bytes; `status` exits 0 only when the
+    newest `app-*` of every `discord*` channel under `$XDG_CONFIG_HOME` is
+    injected against the payload. Root policy mirrors upstream: never bare
+    root, `SUDO_USER`/`DOAS_USER` HOME adopted, root-written files chowned
+    back (verified: env survives pacman's scriptlet sandbox).
+  - `discord-vencord` wrapper: re-asserts injection on **every launch** —
+    this is what survives Discord self-updates — then `exec`s the stock
+    launcher with args intact; injection failure is non-fatal.
+  - stock `discord.desktop` `Exec=` redirect **without shipping that path**
+    (a shipped file would file-conflict with the `discord` package):
+    `post_install`/`post_upgrade` wrap it, a Path-trigger libalpm hook
+    re-wraps after every discord install/upgrade (house gtk4/glib2 pattern,
+    format compared), and `pre_remove` — the house cleanup phase (7
+    `pre_remove` vs 2 `post_remove` in this repo; `post_remove` runs after
+    the package's own files are already deleted) — unwraps **and** unpatches
+    so a removal never leaves a shim requiring a missing `patcher.js`.
+  - `depends=('python')`, four local sources sha256-pinned, `.install` and
+    hook committed as recipe assets.
+- **Validation**: `tests/vencord-recipe.sh` now pins the initiation assets,
+  the `python` depend, the no-client-hard-depends rule, `pre_remove` cleanup
+  and **the `post_upgrade` presence** (the no-fallback lesson); the new
+  `tests/vencord-inject.sh` proves inject/status/adoption/idempotence
+  (sha-stable)/interrupted-state repair/byte-exact uninject/fresh-bootstrap
+  no-op/desktop wrap+restore idempotence/absent-file no-op/wrapper
+  arg+exec-through on scratch `$XDG_CONFIG_HOME` trees; full battery
+  **PASS 34 → 35**; then the **full live lifecycle on this host**:
+  `pacman -R` → `pre_remove` restored the pristine `app.asar` and the stock
+  `Exec=`, fresh `-U` → `post_install` message + wrapped `Exec=` + live shim
+  repointed to `/usr/lib/vencord/patcher.js` (`status` rc 0), same-version
+  `-U` → `post_upgrade` re-ran the same body with sha-identical results;
+  `pacman -Dk` clean. Two measurement traps while testing: a `pacman -R`
+  without `--noconfirm` aborts silently at the prompt (read the state, not
+  the pipe's exit code), and a log filter keyed on the word `upgrading`
+  misses pacman's actual `reinstalling` line.
+- **Rules**: (1) the payload is inert until injected — initiation is part of
+  this package's job, not the user's; (2) any `.install` action that must
+  happen on upgrades needs the upgrade-phase function names; (3) scriptlets
+  must be exercised through real transactions — install **and** upgrade
+  **and** remove, because each phase is a separate entry point; (4) never
+  ship a file at another package's path — redirect through a Path-triggered
+  hook that edits content in place.
+
 ## 2026-09-23 — new `app` group: a TTY multi-select prompt as a layer in front of the normal selection pipeline
 
 - **Decision (user-confirmed)**: isolate a sixth logical group `app` for

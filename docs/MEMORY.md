@@ -374,6 +374,14 @@ install history lives in `NOTE.md`.
   vencord-git):
   nothing is compiler-built except the native Node addons, so the recipes are
   `!strip !debug !lto` and apply only ccache + the mold probe to those addons.
+  vencord-git carries an extra operational contract: the `/usr/lib/vencord`
+  payload is **inert until injected**, so the recipe also ships
+  `discord-vencord` (re-asserts the patch on every launch — the only thing
+  that survives Discord self-updates), `vencord-inject` (official-compatible
+  asar shim; the official installer cannot be repointed at a pacman payload)
+  and a libalpm hook re-wrapping the stock `discord.desktop` — and its
+  scriptlets define `post_upgrade` because pacman has **no fallback** to
+  `post_install` on upgrades.
   logseq-desktop-git additionally bundles `master` (2.x) which embeds an
   OCaml/Melange CLI runtime — the opam switch lives under `$srcdir` and pins
   OCaml 5.1.1 to match upstream CI.

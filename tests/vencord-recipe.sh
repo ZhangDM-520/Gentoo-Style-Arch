@@ -11,8 +11,11 @@ fail() {
 }
 
 # Assets must exist and survive both .gitignore layers (the root rule that
-# denies every subdirectory under a recipe, and any recipe-local file).
-assets=(PKGBUILD .SRCINFO)
+# denies every subdirectory under a recipe, and any recipe-local file). The
+# initiation files ship as local sources/scriptlets, so they are part of the
+# contract, not just the PKGBUILD.
+assets=(PKGBUILD .SRCINFO vencord-git.install discord-vencord vencord-inject
+    vencord-discord-desktop vencord-discord-desktop.hook)
 for asset in "${assets[@]}"; do
     test -f "$root/$recipe/$asset" || fail "missing asset: $recipe/$asset"
     if git -C "$root" check-ignore -q -- "$recipe/$asset"; then
@@ -48,11 +51,12 @@ has arch 'any' || fail "payload is plain JavaScript; arch must be any"
 has provides 'vencord' || fail "does not provide vencord"
 has conflicts 'vencord' || fail "does not conflict with vencord"
 
-# No hard depends: the host client is a loader choice, not a requirement of
-# the payload (the AUR recipe hard-depends on vesktop; this one deliberately
-# does not). Belongs in optdepends instead.
-if grep -Eq '^depends=.+' <<<"$vars"; then
-    fail "hard depends present: $(grep -E '^depends=.+' <<<"$vars")"
+# The only runtime depend is python (vencord-inject, stdlib only). The host
+# client stays a loader choice: the AUR recipe hard-depends on vesktop; this
+# one must not hard-depend on any client — that belongs in optdepends.
+has depends 'python' || fail "missing runtime depend: python (vencord-inject)"
+if grep -Eq '^depends=(discord|vesktop)' <<<"$vars"; then
+    fail "hard client depend: $(grep -E '^depends=(discord|vesktop)' <<<"$vars")"
 fi
 
 # Toolchain: pnpm drives the bundle; git is the VCS source. Java must be
@@ -122,6 +126,36 @@ grep -Fq '/usr/lib/vencord' "$pkgbuild" ||
     fail "payload is not installed to /usr/lib/vencord"
 grep -Fq '/usr/lib/vencord/package.json' "$pkgbuild" ||
     fail "loader contract: no package.json shim beside the payloads"
+
+# Initiation contract: the payload is inert until injected, so package()
+# must ship the launcher, the injector and the desktop-redirect hook, and the
+# scriptlets must wire first wrap + adopt at install and unpatch + unwrap at
+# removal (pre_remove — post_remove runs after the package's own files are
+# already gone).
+grep -Fq 'install=vencord-git.install' "$pkgbuild" ||
+    fail "PKGBUILD does not reference its scriptlet file"
+for shipped in '/usr/bin/discord-vencord' '/usr/bin/vencord-inject' \
+    '/usr/share/libalpm/scripts/vencord-discord-desktop' \
+    '/usr/share/libalpm/hooks/vencord-discord-desktop.hook'; do
+    grep -Fq "$shipped" "$pkgbuild" || fail "package() does not install $shipped"
+done
+install_file="$root/$recipe/vencord-git.install"
+grep -Fq 'post_install()' "$install_file" || fail "no post_install scriptlet"
+grep -Fq 'pre_remove()' "$install_file" ||
+    fail "cleanup must run in pre_remove, not post_remove"
+grep -Fq 'post_upgrade()' "$install_file" ||
+    fail "no post_upgrade — pacman has no fallback to post_install on upgrades, so bumps would silently skip initiation"
+grep -Fq 'vencord-inject inject' "$install_file" ||
+    fail "post_install does not adopt an existing injection"
+grep -Fq 'vencord-discord-desktop wrap' "$install_file" ||
+    fail "post_install does not wrap the stock desktop entry"
+grep -Fq 'vencord-inject uninject' "$install_file" ||
+    fail "pre_remove does not uninject"
+grep -Fq 'vencord-discord-desktop restore' "$install_file" ||
+    fail "pre_remove does not restore the desktop Exec line"
+grep -Fxq 'Target = usr/share/applications/discord.desktop' \
+    "$root/$recipe/vencord-discord-desktop.hook" ||
+    fail "hook does not trigger on the stock discord.desktop path"
 
 # Topology: the recipe must be reachable through the map and the git group.
 grep -Fxq "vencord-git|$recipe" \
