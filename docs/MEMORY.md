@@ -218,7 +218,7 @@
   recipe** (`SRCDEST`/`PKGDEST` default to `$startdir`), which is why the
   recipe directories carry ignore rules; both classes are ignored runtime
   state.
-- The current logical groups are `git` (56), `stable` (29), `core` (41),
+- The current logical groups are `git` (58), `stable` (29), `core` (41),
   `misc` (1), and `third-party` (2). `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
 - No upstream checkout, package archive, downloaded signature, PGP cache,
@@ -367,7 +367,8 @@ install history lives in `NOTE.md`.
   schema/terminals patches; `options=(staticlibs)` on lz4/pixman/mimalloc/
   libunwind. Deliberate no-ops: libreoffice-fresh (already `!lto` +
   `--enable-lto` + fortify 3→2 + -g1); blender-git (mold + ccache + !lto).
-- **Electron/JavaScript packages** (vscodium-insiders-git, logseq-desktop-git):
+- **Electron/JavaScript packages** (vscodium-insiders-git, logseq-desktop-git,
+  vencord-git):
   nothing is compiler-built except the native Node addons, so the recipes are
   `!strip !debug !lto` and apply only ccache + the mold probe to those addons.
   logseq-desktop-git additionally bundles `master` (2.x) which embeds an

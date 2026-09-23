@@ -32,6 +32,70 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-23 — added `vencord-git`: desktop standalone Discord client mod in the git group
+
+- **Scope decisions (user-confirmed)**: package https://github.com/Vendicated/Vencord
+  as `packages/git/vencord-git` with the **desktop standalone artifacts only**
+  (`pnpm buildStandalone` → the six bundles → `/usr/lib/vencord`); no web build
+  and no browser-extension outputs. `check()` runs `pnpm testTsc` (type-check
+  only — upstream's full `pnpm test` also re-runs eslint, stylelint and the
+  plugin-manifest generator on every git bump). Fixture, host IgnorePkg entry
+  and docs shipped in the same change.
+- **Recipe**: root `pnpm install --frozen-lockfile` — Vencord's root
+  `pnpm-workspace.yaml` declares `packages/*`, so a *subdirectory* install
+  would need the workspace-isolating flag (the 2026-09-18 logseq incident);
+  there is no subdirectory install here, and `tests/vencord-recipe.sh` pins
+  that guard's absence. `arch=(any)`, `provides`/`conflicts` = `vencord`, and
+  **no hard depends**: `discord`/`vesktop` are optdepends because the loader is
+  a host choice — a deliberate divergence from the AUR recipe, which
+  hard-depends on `vesktop` (not installed here). `package()` writes the
+  `package.json` shim beside the payloads (loader contract, AUR parity).
+- **Optimization (MEMORY §4 Electron/JavaScript bullet)**: `options=('!strip'
+  '!debug' '!lto')` — nothing ships compiled except esbuild's prebuilt helper —
+  plus the house ccache + mold probe for any incidental native addon, and no
+  hard-coded ISA/optimisation flags of its own. Upstream honours
+  `SOURCE_DATE_EPOCH` (`BUILD_TIMESTAMP`), so makepkg's stamp is baked in.
+- **Wiring**: one `packages.map` record, one `git.list` member, one lone
+  `dependencies.conf` record (no workspace edges — git/nodejs/pnpm come from
+  the host repos). `build-all.fish` needed **no code change**: the loader
+  revalidates the whole map/graph/sort on every invocation, and `--audit`,
+  `--list` and the three group dry-runs went green with the record in place.
+- **Host**: `/etc/pacman.conf` backed up to
+  `/etc/pacman.conf.20260923-vencord.bak` first, then `IgnorePkg =
+  vencord-git` inserted **inside `[options]`** (after the last IgnorePkg
+  line; a line in a repo section is silently dropped). Closure check per the
+  2026-09-19 audit — `comm -23` of the `.SRCINFO` **pkgname set** vs
+  `pacman-conf IgnorePkg` — is empty again. Note the pkgbase-only names
+  `fcitx5-qt-git` and `texlive-texmf` are *not* gaps: they are non-installable
+  split bases whose outputs (`fcitx5-qt5/6-git`, 24 `texlive-*` splits) are
+  covered.
+- **Counts were already stale before this change**: the README claimed
+  126 recipes / 129 memberships / git 56, but measuring (find PKGBUILD,
+  group-line sums) showed 127 / 130 / 57 pre-change — an earlier addition
+  never updated them. Corrected to the measured post-change truth:
+  **128 recipe directories, 131 group memberships, git 58** (stable 29,
+  core 41, misc 1, third-party 2; `hip-runtime`/`hsa-rocr`/`openssl` are
+  deliberately double-listed, so 131 sums to 128 distinct members).
+- **Validation**: `bash -n`; `makepkg --printsrcinfo`; `--audit`/`--list`/
+  dry-runs for git, stable and core all rc=0; full fixture battery **PASS
+  (33 fixtures**, 32 → 33 with `tests/vencord-recipe.sh` pinning assets,
+  source, stage order, the optimisation standard, topology membership,
+  gitignore visibility and `.SRCINFO` freshness); a **real build**
+  (`--no-deps --no-sync vencord-git`) finished green in 1m54s — makepkg
+  wrote `pkgver=1.15.6.r4.g59a542865` back into the PKGBUILD, and the
+  archive `vencord-git-1.15.6.r4.g59a542865-1-any` (1.6 MB) was inspected:
+  all six bundles + css/maps/`.LEGAL.txt`, the shim, LICENSE and README are
+  present, and `.PKGINFO` carries `conflict = vencord`, the optdepends and
+  the makedepends. **No install was performed.**
+- **Rules**: (1) `~/.makepkg.conf` sets `BUILDENV=(… !check …)`, so makepkg
+  skips **every** recipe's `check()` on this host — the stage was validated
+  by running `pnpm testTsc` manually against the built tree (rc=0, 13.5 s);
+  do not read a missing `Starting check()...` line as a recipe defect.
+  (2) Never edit the README/MEMORY counts from memory — measure first; the
+  baseline was already off by one. (3) pnpm's `configured to use 11.9.0 …
+  your current pnpm is v11.26.0` warning is cosmetic (install, type-check
+  and build all proceeded).
+
 ## 2026-09-20 — `build-all.fish` audit: the harness was misreporting its own success
 
 - **Scope**: a full static read of `build-all.fish` (3561 lines, 73 functions)

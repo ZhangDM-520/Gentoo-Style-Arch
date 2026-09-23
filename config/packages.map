@@ -126,3 +126,4 @@ xz-git|packages/git/xz-git
 zlib-ng-compat-git|packages/git/zlib-ng-compat-git
 zlib-ng-git|packages/git/zlib-ng-git
 zstd-git|packages/git/zstd-git
+vencord-git|packages/git/vencord-git

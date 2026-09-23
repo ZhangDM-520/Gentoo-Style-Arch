@@ -23,7 +23,7 @@ verification.
 
 ## What is included
 
-The current set has 126 recipe directories and 129 group memberships. The
+The current set has 128 recipe directories and 131 group memberships. The
 counts differ because `core` is a logical build group: 36 of its 41 members
 live under `packages/core/`, while `autofdo-git`, `libclc-git` come from
 `packages/git/` and `hip-runtime`, `hsa-rocr`, `openssl` from
@@ -31,7 +31,7 @@ live under `packages/core/`, while `autofdo-git`, `libclc-git` come from
 
 | Group | Members | Purpose |
 | --- | ---: | --- |
-| `git` | 56 | Top-level development and rolling packages |
+| `git` | 58 | Top-level development and rolling packages |
 | `stable` | 29 | Stock-name packages synchronized with Arch repositories |
 | `core` | 41 | Heavy, ABI-coupled, source-heavy, and ROCm packages |
 | `misc` | 1 | Optional CachyOS kernel recipe |
