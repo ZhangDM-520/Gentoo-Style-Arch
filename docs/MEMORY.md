@@ -952,6 +952,24 @@ recipe).
   (`flock -x -w 300 … pacman "$@"`) because makepkg's own `-s` dep installs
   otherwise race the builder's `pacman -U` (makepkg honours `PACMAN=`, verified
   `/usr/bin/makepkg:1203`). Deadlock-free: `run_pacman_locked` is a leaf.
+- **Closing the terminal window SIGTERMs the whole run, and half-commits
+  pacman's local db** (2026-09-24, vscodium-insiders): dispatcher.log's first
+  real capture named the sender — `TERM … chain=fish ← sudo ← systemd --user
+  ← init`: the launching shell died, systemd user-scope teardown TERMed
+  everything, and 3 s later its in-flight `pacman -U` was a corpse mid-commit.
+  Long builds belong in a terminal you keep open (tmux); a dead run is
+  diagnosed from dispatcher.log first. The corpse signature is a
+  `local/<pkg>-<ver>/` dir **missing `desc`/`files`** (only `mtree`), and its
+  headline symptom is pacman's misleading `invalid or corrupted package` —
+  that error indicts the LOCAL db, never the archive (makepkg's `.BUILDINFO`
+  additionally prints the raw `desc` open error). The entry is unusable in
+  every direction (`-U`/`-R`/`-Ql` all hard-fail), so the only repair is
+  entry removal + `pacman -U` (with `--overwrite '*'` for the half-removed
+  package's now-orphaned files). `check_pacman_db_health` performs that repair
+  at the same four sites as the lock probe — busy holder → report-only,
+  provably idle (two probes 1 s apart) → remove loudly and tell you to
+  reinstall with `-s -i`/`-ia`; fixture `tests/local-db-repair.sh`, hidden
+  seam `--local-db-check <path>`.
 - **A lane must record its own death, and the run must name its signal**
   (2026-09-23): a 19:34:01 event killed dispatcher+lanes simultaneously and
   nothing on disk said who — in code lanes are only TERMed by the interrupt

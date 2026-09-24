@@ -1360,6 +1360,13 @@ function install_all
         ui_error "refusing -ia while the pacman database lock is busy (recovery hint above)"
         return 1
     end
+    # Same integrity preflight as -ia's sibling -i path: a broken entry would
+    # hard-fail the whole single transaction with "invalid or corrupted
+    # package"; the probe removes it loudly when provably idle.
+    if not check_pacman_db_health (pacman_db_local_path)
+        ui_error "refusing -ia while broken local package database entries exist (recovery hint above)"
+        return 1
+    end
     set -l pkgs (find_built_pkgs)
     if test (count $pkgs) -eq 0
         ui_warning "No built packages found."
@@ -1525,6 +1532,11 @@ function run_pacman_locked -a log_file
         # provably stale lock so the NEXT attempt can proceed (2026-09-23:
         # six runs died on "could not lock database: File exists").
         check_pacman_lock (pacman_db_lock_path)
+        # The other failure this path actually sees is pacman's misleading
+        # "invalid or corrupted package", which is the LOCAL db, not the
+        # archive (2026-09-24 vscodium): probe/repair the broken entry right
+        # here so the retry or the next run can succeed.
+        check_pacman_db_health (pacman_db_local_path)
     end
     return $rc
 end
@@ -2911,20 +2923,30 @@ function require_command -a command_name
     return 0
 end
 
-# Resolve the pacman database lock the way makepkg itself does —
-# "$(pacman-conf DBPath)/db.lck" — falling back to the stock path. Besides
+# Resolve pacman's database ROOT the way makepkg itself does —
+# `pacman-conf DBPath` — falling back to the stock /var/lib/pacman. Besides
 # honouring a non-default DBPath, this gives fixtures a PATH-stubbable
 # `pacman-conf` seam so they never probe (or touch) the host's real
-# /var/lib/pacman/db.lck. No GSA_* test knob exists for this.
-function pacman_db_lock_path
+# /var/lib/pacman/{db.lck,local}. No GSA_* test knob exists for this.
+function pacman_db_path
     if command -q pacman-conf
         set -l db_path (pacman-conf DBPath 2>/dev/null | string trim)
         if test -n "$db_path"; and string match -q '/*' -- "$db_path"
-            echo "$db_path/db.lck"
+            echo "$db_path"
             return 0
         end
     end
-    echo /var/lib/pacman/db.lck
+    echo /var/lib/pacman
+end
+
+function pacman_db_lock_path
+    echo (pacman_db_path)"/db.lck"
+end
+
+# The local (installed-package) database: every entry here is a directory
+# <pkgname>-<pkgver>-<pkgrel> holding at least `desc` and `files`.
+function pacman_db_local_path
+    echo (pacman_db_path)"/local"
 end
 
 # One "holder pid=N cmd=..." line per live lock holder on stdout. Empty
@@ -2992,6 +3014,97 @@ function check_pacman_lock -a lock_path
     return 1
 end
 
+# Entry directories under <DBPath>/local whose `desc` and/or `files` member is
+# absent. `find`, never a bare glob: an unmatched fish glob is fatal (house
+# rule), and a fixture's local dir may legitimately be empty.
+function pacman_db_broken_entries -a local_dir
+    for entry in (find "$local_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+        if not test -f "$entry/desc"; or not test -f "$entry/files"
+            echo "$entry"
+        end
+    end
+end
+
+# Usage: pacman_db_broken_report <local-dir> [holder-line ...] — print what is
+# broken, who is alive, and how to recover.
+function pacman_db_broken_report -a local_dir
+    for entry in (pacman_db_broken_entries "$local_dir")
+        echo "  broken: $entry (missing desc/files — interrupted pacman -U commit)"
+    end
+    for line in $argv[2..-1]
+        echo "$line"
+    end
+    echo "  A live transaction may be committing these right now. If they stay"
+    echo "  broken after it ends, the next builder run repairs them automatically"
+    echo "  (idle removal), or fix by hand:"
+    echo "    sudo rm -rf <entry>   then reinstall the package (-s -i / -ia)"
+end
+
+# check_pacman_db_health <local-dir> — report-only probe PLUS guarded removal
+# of local database entries an interrupted `pacman -U` left behind mid-commit.
+# Signature (2026-09-24 vscodium-insiders-git): the entry directory exists but
+# `desc`/`files` never landed (only `mtree`, written 3 s before a window-close
+# TERM killed pacman). From then on every transaction that loads the local db
+# fails with pacman's MISLEADING `invalid or corrupted package` — blame lands
+# on the ARCHIVE, which is perfectly fine — and makepkg's .BUILDINFO query
+# prints the raw `desc` open error during the package() phase. The entry is
+# unusable in every direction (-U, -R, -Ql all hard-fail), so removal plus
+# reinstall is the only repair; pacman -R cannot even read it.
+# Rules mirror check_pacman_lock: NEVER touch anything while a pacman/
+# packagekitd/pamac holder exists (a live transaction may legitimately be
+# mid-commit); remove ONLY when two probes 1 s apart find the box idle; LOUD,
+# because this mutates host state. In non-root runs `rm -rf` fails like the
+# lock probe does and prints the manual sudo line instead.
+# rc 0 = nothing broken, or the broken entries were removed; rc 1 = broken
+# entries remain (busy holder or permission denied).
+function check_pacman_db_health -a local_dir
+    if test -z "$local_dir"; or not test -d "$local_dir"
+        return 0
+    end
+    set -l broken (pacman_db_broken_entries "$local_dir")
+    if test (count $broken) -eq 0
+        return 0
+    end
+    set -l holders (pacman_lock_holder_lines)
+    if test (count $holders) -gt 0
+        ui_warning "local package database has "(count $broken)" broken entry(ies) but a transaction holder is alive — leaving them untouched:"
+        pacman_db_broken_report "$local_dir" $holders
+        return 1
+    end
+    sleep 1
+    set broken (pacman_db_broken_entries "$local_dir")
+    if test (count $broken) -eq 0
+        return 0
+    end
+    set holders (pacman_lock_holder_lines)
+    if test (count $holders) -gt 0
+        ui_warning "local package database has "(count $broken)" broken entry(ies) but a transaction holder is alive — leaving them untouched:"
+        pacman_db_broken_report "$local_dir" $holders
+        return 1
+    end
+    # Provably idle twice — the same gate as the lock removal above.
+    if rm -rf -- $broken
+        ui_warning "BROKEN local package database entries removed (idle on two probes 1 s apart):"
+        for entry in $broken
+            echo "  removed: $entry"
+        end
+        echo "  Why: an interrupted pacman -U commit leaves the entry directory without"
+        echo "  its desc/files members (2026-09-24 vscodium-insiders-git incident),"
+        echo "  after which pacman rejects every later transaction with a misleading"
+        echo "  'invalid or corrupted package'. The affected package(s) now count as"
+        echo "  NOT installed — reinstall them next: 'build-all.fish -s -i' or '-ia'"
+        echo "  reinstalls from the already-built archives."
+        return 0
+    end
+    ui_error "cannot remove broken local package database entries (permission denied?):"
+    for entry in $broken
+        echo "  $entry"
+    end
+    echo "  Remove them manually, then reinstall the package(s):"
+    echo "    sudo rm -rf <entry> && sudo pacman -U <archive>"
+    return 1
+end
+
 function check_runtime_prereqs -a install_flag needs_stable_sync
     set -l required fish makepkg nproc ps awk tail sed getent
     if test "$install_flag" = "1"; or test "$needs_stable_sync" = "1"
@@ -3020,6 +3133,18 @@ function check_runtime_prereqs -a install_flag needs_stable_sync
             return 1
         end
         ui_warning "pacman database lock is busy — building anyway; -i/-ia would be refused until it clears"
+    end
+    # Local-db integrity preflight (2026-09-24 vscodium): a desc/files-less
+    # entry makes every install fail with the misleading "invalid or
+    # corrupted package" — busy holder → report and refuse -i up front;
+    # provably idle → the probe removes it loudly so -s -i self-heals.
+    if not check_pacman_db_health (pacman_db_local_path)
+        if test "$install_flag" = "1"
+            ui_error "refusing to start an -i run while broken local package database entries exist (recovery hint above)"
+            echo "  Builds would succeed but every install would hard-fail on the broken entry."
+            return 1
+        end
+        ui_warning "broken local package database entries present — building anyway; -i/-ia would be refused until they are repaired"
     end
     return 0
 end
@@ -3706,6 +3831,11 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
             # the cleanup TERM sweep — a provably-stale db.lck is removed
             # loudly here, a live holder is only reported.
             check_pacman_lock (pacman_db_lock_path)
+            # Same aftermath window: a TERMed pacman may have died MID-COMMIT
+            # (2026-09-24: mtree-only local entry, three packages' installs
+            # poisoned until it was repaired). Idle → removed loudly here so
+            # the next run's -i self-heals; busy → reported only.
+            check_pacman_db_health (pacman_db_local_path)
             ui_warning "Build interrupted"
             dispatcher_log "Build interrupted (last signal: $_LAST_SIGNAL)"
             set -g _RL_INTERRUPTED 1
@@ -5077,6 +5207,19 @@ if test (count $argv) -gt 0; and test "$argv[1]" = --stale-lock-check
         exit 2
     end
     check_pacman_lock "$argv[2]"
+    exit $status
+end
+
+# Hidden fixture seam (same precedent as --stale-lock-check): run the
+# local-db integrity probe against an arbitrary directory. rc 0 = healthy or
+# broken entries removed; 1 = broken entries remain (busy holder or
+# permission denied). Never points at the host db unless a caller passes it.
+if test (count $argv) -gt 1; and test "$argv[1]" = --local-db-check
+    if test (count $argv) -ne 2
+        echo "Error: --local-db-check expects exactly one local-db path" >&2
+        exit 2
+    end
+    check_pacman_db_health "$argv[2]"
     exit $status
 end
 

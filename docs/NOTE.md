@@ -308,6 +308,75 @@ dependency edges, and incident root causes are unaffected by the renames.
   file directly; the mutex inode is never renamed. Forensics appends stay
   best-effort (guarded), everything else fails named.
 
+## 2026-09-24 — the signal finally named itself: a window close is a TERM, and it half-committed pacman's local db (vscodium-insiders)
+
+- **Symptom (user report)**: "error happened during create package phase" —
+  `vscodium-insiders-git.log` shows makepkg's `.BUILDINFO` generation printing
+  `error: could not open file /var/lib/pacman/local/vscodium-insiders-git-…/desc`,
+  then the build finishing fine, then the lane's install failing with
+  `could not fully load metadata` → `error: failed to prepare transaction
+  (invalid or corrupted package)` (rc=1) → `✗ Install failed`.
+- **Root cause chain (every step measured)**:
+  1. **The phase-3 forensics worked on their first real incident.**
+     `.state/logs/dispatcher.log` (workspace) records
+     `2026-09-24T17:50:30 [DEBUG-gsa-term] signal: TERM received …
+     chain=fish ← sudo ← systemd --user(1516) ← init` + `cleanup … stop begin
+     reason=interrupt pkg=vscodium-insiders-git … Build interrupted`. PID 1516
+     confirmed `systemd --user`: the launching shell was already gone (sudo
+     orphaned), so this is **systemd user-scope teardown SIGTERMing the run —
+     closing the terminal window kills the build**. The identical chain marks
+     17:07, 17:28 and 17:50 today and retroactively answers 2026-09-23's
+     unnamed 19:34:01 mass-TERM. The "lane watching" suspicion is exonerated
+     by the lane's own log: the cleanup path ran exactly as designed.
+  2. That run's `pacman -U` logged `[ALPM] transaction started` at 17:50:27
+     and was TERMed ~3 s later **mid-commit**: the local entry directory was
+     left containing **only `mtree`** (no `desc`, no `files`), the package
+     half-removed (`/usr/share/…` present, `/usr/lib/vscodium*` gone), no
+     `db.lck` (pacman unlocked but could not roll the local dir back). A
+     system-wide scan showed exactly this one desc-less entry.
+  3. From then on the entry was unusable **in every direction**: `pacman -U`
+     and `-R` and `-Ql` and makepkg's `.BUILDINFO` probe all hard-fail on the
+     missing members — and pacman's headline error, `invalid or corrupted
+     package`, **indicts the archive, which was perfectly fine**. That
+     misdirection is what made the failure look like a packaging bug.
+- **Repair (approved, executed)**: `cp -a` backup of the dangling dir to
+  `/tmp/vscodium-dangling-entry.bak` → `sudo rm -rf` the entry (it contains no
+  `desc`, so no scriptlet can ever run for it; `-R` cannot read it either) →
+  `sudo pacman -U --noconfirm --overwrite '*' <existing archive>` — the plain
+  `-U` refused exactly as predicted because the half-removed package's
+  orphaned `/usr/share/vscodium-insiders-git/**` files now belong to no
+  package (the documented `-ia --overwrite '*'` house escape hatch). Verified:
+  `pacman -Qk` → `2857 total files, 0 missing files`, `-Ql` lists, desc rescan
+  empty, no `db.lck`, hooks ran.
+- **Prevention (`build-all.fish`)**: `check_pacman_db_health <local-dir>` —
+  scans `$(pacman-conf DBPath)/local/*/` for entries missing `desc` **or**
+  `files` (both are universal on a healthy box: measured 1754/1754), gates on
+  the same holder double-probe as `check_pacman_lock` (a live transaction may
+  legitimately be mid-commit → report-only), and removes loudly only when
+  idle-twice, naming the entry, the interrupted-commit cause, and the
+  reinstall step (`-s -i`/`-ia`). New `pacman_db_path`/`pacman_db_local_path`
+  helpers keep one `pacman-conf DBPath` seam (fixtures never see the host
+  db). Wired at the same four sites as the lock probe: `check_runtime_prereqs`
+  (refuse `-i`, warn build-only), `install_all` (refuse `-ia`), the interrupt
+  teardown (the exact aftermath window), and `run_pacman_locked`'s failure
+  path (repair right where the misleading error surfaces). Hidden seam
+  `--local-db-check <path>` (same precedent as `--stale-lock-check`; no
+  `GSA_*` knob).
+- **Validation**: `tests/local-db-repair.sh` — six phases (idle removal +
+  warning text, holder-kept + pid/cmd + manual recovery, healthy entry
+  untouched while a broken sibling is removed, desc-without-files shape,
+  empty/absent dir, static seam+4-site pins); **falsified before trusted**
+  (neutering the `rm -rf` makes phase 1 fail; restored → PASS). `fish -n`,
+  `--audit`/`--list`/dry-runs, full battery green; live host repair verified.
+- **Durable rules**: closing the terminal window is a SIGTERM to the entire
+  run — long builds belong in a terminal you keep open (tmux) or must expect
+  termination at window close; dispatcher.log names the sender, so a dead run
+  is diagnosed from it first. `invalid or corrupted package` (plus a raw
+  `desc` open error in `.BUILDINFO`) indicts the **local db**, not the
+  archive: a desc/files-less `local/` dir is the signature of an interrupted
+  `-U` commit, healed only by entry removal + reinstall — the builder now
+  does both, loudly, when the box is provably idle.
+
 ## 2026-09-23 (night) — lanes died to an unnamed signal, the abort corrupted pacman, noctalia's training never ran, and zen trained on Speedometer 2.0
 
 One report, three isolatable defects, fixed by three parallel agents.
