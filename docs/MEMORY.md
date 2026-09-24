@@ -233,8 +233,8 @@
     possibly-held lock inode — root pre-creates it as the build user and
     unprivileged runs only verify readable (flock(1) opens read-only;
     measured: `flock -x` succeeds on root-owned 0644 and 0444 files). Pinned by
-    `tests/log-ownership.sh` (quarantine) and `tests/log-ownership-root.sh`
-    (root repair).
+    `tests/log-ownership.sh` (both halves — the unprivileged quarantine and
+    the root-repair section).
 
 ## 2. Workspace overview
 
@@ -752,9 +752,10 @@ recipe).
   pkgver, provides, the source URL and sha256sums, so a stale copy makes anything
   consuming the recipe build the wrong sources against the wrong sums —
   silently. bettbox's PKGBUILD was 1.19.2 while `.SRCINFO` was 1.19.1 with the
-  previous hash. Only three fixtures checked `.SRCINFO` (each its own recipe);
-  `tests/srcinfo-freshness.sh` now regenerates and diffs every recipe listed in
-  `config/packages.map` (~32 s at `-P 8`, `GSA_SRCINFO_JOBS` to override).
+  previous hash. Several per-recipe fixtures used to re-check their own copy;
+  `tests/srcinfo-freshness.sh` is now the single owner: it regenerates and diffs
+  every recipe listed in `config/packages.map` (one job per hardware thread,
+  `GSA_SRCINFO_JOBS` to override).
 - **The kernel patch set is version-scoped, and `updpkgsums` prefers a cached
   copy over the URL** (2026-09-19, `linux-cachyos`): `_patchsource` is
   `.../kernel-patches/master/${_major}`, so one version bump invalidates *every*
@@ -772,7 +773,7 @@ recipe).
   `scripts/config` sets symbols blindly and `olddefconfig` then drops the
   unknown ones, so a symbol that vanished upstream is a **silent** feature loss —
   check the ones that carry the variant's identity (`PREEMPT_RT`, `SCHED_BORE`)
-  still exist in the new tree. `tests/kernel-recipe-version.sh` now pins the part
+  still exist in the new tree. `tests/kernel-recipes.sh` now pins the part
   that is checkable offline: the tarball URL must name `pkgver`, and every
   `_patchsource` URL must sit under the `pkgver`'s major.
 - **A `b2sums` literal serves one knob combination, and makepkg's error for the
@@ -790,7 +791,7 @@ recipe).
   `b2sums+=(…)` next to each `source+=(…)`; `updpkgsums` rewrites the whole
   assignment on every version bump, so the appends double-count. Upstream
   sidesteps this by shipping one PKGBUILD per scheduler; a merged recipe cannot.
-  `tests/kernel-recipe-sums.sh` pins the guard, its exactness and the
+  `tests/kernel-recipes.sh` pins the guard, its exactness and the
   exemption.
 - **A diagnostic on a captured stdout is swallowed, and a range indexes the
   selection, not the whole set** (2026-09-19, `build-all.fish`): `resolve_group`
@@ -809,7 +810,7 @@ recipe).
   Separately: a **range indexes the selection**, so read `-l -g GROUP` before
   choosing one — `-l` now honours the selection and `-n` with none covers the
   whole set. Out-of-bounds ranges name the selection size, clamped bounds warn,
-  and `..` is refused. `tests/project-cli-hints.sh` pins all of it (red on five
+  and `..` is refused. `tests/project.sh` pins all of it (red on five
   mutations, including one that reverted the `>&2` and was only caught because
   the assertion checks the *channel* rather than the merged text).
 - **A `scripts/config` write is not evidence, and `!SYM` ≠ `SYM=n`**
@@ -821,7 +822,7 @@ recipe).
   `SCHED_BORE`, which only the BORE patch adds). The recipe now builds an
   expectation list beside each write and `prepare()` verifies the *resolved*
   `.config` against it via `packages/misc/linux-cachyos/verify-config.sh`,
-  aborting with a named reason (`tests/kernel-config-verify.sh` pins it). Two
+  aborting with a named reason (`tests/kernel-recipes.sh` pins it). Two
   rules fall out. (a) Only the post-`make prepare` file is evidence. (b) `!SYM`
   and `SYM=n` are different claims: a `choice` member whose prompt is hidden by
   a false `if` (`bool "Cubic" if TCP_CONG_CUBIC=y`) vanishes from `.config`
@@ -1011,3 +1012,18 @@ recipe).
   *requires a root path* (`sp3_httpd` on port 8000 exists for exactly this),
   so the fix for the deprecated SP2 workload was a **deletion-only** patch
   (`0007-pgo-speedometer3.patch`), never a relative `webkit/…` entry.
+- **The battery runs in parallel now, so two things became contractual**
+  (2026-09-24, harness): `tests/run-all.sh` executes fixtures concurrently by
+  default (`-j`/`RUN_ALL_JOBS` to cap, `--serial` to debug; 45 scripts and
+  ~4 min serial → 33 files and ~29 s). (a) A fixture must be parallel-safe:
+  non-mutating, `$TMPDIR`-scoped, and every process assertion scoped to its own
+  `$fixture` path — `signal-abort-lock.sh`'s global `--lane-job` scan was the
+  documented "never run two batteries at once" tripwire and would have
+  self-inflicted on every run, so it is path-scoped now. (b) Sibling subjects
+  merge into ONE fixture file as `( subshell )` sections (own variables, traps,
+  `fail()` prefix) instead of growing another top-level script; the five
+  `*-pgo-transition.sh` wrappers folded into `pgo-transition.sh` (no args = all
+  five pairs). `dashboard.sh` case C no longer waits out a real 30 s window:
+  `_LANE_STOP_GRACE_S` is an env-overridable *internal* seam (default stays 30,
+  pinned by `signal-abort-lock.sh`; not an eighth public `GSA_*` input), and
+  `.SRCINFO` freshness has exactly one owner, `tests/srcinfo-freshness.sh`.

@@ -63,8 +63,9 @@ non-mutating — and with `makepkg`'s own checks. `tools/` holds host-side
 diagnostics that are deliberately too heavy for that battery:
 
 ```sh
-bash tests/run-all.sh                  # every fixture
+bash tests/run-all.sh                  # every fixture (parallel by default)
 bash tests/run-all.sh recipe           # substring filter
+bash tests/run-all.sh --serial         # one at a time
 tools/go-modcache-check.sh             # is the Go module cache intact?
 ```
 

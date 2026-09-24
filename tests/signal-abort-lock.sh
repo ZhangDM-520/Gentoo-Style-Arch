@@ -180,14 +180,27 @@ end_bg() { # wait for $disp → $rc; reap the watchdog
 }
 
 find_lane_pid() {
-    ps -eo pid=,args= | awk '/build-all\.fish --lane-job/ && !/awk/ {print $1; exit}'
+    # Scoped to THIS fixture's synthetic workspace. The battery runs fixtures in
+    # parallel, so a global `--lane-job` match would pick a sibling fixture's
+    # lane (the 2026-09-24 "never run two batteries at once" hazard, which a
+    # parallel runner would otherwise self-inflict on every run). Lane argv
+    # always carries the builder's own path: `fish $SCRIPT_DIR/build-all.fish
+    # --lane-job …`, and SCRIPT_DIR lives under $fixture here.
+    ps -eo pid=,args= | awk -v f="$fixture" \
+        '/build-all\.fish --lane-job/ && index($0, f) && !/awk/ {print $1; exit}'
 }
 
 # ── 6. static shape of stop_lane_process (do NOT wait out the real 30 s) ────
 gf="$root/build-all.fish"
-grace=$(sed -n 's/^set -g _LANE_STOP_GRACE_S \([0-9][0-9]*\)$/\1/p' "$gf")
+# The default must still be 30 — the value lives behind the env-override seam
+# (tests/dashboard.sh shortens it to prove the KILL path fast), so pin both
+# halves: the 30 fallback and the seam that may replace it.
+grace=$(sed -n 's/^[[:space:]]*set -g _LANE_STOP_GRACE_S \([0-9][0-9]*\)$/\1/p' "$gf" |
+    head -1)
 [[ $grace == 30 ]] ||
-    fail "grace constant must be 30 s (got '$grace')"
+    fail "grace default must be 30 s (got '$grace')"
+grep -qF 'if not set -q _LANE_STOP_GRACE_S; or not string match -qr' "$gf" ||
+    fail "_LANE_STOP_GRACE_S must stay an env-overridable internal seam"
 stop_body=$(sed -n '/^function stop_lane_process/,/^function cleanup_active_lanes/p' "$gf")
 [[ -n $stop_body ]] || fail "could not extract stop_lane_process from build-all.fish"
 term_lines=$(grep -c 'kill -TERM' <<<"$stop_body")
@@ -344,9 +357,13 @@ for sig in INT TERM HUP; do
         fail "$sig: lane pgrp received $term_count TERMs, want exactly 1" \
             "$(cat "$state/signals.log")"
     sleep 0.3
-    if ps -eo args= | grep -F 'build-all.fish --lane-job' | grep -v grep >/dev/null; then
+    # Scoped to $fixture for the same reason as find_lane_pid: a sibling
+    # fixture's lane running concurrently must not be read as a survivor.
+    if ps -eo args= | grep -F 'build-all.fish --lane-job' | grep -F "$fixture" |
+        grep -v grep >/dev/null; then
         fail "$sig: a lane process survived the dispatcher:" \
-            "$(ps -eo pid=,args= | grep -F 'build-all.fish --lane-job' | grep -v grep)"
+            "$(ps -eo pid=,args= | grep -F 'build-all.fish --lane-job' |
+            grep -F "$fixture" | grep -v grep)"
     fi
     if ps -eo args= | grep -F "$fixture/bin/makepkg" | grep -v grep >/dev/null; then
         fail "$sig: a stub makepkg survived the dispatcher"

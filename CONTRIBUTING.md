@@ -115,8 +115,10 @@ bash tests/run-all.sh
 ```
 
 `tests/run-all.sh` runs every fixture (discovered, so new ones need no edit
-here); pass a substring to narrow it, e.g. `bash tests/run-all.sh recipe`. The
-fixtures are non-mutating and cover the project configuration, recipe
+here) — in parallel by default, because every fixture is non-mutating and
+`$TMPDIR`-scoped; pass a substring to narrow it,
+e.g. `bash tests/run-all.sh recipe`, or `--serial` to debug one at a time. The
+fixtures cover the project configuration, recipe
 registration and assets, source sharing, PGO transitions and the PGO install
 gate, and the scheduler's resource profiles, so run the whole battery rather
 than only the file matching the recipe you touched — the map-format change of

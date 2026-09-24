@@ -21,12 +21,13 @@ set -euo pipefail
 #      the polite TERM.
 #
 # Case C is the only timing-sensitive assertion in the battery: it fails if the
-# builder does not return within 60s of the interrupt. That is deliberate — a
+# builder does not return promptly after the interrupt. That is deliberate — a
 # builder that waits for its lanes to finish on their own is the defect. The
-# bound sits above stop_lane_process' 30s abort grace (one TERM, then a
-# deadline poll, then a single SIGKILL — the 2026-09-23 fix that stopped the
+# bound sits above the abort grace this case sets through the
+# _LANE_STOP_GRACE_S internal seam (5 s here, 30 s by default — one TERM, then
+# a deadline poll, then a single SIGKILL, the 2026-09-23 fix that stopped the
 # old 50ms TERM blitz from re-interrupting a running pacman's unlock) and far
-# below the stub lanes' natural ~45s runtime, so a pass proves the escalation
+# below the stub lanes' natural ~10s runtime, so a pass proves the escalation
 # killed the lanes rather than their own loop ending.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -229,26 +230,31 @@ stty cols 40 rows 24
 export PATH="$dir/bin:\$PATH"
 export GSA_STATE_DIR="$dir/state"
 export GSA_CPU_THREADS=8 GSA_MEMORY_GIB=16
-# 900 ticks x 0.05s = ~45s natural lane runtime, deliberately LONGER than
-# stop_lane_process' 30s grace: the lanes must be ended by the post-grace
+# 200 ticks x 0.05s = ~10s natural lane runtime, deliberately LONGER than
+# the grace this case sets below: the lanes must be ended by the post-grace
 # SIGKILL escalation, not by their own loop running out.
-export GSA_FAKE_TICKS=900
+export GSA_FAKE_TICKS=200
+# Shorten the abort grace through the builder's internal seam (default stays
+# 30 s, pinned by signal-abort-lock.sh): the contract is TERM → grace → single
+# KILL, not the wall-clock length of the window, and waiting out a real 30 s
+# made this the slowest fixture in the battery.
+export _LANE_STOP_GRACE_S=5
 export GSA_LANE_MARKER="$dir/pids"
 fish "$dir/build-all.fish" --allow-broken-rustc --no-deps --no-sync --lanes 2 p1 p2 p3 &
 builder=\$!
 sleep 1.4
 kill -INT "\$builder" 2>/dev/null
 # A zombie still answers kill -0, so \"exited\" is decided the way the builder
-# decides it: no such pid, or a Z state. The 60s deadline clears the 30s
-# abort grace with 2x margin for a loaded machine.
+# decides it: no such pid, or a Z state. The 20s deadline clears the 5s abort
+# grace (and this case's own startup) with 2x margin for a loaded machine.
 attempts=0
 while :; do
     state=\$(ps -o stat= -p "\$builder" 2>/dev/null | tr -d ' ')
     if test -z "\$state" || test "\${state#*Z}" != "\$state"; then break; fi
     attempts=\$((attempts + 1))
-    if test "\$attempts" -ge 600; then
-        printf 'interrupt: the builder was still running 60s after SIGINT —\\n' >&2
-        printf 'past the 30s abort grace, so the lanes were never signalled\\n' >&2
+    if test "\$attempts" -ge 200; then
+        printf 'interrupt: the builder was still running 20s after SIGINT —\\n' >&2
+        printf 'past the abort grace, so the lanes were never signalled\\n' >&2
         kill -KILL "\$builder" 2>/dev/null
         break
     fi

@@ -18,7 +18,9 @@ set -euo pipefail
 # diffed, never written to.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-jobs=${GSA_SRCINFO_JOBS:-8}
+# Concurrency: makepkg --printsrcinfo is cheap and pure, so the whole map is
+# checked at once (one job per hardware thread; override with GSA_SRCINFO_JOBS).
+jobs=${GSA_SRCINFO_JOBS:-$(nproc 2>/dev/null || echo 8)}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gsa-srcinfo-fixture.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 

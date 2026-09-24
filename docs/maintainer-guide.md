@@ -23,7 +23,7 @@ recipe.
 combination of a recipe's knobs. Keep the source set knob-independent where you
 can. Where you cannot, make the recipe refuse the combinations it cannot serve
 *and* keep the sum-generation path runnable — `packages/misc/linux-cachyos`
-does both, and `tests/kernel-recipe-sums.sh` pins it. Never grow `b2sums` with
+does both, and `tests/kernel-recipes.sh` pins it. Never grow `b2sums` with
 per-knob `b2sums+=(…)` appends next to each `source+=(…)`: `updpkgsums`
 rewrites the whole assignment as a literal on every version bump, so the
 appends double-count at the first bump.

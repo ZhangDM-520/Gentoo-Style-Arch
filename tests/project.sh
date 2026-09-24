@@ -35,24 +35,31 @@ fail() {
 
 out=
 rc=0
-run() { # [args...]
-    set +e
-    out=$(fish "$builder" "$@" 2>&1)
-    rc=$?
-    set -e
+cache=$tmp/run-cache
+mkdir -p "$cache"
+# Cache key = the exact argument list, so a replayed call hits the invocation
+# that was pre-executed for it.
+run_key() { printf '%s\0' "$@" | md5sum | cut -d' ' -f1; }
+
+run() { # [args...] — replay a pre-executed invocation
+    local key
+    key=$(run_key "$@")
+    out=$(cat "$cache/$key.out" 2>/dev/null) ||
+        fail "no pre-executed invocation for: $*"
+    rc=$(cat "$cache/$key.rc" 2>/dev/null) || rc=127
+    [[ $rc =~ ^[0-9]+$ ]] || rc=127
 }
 
 out_stdout=
 out_stderr=
-run_split() { # [args...]
-    local err
-    err=$(mktemp "$tmp/err.XXXXXX")
-    set +e
-    out_stdout=$(fish "$builder" "$@" 2>"$err")
-    rc=$?
-    set -e
-    out_stderr=$(cat "$err")
-    rm -f "$err"
+run_split() { # [args...] — replay with stdout/stderr kept apart
+    local key
+    key=$(run_key "$@")
+    out_stdout=$(cat "$cache/$key.out" 2>/dev/null) ||
+        fail "no pre-executed invocation for: $*"
+    out_stderr=$(cat "$cache/$key.err" 2>/dev/null)
+    rc=$(cat "$cache/$key.rc" 2>/dev/null) || rc=127
+    [[ $rc =~ ^[0-9]+$ ]] || rc=127
 }
 
 require_ok() { # description
@@ -70,6 +77,37 @@ require_not_in() { # description needle
 rows() { # print the numbered rows of $out, as bare package names
     sed -n 's/^ *[0-9][0-9]*\. //p' <<<"$out"
 }
+
+# --- parallel pre-execution --------------------------------------------------
+# Every run/run_split below is a read-only listing or dry run that has no
+# effect on any other, so the calls are collected from THIS FILE and executed
+# here concurrently; run()/run_split() then replay them from the cache. The
+# assertions stay sequential and byte-for-byte identical — only fish's
+# per-invocation startup (config load plus the full map/graph/sort validation
+# the loader performs on every call) is paid across all invocations at once
+# instead of one after another (~27s -> ~7s).
+pids=()
+declare -A scheduled=()
+while IFS= read -r line; do
+    kind=${line%% *}
+    rest=${line#* }
+    read -r -a argv <<<"$rest"
+    ((${#argv[@]})) || continue
+    key=$(run_key "${argv[@]}")
+    [[ -n ${scheduled[$key]:-} ]] && continue
+    scheduled[$key]=1
+    if [[ $kind == run_split ]]; then
+        (fish "$builder" "${argv[@]}" >"$cache/$key.out" 2>"$cache/$key.err"
+        printf '%s\n' "$?" >"$cache/$key.rc") &
+    else
+        (fish "$builder" "${argv[@]}" >"$cache/$key.out" 2>&1
+        printf '%s\n' "$?" >"$cache/$key.rc") &
+    fi
+    pids+=("$!")
+done < <(grep -E '^(run|run_split) ' "${BASH_SOURCE[0]}")
+for pid in "${pids[@]}"; do
+    wait "$pid" || true
+done
 
 # --- unresolved references: refused, with the nearest candidates ------------
 run -n --no-deps mesa-gti
@@ -197,3 +235,37 @@ require_not_in 'the bare name with --no-deps' 'dependency expansion'
 
 printf 'cli hints fixture: PASS (%s recipes, %s-row selection indexed, extra forms announced)\n' \
     "$recipes" "$git_rows"
+
+# ==== project-config.sh ====
+(
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+output=$(fish "$root/build-all.fish" --list 2>&1) || {
+    printf '%s\n' "$output" >&2
+    exit 1
+}
+
+if ! grep -F 'xorg-xwayland-git' <<<"$output" >/dev/null; then
+    printf 'package listing omitted xorg-xwayland-git:\n%s\n' "$output" >&2
+    exit 1
+fi
+
+# config/groups/ is reachable only through the six declared group names:
+# read_group_config is called for exactly git/stable/core/misc/third-party/app
+# and resolve_group rejects every other name, so any other file in that
+# directory is unreachable control state that silently goes stale. A run of
+# --list above already proved the six real files load, so only the directory's
+# contents need checking here.
+expected_files=(app.list core.list git.list misc.list stable.list third-party.list)
+mapfile -t group_files < <(
+    find "$root/config/groups" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+)
+if [[ "${group_files[*]}" != "${expected_files[*]}" ]]; then
+    printf 'unexpected config/groups contents: %s (expected: %s)\n' \
+        "${group_files[*]}" "${expected_files[*]}" >&2
+    exit 1
+fi
+
+printf 'project configuration fixture: PASS\n'
+)

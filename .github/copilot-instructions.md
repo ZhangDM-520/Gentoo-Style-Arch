@@ -68,18 +68,24 @@ fish build-all.fish --audit          # needs ripgrep
 fish build-all.fish --dry-run --group git
 
 # Fixture battery — the project's test suite
-bash tests/run-all.sh                # all fixtures, alphabetically
+bash tests/run-all.sh                # every fixture, in parallel (nproc jobs)
 bash tests/run-all.sh recipe         # substring filter, e.g. 'recipe', 'pgo'
+bash tests/run-all.sh --serial       # one at a time (debugging a flaky fixture)
 bash tests/recipe-sources.sh         # run one fixture directly
 ```
 
-`tests/run-all.sh` discovers `tests/*.sh` and needs no edit for a new fixture.
-The filter is a plain substring of the filename, so `pgo` runs the whole PGO
+`tests/run-all.sh` discovers fixtures recursively (excluding `tests/assets/`)
+and needs no edit for a new one. It runs them in parallel by default, which is
+sound because every fixture is non-mutating and `$TMPDIR`-scoped, so none writes
+what another reads — **a new fixture must keep that true** (bug in the fixture,
+not a reason to drop `-j`). `-j N` / `RUN_ALL_JOBS` caps concurrency,
+`--serial` runs one at a time, and the ✓/✗ report is printed alphabetically
+regardless of completion order. The
+filter is a plain substring of the filename, so `pgo` runs the whole PGO
 family; `texlive`, `recipe`, `project`, `scheduler` and `sudo` each
-narrow to one area (`project` covers both `project-config` and `project-cli-hints`),
-and `mkinitcpio`/`bpftune` isolate the two single-recipe hook fixtures. A
-filter that matches nothing still exits 0 with `PASS (0 fixture(s))` — check
-that count before trusting a green run.
+narrow to one area, and `mkinitcpio`/`bpftune` isolate the two single-recipe
+hook fixtures. A filter that matches nothing still exits 0 with
+`PASS (0 fixture(s))` — check that count before trusting a green run.
 
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
@@ -87,10 +93,15 @@ on builder output), and print a reason to stderr. **Run the whole battery, not
 just the fixture near your change** — a `config/packages.map` format change
 was once caught by an unrelated recipe fixture.
 
-Two harness conventions worth copying rather than reinventing: a fixture that
+Three harness conventions worth copying rather than reinventing: a fixture that
 applies to many packages takes its package/project as `$1`/`$2`
-(`tests/pgo-transition.sh`; the five six-line `*-pgo-transition.sh` files are
-wrappers that `exec` it with their package pair), and `tests/assets/` is *not* discovered —
+(`tests/pgo-transition.sh` runs all five of its pairs with no arguments, one
+pair when given the three); sibling areas share ONE file as sequential sections,
+each absorbed script wrapped in a `( subshell )` so its variables, traps and
+`fail()` prefix stay isolated (`kernel-recipes`, `log-ownership`, `noctalia-pgo`,
+`zen-pgo`, `vencord`, `project`) — merge into an existing subject file rather
+than adding a second top-level script for the same subject; and `tests/assets/`
+is *not* discovered —
 it holds frozen reference material such as the previous split-loop
 implementation, so nothing there runs standalone.
 
@@ -225,7 +236,7 @@ Four modules, deliberately separated (`docs/architecture.md`):
    `reserved_memory_gib`) and the default `lanes`/`jobs`/`intensity`/`state_dir`.
    Only those six group names are ever read, so any other file in
    `config/groups/` is unreachable state that silently goes stale —
-   `tests/project-config.sh` fails on it.
+   `tests/project.sh` fails on it.
 3. **Builder** — `build-all.fish` resolves IDs, expands and topologically sorts
    dependencies, dispatches isolated fish child processes as lanes, serializes
    pacman transactions, owns the dashboard, and reports per-package logs.

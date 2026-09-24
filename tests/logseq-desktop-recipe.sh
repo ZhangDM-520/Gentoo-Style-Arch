@@ -117,10 +117,7 @@ grep -Fxq 'logseq-desktop-git' "$root/config/groups/git.list" ||
 grep -q '^logseq-desktop-git:' "$root/config/dependencies.conf" ||
     fail "not registered in config/dependencies.conf"
 
-# .SRCINFO must match the recipe.
-if ! GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" |
-    diff -q - "$root/$recipe/.SRCINFO" >/dev/null; then
-    fail ".SRCINFO is out of sync with the PKGBUILD"
-fi
+# .SRCINFO freshness is owned by tests/srcinfo-freshness.sh (it regenerates and
+# diffs every recipe from config/packages.map), so it is not re-asserted here.
 
 printf 'logseq-desktop-git recipe fixture: PASS\n'

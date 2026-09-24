@@ -2,6 +2,26 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# One fixture covers every PGO-transition recipe. With no arguments it runs
+# each package/project/recipe triple in turn — the five six-line
+# *-pgo-transition.sh wrappers this replaces did exactly that via `exec` — and
+# with the three positional arguments it runs only that pair. A failing pair
+# fails the whole fixture.
+if (($# == 0)); then
+    status=0
+    while read -r pkg proj recipe; do
+        bash "${BASH_SOURCE[0]}" "$pkg" "$proj" "$recipe" || status=1
+    done <<'PAIRS'
+cairo-git cairo packages/git/cairo-git
+glib2-git glib packages/core/glib2-git
+gtk3-git gtk packages/git/gtk3-git
+gtk4-git gtk packages/core/gtk4-git
+xorg-xwayland-git xserver packages/git/xorg-xwayland-git
+PAIRS
+    exit $status
+fi
+
 package_id="${1:-glib2-git}"
 project_dir="${2:-glib}"
 recipe_path="${3:-packages/core/glib2-git}"

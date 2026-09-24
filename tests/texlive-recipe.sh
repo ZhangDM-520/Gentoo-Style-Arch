@@ -180,10 +180,7 @@ grep -Fq "'^svn\+|^svn://'" "$root/build-all.fish" ||
 grep -q '^set -g _DOWNLOAD_ARCHIVE_EXTS .*\(^\| \)whl\( \|$\)' "$root/build-all.fish" ||
     fail "build-all.fish does not clean downloaded wheels"
 
-# .SRCINFO must match the recipe.
-if ! GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" |
-    diff -q - "$root/$recipe/.SRCINFO" >/dev/null; then
-    fail ".SRCINFO is out of sync with the PKGBUILD"
-fi
+# .SRCINFO freshness is owned by tests/srcinfo-freshness.sh (it regenerates and
+# diffs every recipe from config/packages.map), so it is not re-asserted here.
 
 printf 'texlive-texmf recipe fixture: PASS\n'

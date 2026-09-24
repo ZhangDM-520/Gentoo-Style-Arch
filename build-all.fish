@@ -165,7 +165,13 @@ set -g _INTERRUPT_HANDLED 0
 set -g _LAST_SIGNAL none
 set -g _LANE_JOB_ACTIVE 0
 set -g _LANE_SIGNAL_RC 0
-set -g _LANE_STOP_GRACE_S 30
+# The grace defaults to 30 s but an exported value overrides it: an
+# underscore-prefixed INTERNAL seam (tests/dashboard.sh shortens it so the
+# post-grace KILL path can be proven in seconds). The seven public GSA_*
+# inputs listed in --help are unchanged. Non-numeric junk falls back to 30.
+if not set -q _LANE_STOP_GRACE_S; or not string match -qr '^[0-9]+$' -- $_LANE_STOP_GRACE_S
+    set -g _LANE_STOP_GRACE_S 30
+end
 
 # ─── Project configuration ───────────────────────────────────────────────────
 set -g _PACKAGE_MAP

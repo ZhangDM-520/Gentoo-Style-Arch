@@ -27,10 +27,73 @@ of the same five names (`config/groups/*.list`).
 | `-g static`, `-g heavy`, `-g critical`, `-g rocm` | four separate groups | `-g stable` and `-g core` (2026-09-15); `core` auto-enables `-i` |
 | `-si`, `--sepinstall` | the separated-install flag | removed 2026-09-17 — `-i`/`--install` is the only spelling |
 | `--installall` at end of run | the old collective install | `-ia` remains as a one-transaction escape hatch; a normal run installs per package with `-i` |
+| `tests/*-pgo-transition.sh` (five 6-line wrappers) | one wrapper per PGO recipe | folded into `tests/pgo-transition.sh` (no args = all five pairs) on 2026-09-24 |
+| `tests/kernel-config-verify.sh`, `kernel-recipe-sums.sh`, `kernel-recipe-version.sh` | three kernel fixtures | one `tests/kernel-recipes.sh` with three sections (2026-09-24) |
+| `tests/log-ownership-root.sh`, `noctalia-pgo-train.sh`, `zen-pgo-workload.sh` + `zen-pgo-speedometer.sh`, `vencord-recipe.sh` + `vencord-inject.sh`, `project-config.sh` + `project-cli-hints.sh` | one file per sub-area | sections of `tests/log-ownership.sh`, `noctalia-pgo.sh`, `zen-pgo.sh`, `vencord.sh`, `project.sh` (2026-09-24) |
 
 So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
+
+## 2026-09-24 (battery restructure) — 45 scruffy fixtures and a 4-minute serial battery → 33 files, one file per subject, 29 s in parallel
+
+- **Symptom**: `tests/` had grown one incident at a time — 45 flat scripts
+  (~6,970 lines), five six-line wrapper files, six subjects split across two or
+  three files each, and one `.SRCINFO` freshness check asserted in five places.
+  The full battery cost ~4 minutes, so it was starting to feel too expensive to
+  run habitually — which is exactly how a battery stops catching things.
+- **Cost audit (per-fixture wall time)**: `dashboard.sh` 48.9 s (case C waited
+  out the *real* 30 s abort grace plus a 60 s deadline), `project-cli-hints.sh`
+  26.7 s (21 fish invocations, each paying the loader's full map/graph/sort
+  validation), `srcinfo-freshness.sh` 22.5 s (job cap 8 on a 24-thread host) —
+  34 % of the run in three files; 20 fixtures were already sub-second. The
+  runner was a plain serial `for` loop.
+- **Fix**:
+  1. *Merges* — `kernel-config-verify`+`-sums`+`-version` → `kernel-recipes.sh`;
+     `log-ownership-root` → `log-ownership.sh`; `noctalia-pgo-train` →
+     `noctalia-pgo.sh`; `zen-pgo-workload`+`-speedometer` → `zen-pgo.sh`;
+     `vencord-recipe`+`-inject` → `vencord.sh`; `project-config`+`-cli-hints` →
+     `project.sh`. Each absorbed script is appended as a `( subshell )`
+     section, so its variables, `trap`, `set +e/-e` toggles and `fail()` prefix
+     stay isolated and a failure still names the sub-area. The five wrappers
+     folded into `pgo-transition.sh` (no arguments = all five
+     package/project/recipe pairs; three arguments = that pair alone).
+  2. *Parallel runner* — `run-all.sh` now fans out with `xargs -P` (default
+     `nproc`, `-j N`/`RUN_ALL_JOBS`, `--serial`), buffers each fixture's output
+     under `$TMPDIR`, and reports alphabetically regardless of completion order;
+     same discovery (recursive, `tests/assets/` excluded), same filter, same
+     `PASS (n fixture(s))` contract.
+  3. *Seam instead of waiting* — `build-all.fish` reads `_LANE_STOP_GRACE_S`
+     from the environment (underscore-prefixed **internal** seam, default still
+     30 s, non-numeric junk falls back to 30; the seven public `GSA_*` inputs in
+     `--help` are untouched). `dashboard.sh` case C exports 5 s and scales its
+     stub lanes to ~10 s: the assertion is still TERM → grace → single KILL.
+  4. *Inner parallelism* — `project.sh` collects its `run`/`run_split` calls
+     from its own text and pre-executes them concurrently, replaying from a
+     cache (assertions byte-for-byte unchanged); `srcinfo-freshness.sh` defaults
+     to one job per hardware thread.
+  5. *One owner per check* — the byte-exact `.SRCINFO` diff was removed from
+     `logseq-desktop-recipe`, `texlive-recipe`, `bpftune-tuners-hook` and the
+     zen section; `srcinfo-freshness.sh` covers every recipe in
+     `config/packages.map`.
+  6. *The tripwire* — `signal-abort-lock.sh`'s two **global**
+     `--lane-job` process scans are now scoped to `$fixture` (lane argv always
+     carries `$SCRIPT_DIR/build-all.fish`). The 2026-09-24 harness entry's
+     "never run two batteries at once" rule was an unscoped-`ps` bug waiting to
+     self-inflict the moment the runner went parallel.
+- **Validation**: full battery **PASS (33) in 29 s** parallel and **PASS (33)
+  in 108 s** with `--serial`; red-checks — a neutered assertion inside the
+  *absorbed* kernel-sums section and a neutered assertion in `project.sh`'s
+  replayed body each fail the battery, then pass again after byte-exact
+  restoration; `fish -n`, `--audit`, `--list`, and the three dry-runs green;
+  filter (`kernel`, `project.sh`), `-j` and `--serial` paths exercised.
+- **Durable rules**: (a) a fixture must be parallel-safe — non-mutating,
+  `$TMPDIR`-scoped, and process assertions scoped to its own fixture path, never
+  global; (b) merge a sibling subject into the existing file as a subshell
+  section, do not add a top-level script per check; (c) `.SRCINFO` freshness is
+  asserted only by `srcinfo-freshness.sh`; (d) timing tests use the
+  `_LANE_STOP_GRACE_S` seam, never a real grace window, and
+  `signal-abort-lock.sh` pins the 30 s default so the seam cannot drift.
 
 ## 2026-09-24 (texlive prepare) — a config-only SVN husk in SRCDEST sailed past makepkg's warning and killed prepare() at the awk step
 

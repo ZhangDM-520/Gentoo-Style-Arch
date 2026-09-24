@@ -94,14 +94,9 @@ grep -qx 'Exec = /usr/share/libalpm/scripts/bpftune-restart post' "$root/$post_h
     fail 'the post hook does not run the script post half'
 
 # --- .SRCINFO must match the recipe ------------------------------------------
-# Same check logseq-desktop-recipe.sh and texlive-recipe.sh make. It is the one
-# that catches a checksum edited in the PKGBUILD after .SRCINFO was generated,
-# which is a silent break: the sources and their sums disagree and nothing else
-# in the battery reads .SRCINFO at all.
-if ! GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" |
-    diff -q - "$root/$recipe/.SRCINFO" >/dev/null; then
-    fail '.SRCINFO is out of sync with the PKGBUILD'
-fi
+# .SRCINFO freshness (the check that catches a checksum edited in the PKGBUILD
+# after .SRCINFO was generated) is owned by tests/srcinfo-freshness.sh, which
+# covers every recipe from config/packages.map — not re-asserted here.
 
 # --- what the script decides, against a stubbed systemctl -------------------
 work=$(mktemp -d)
