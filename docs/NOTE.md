@@ -32,6 +32,107 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-24 (texlive prepare) — a config-only SVN husk in SRCDEST sailed past makepkg's warning and killed prepare() at the awk step
+
+- **Symptom**: `build-all.fish` dispatched `texlive-texmf` (rc=1, 23m20s in
+  `.state/logs/texlive-texmf.log`): the 6 minted overlay patches and
+  `texmf.cnf.patch` applied cleanly (all 7 `patching file …` lines), then
+  `awk: fatal: cannot open file 'tlpkg/texlive.tlpdb' for reading: No such
+  file or directory` → `==> ERROR: A failure occurred in prepare().` The awk
+  is prepare()'s last phase — the per-collection split that reads the tlpdb
+  for membership, runfiles, formats, maps, hyphen rules and bin-script links
+  (and whose output `texlive-basic` also *packages* into
+  `/usr/share/tlpkg`).
+- **Measurement** (plan gate, before any edit): upstream HAS the file at the
+  pinned revision — `svn info -r 78408
+  svn://tug.org/texlive/tags/texlive-2026.1/Master/tlpkg/texlive.tlpdb` →
+  `Node Kind: file`, `Revision: 78408`, and `svn ls …/Master/tlpkg/` lists
+  `texlive.tlpdb`. Locally `find` found no tlpdb anywhere in the recipe, and
+  `svn info <recipe>/tlpkg` → `E155007: … is not a working copy`: the SRCDEST
+  `tlpkg/` contained ONLY `.makepkg/` (svn's config dir — `auth`, `config`,
+  `servers`, `README.txt`), no `.svn`, no content. The log shows why makepkg
+  let it through: `-> Updating tlpkg svn repo...` / `Skipped '.'` /
+  `svn: E155007: None of the targets are working copies` /
+  `==> WARNING: Failure while updating tlpkg svn repo` — an *update* failure
+  on an existing directory is non-fatal — and the extract step then copied
+  the husk into `$srcdir/tlpkg` (identical 03:31 mtimes on both sides). The
+  sibling sources show the healthy path: `x86_64-linux/` was absent at run
+  start, so makepkg *cloned* it and it works. So: **absent locally, not moved
+  upstream** — an interrupted/failed initial checkout (dir created 03:31,
+  inside the run window whose TERM lands at 03:34:47 in dispatcher.log; the
+  old run's log was overwritten, so interrupt-vs-network for that first
+  failure is UNPROVEN) left a husk that every later run "updates" without
+  ever fetching.
+- **Patch-series question answered**: neither patch touches `tlpkg/`
+  (`grep -c tlpkg` → 0 in both; targets are `texmf-dist/minted/*` and
+  `./texmf.cnf` copied from `texmf-dist/web2c`), all 7 applied in the failing
+  run, and `_rev=78408`/`pkgver=2026.1` are unchanged since the recipe's
+  first commit — there was **no version bump**; nothing in prepare() besides
+  the missing input changed.
+- **Contract chosen**: the awk step stays byte-for-byte — the tlpdb
+  legitimately ships at the pinned revision and is itself a packaged output,
+  so skip/rewrite would gut the split. The fetch is repaired instead: the
+  husk was moved to `/tmp/gsa-tlpkg-husk-backup` (evidence) and removed so
+  makepkg performs a fresh pinned `svn checkout`, plus a preflight at the
+  top of `prepare()` fails in seconds with the exact repair
+  (`rm -rf tlpkg src/tlpkg && makepkg -f`) instead of 23 minutes in at a
+  bare awk fatal. Sums (`SKIP` for the three VCS entries), sources and
+  `.SRCINFO` are untouched (`makepkg --printsrcinfo` diff empty).
+- **Validation**: `fish -n`, `bash -n`, `--audit`, `--list`, dry-runs
+  git/core/stable, full battery **44/44**; the repaired checkout then took
+  `build-all.fish --no-deps texlive-texmf` through prepare() into packaging
+  (see validation note below).
+- **Durable rules**: a non-working-copy directory in SRCDEST is a landmine —
+  makepkg only WARNs on the update and builds from whatever garbage is
+  there; never "just re-run" a tlpdb-class failure without checking
+  `svn info <source-dir>` first. `svn ls`/`svn info` against the pinned
+  revision is the measurement for "the source disappeared"; the build log's
+  text alone is not.
+
+## 2026-09-24 (lane reap race) — `signal-abort-lock.sh`'s rc=125 flake: the dispatcher read the result, then checked the child, and the child died in between
+
+- **Symptom**: `tests/signal-abort-lock.sh` failed intermittently (one
+  44-fixture battery 43/44, green on rerun; also seen 1-in-8 and, when pinned
+  by a strictly SERIAL loop, at iter 20/30) with
+  `phase 3 … dispatcher did not report the honest 143` and the run summary
+  `✗ lane supervisor produced no valid result (pid=3542191, state=(gone))` /
+  `result file bytes: (no bytes)` — while the package log *simultaneously*
+  carried `lane child received TERM (rc=143, pid=3542191) — honest signal
+  result recorded`, i.e. the child did everything the 2026-09-23 fix
+  promised, with the SAME pid the supervisor named.
+- **Root cause** (ordering proof, no guesswork): the dispatcher's reap reads
+  the result ONCE (`cat "$rf"`) and only afterwards asks
+  `lane_pid_alive`. `write_lane_result` publishes atomically with `mv`,
+  and the child's sequence is `mv → honest log line → re-raise → death`.
+  `(no bytes)` therefore means the `cat` happened **before** the `mv`;
+  `state=(gone)` plus the honest line (which precedes the forensics block in
+  `p1.log`) means the `ps` happened **after** the death — the whole
+  publish-and-die fell into the gap between the read and the check. The
+  result was on disk; the dispatcher had already decided it saw nothing and
+  reaped rc=125. Window is milliseconds, hence ~1-in-20 serially. (Two
+  other reds seen while reproducing — "run … reported success" — were
+  self-inflicted: two overlapping loop instances, whose global
+  `find_lane_pid` greps crossed; that hazard is already named in the
+  2026-09-24 harness entry and is NOT this defect.)
+- **Fix** (one hunk in `build-all.fish`'s reap): after the liveness check
+  reports the child dead with no valid result, re-read the file ONCE.
+  Publication happens-before death, so if the child wrote, the result exists
+  at that moment; a genuinely missing write stays empty and keeps today's
+  forensics/`stop_lane_process` behaviour unchanged. No new GSA_* knob, no
+  fixture reshuffle, no restyling.
+- **Validation**: red-first — the unmodified fixture's phase-3 failure was
+  captured serially with full output before the edit; after the edit the
+  same fixture ran **50/50 green serially** and the full battery **44/44**;
+  `fish -n` clean. A deterministic red harness is impossible without a
+  builder test knob (the window is dispatcher-internal), so the pin is the
+  captured red plus the 50-run green tail, not a new fixture.
+- **Durable rules**: result-file reads and liveness checks are NOT one
+  atomic observation — any future code that branches on "empty result" must
+  re-read after observing death; `rc=125 with '(no bytes)' forensics` can
+  still be this lost race, not only a dead-before-write child; and the
+  serial-reproduction rule stands (two overlapping batteries produce
+  unrelated reds that look like new defects).
+
 ## 2026-09-24 (sync anchoring) — one missing published checksum refused the recipe, and the refusal strangled the dispatch; sync now runs updpkgsums, and an unanchorable recipe defers
 
 - **Symptom**: `build-all.fish -g stable,core,git,third-party -s -i`

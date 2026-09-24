@@ -963,7 +963,11 @@ recipe).
   silently) and lane mode writes an honest result (129/130/143) before
   re-raising. Fish trap: `exit` inside a handler always yields rc 0 — erase
   the handler and re-raise; the result *file* is the channel that matters
-  (fish exits 0 on INT even handler-less). rc=125 without forensics = bug.
+  (fish exits 0 on INT even handler-less). rc=125 without forensics = bug;
+  rc=125 WITH `(no bytes)` forensics can still be a lost race — result reads
+  and liveness checks are not one atomic observation, so the reap re-reads
+  the file once after the child is observed dead (publication happens-before
+  death; 2026-09-24 lane-reap flake).
 - **Sandbox paths have a length budget** (2026-09-23, noctalia): anything a
   compositor/socket writes under `XDG_RUNTIME_DIR` must fit the 108-byte Unix
   `sun_path`; sandboxing it under a deep `$srcdir/pgo-work` made sway die at

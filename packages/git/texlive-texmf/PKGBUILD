@@ -71,6 +71,21 @@ sha256sums=('SKIP'
 options=(!strip) # Nothing to strip, save packaging time
 
 prepare() {
+  # The split's database — and texlive-basic's packaged /usr/share/tlpkg —
+  # come from the tlpkg SVN source. makepkg only WARNS when updating an
+  # existing SRCDEST directory that is not a working copy (an interrupted
+  # checkout leaves a config-only husk) and then extracts that husk, so the
+  # failure used to surface 23 minutes later as a bare
+  # `awk: fatal: cannot open file 'tlpkg/texlive.tlpdb'` (2026-09-24).
+  # Fail first, from the recipe directory, with the repair.
+  if [[ ! -r tlpkg/texlive.tlpdb ]]; then
+    echo "==> ERROR: tlpkg/texlive.tlpdb is missing — the tlpkg SVN source did not fetch." >&2
+    echo "    tlpkg/ beside the PKGBUILD is not a complete SVN working copy." >&2
+    echo "    From the recipe directory, remove the husk and re-fetch:" >&2
+    echo "        rm -rf tlpkg src/tlpkg && makepkg -f" >&2
+    return 1
+  fi
+
 # Update minted for Python 3.14 compatibility
   patch -p1 < minted-3.8.patch
 

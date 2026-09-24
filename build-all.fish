@@ -3733,6 +3733,23 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     # finished child from looking partial here.
                     continue
                 end
+                if test $result_ready -eq 0; and test $result_malformed -eq 0; and \
+                    not lane_pid_alive "$lane_pid[$i]"
+                    # The read above and the death observed above are not one
+                    # atomic step: a child can publish (write_lane_result's
+                    # mv) and die BETWEEN them, which misreported an honest
+                    # result as rc=125 "(no bytes)" (fixture flake, 2026-09-24).
+                    # Publication happens-before death, so if the child wrote,
+                    # the result exists NOW — re-read once. A genuinely
+                    # missing write stays empty and falls through unchanged.
+                    set res_raw (cat "$rf" 2>/dev/null)
+                    if test (count $res_raw) -gt 0; and \
+                        lane_result_valid "$expected_pkg" "$res_raw[1]"
+                        set result_ready 1
+                    else if test (count $res_raw) -gt 0
+                        set result_malformed 1
+                    end
+                end
 
                 set -l p "$expected_pkg"
                 set -l rc 125
