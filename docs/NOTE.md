@@ -35,6 +35,56 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-25 (install skip) — `-s -i` re-ran `pacman -U` for packages already installed at the built version; `-i` now checks, `-fi` forces
+
+- **Symptom**: the documented resume idiom `build-all.fish -s -i` skipped
+  already-built archives but still ran `pacman -U --noconfirm --ask 4` for
+  every one of them on every run — even when the exact built version was
+  already installed. A long resume paid a full transaction set for nothing.
+- **Decisions** (confirmed before implementing): the check applies to EVERY
+  `-i` install (fresh-build path and `-s` skip path share one installer);
+  `-fi/--forceinstall` implies `-i` and bypasses the check; a freshness
+  guard is required; `-ia/--installall` stays untouched (collective escape
+  hatch by definition installs everything built).
+- **Fix**: new `install_skip_reason` in `build-all.fish` answers two
+  read-only queries per archive — `pacman -Qp` (built name+version straight
+  from the archive, so epochs and split outputs arrive in pacman's own
+  canonical form, with no filename/PKGBUILD parsing) and
+  `LANG=C pacman -Qi` (installed `Version` + `Install Date` → `date -d`
+  epoch) — and `install_pkgs_now` drops an archive only when (a) the
+  versions are identical AND (b) the install date is NOT older than the
+  archive. The freshness guard is what makes a same-version rebuild
+  install: version equality alone would skip a patched rebuild whose new
+  payload never reached the system. Any doubt — no query answer, a missing
+  field, an unparseable date — falls through to `pacman -U`, so the
+  conservative direction is always the transaction, never silence. `-fi`
+  rides install_flag's plumbing (`main` → `run_lanes` → `--lane-job`'s
+  fifth flag → `lane_job` → `build_package` → `_INSTALL_FORCE`, the same
+  global hand-off `_BUILD_QUIET` uses) and skips the check entirely; the
+  failure-resume and sudo-rerun suggestions now mirror `--forceinstall`.
+- **Pitfalls hit**:
+  - the `--lane-job` argv contract grew from 8 to 9 tokens — every direct
+    caller must pass the fifth flag or the child exits 2
+    (`tests/signal-abort-lock.sh` invoked it directly);
+  - an inline `echo "…"(test …; and echo " (forced)")"` broke fish parsing:
+    a `"` inside the command substitution terminated the outer quote early
+    and `(forced)` was executed as a substitution ("Unknown command:
+    forced") — compute display labels in `set -l` blocks instead;
+  - the lane's `already built` ui_info is gated to interactive mode, so a
+    `-s` fixture cannot observe the skip at the terminal — it counts stub
+    makepkg invocations instead (`GSA_FIXTURE_MAKEPKG_COUNT`).
+- **Validation**: `fish -n build-all.fish`; `bash -n tests/*.sh`;
+  `--audit`/`--list` clean; help renders `-fi`; real-host parse check
+  (`LANG=C pacman -Qi bash` → `date -d` → epoch); full battery
+  `bash tests/run-all.sh` — PASS (33 fixtures), including the six new
+  `install-archive-guard.sh` cases C–H (skip, version mismatch, stale
+  install date, force bypass + implies-`-i`, `-s -i` double skip,
+  `-s -fi`) and `resume-command.sh`'s `--forceinstall` mirror.
+- **Rule**: `-i` installs only on positive evidence — exact version match
+  AND install date ≥ archive mtime; every doubt installs. `-fi` forces and
+  implies `-i`; `-ia` is unaffected. Pinned by
+  `tests/install-archive-guard.sh`.
+
 ## 2026-09-24 (battery restructure) — 45 scruffy fixtures and a 4-minute serial battery → 33 files, one file per subject, 29 s in parallel
 
 - **Symptom**: `tests/` had grown one incident at a time — 45 flat scripts

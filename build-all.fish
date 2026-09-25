@@ -53,6 +53,10 @@ end
 # 1 = background lane job — suppress human-facing echoes (the parent renderer
 # owns live output). Set per-build_package call, read by install_pkgs_now.
 set -g _BUILD_QUIET 0
+# 1 = -fi/--forceinstall: install_pkgs_now skips the same-version sanity
+# check and always runs pacman -U. Set per-build_package call (same hand-off
+# as _BUILD_QUIET); the default keeps any other entry point on the checked path.
+set -g _INSTALL_FORCE 0
 
 # Output is rendered by the parent dispatcher only. Fish's set_color emits
 # ANSI sequences even when stdout is a pipe, so wrap the builtin and make
@@ -2217,6 +2221,67 @@ function link_sources
     end
 end
 
+# Same-version sanity check for ONE archive: print (status 0) the installed
+# version when installing it would be a no-op — its exact version is already
+# installed AND that install is not older than the archive. Status 1 means
+# "install": no installed entry, a version mismatch, a stale install date
+# (a same-version rebuild whose payload never reached the system), or ANY
+# doubt — a failed query, a missing field, an unparseable date. Doubt must
+# install, never skip (2026-09-25). The queries are read-only: -Qp/-Qi take
+# no db lock and need no sudo, so lanes may run them while another lane holds
+# the -U mutex, and every failure path is caught by the value checks below
+# even if the exit status were lost.
+function install_skip_reason -a archive
+    # Built name+version straight from pacman's own read of the archive — no
+    # filename or PKGBUILD parsing, so epochs and split outputs arrive in the
+    # same canonical form pacman will compare.
+    set -l probe (pacman -Qp -- "$archive" 2>/dev/null)
+    if test $status -ne 0; or test (count $probe) -ne 1
+        return 1
+    end
+    set -l fields (string split -m1 ' ' -- $probe)
+    if test (count $fields) -ne 2; or test -z "$fields[1]"; or test -z "$fields[2]"
+        return 1
+    end
+    set -l built_version "$fields[2]"
+    # Installed version + install date in one query. LANG=C pins the field
+    # layout so the Install Date below is the C-locale text `date -d` parses.
+    set -l info (LANG=C pacman -Qi -- "$fields[1]" 2>/dev/null)
+    if test $status -ne 0; or test (count $info) -eq 0
+        return 1
+    end
+    set -l installed_version ""
+    set -l install_date ""
+    for line in $info
+        if string match -qr -- '^[[:space:]]*Version[[:space:]]*:' "$line"
+            set installed_version (string replace -r -- '^[[:space:]]*Version[[:space:]]*:[[:space:]]*' '' "$line")
+        else if string match -qr -- '^[[:space:]]*Install Date[[:space:]]*:' "$line"
+            set install_date (string replace -r -- '^[[:space:]]*Install Date[[:space:]]*:[[:space:]]*' '' "$line")
+        end
+    end
+    if test -z "$installed_version"; or test "$installed_version" != "$built_version"
+        return 1
+    end
+    if test -z "$install_date"
+        return 1
+    end
+    set -l installed_epoch (date -d "$install_date" +%s 2>/dev/null)
+    if test $status -ne 0; or test -z "$installed_epoch"
+        return 1
+    end
+    set -l archive_mtime (stat -c %Y -- "$archive" 2>/dev/null)
+    if test $status -ne 0; or test -z "$archive_mtime"
+        return 1
+    end
+    # Freshness guard: a same-version rebuild whose archive is NEWER than the
+    # install must still be installed — version equality alone would skip it.
+    if test "$installed_epoch" -lt "$archive_mtime"
+        return 1
+    end
+    printf '%s\n' "$installed_version"
+    return 0
+end
+
 # ─── Unattended install of built package files ───────────────────────────────
 # One pacman transaction per call. --ask 4 auto-accepts removal of conflicting
 # (e.g. stock) packages — the stock→-git swap prompt — so a run never blocks on
@@ -2253,6 +2318,39 @@ function install_pkgs_now -a log_file
     # on every run, and under -i every later package would build against it.
     if not verify_pgo_payload $pkgs
         return 1
+    end
+    # Same-version sanity check (2026-09-25) — skipped entirely under
+    # -fi/_INSTALL_FORCE: drop every archive whose exact version is already
+    # installed with an install date not older than the archive; if nothing
+    # is left, there is no transaction to run. Doubt installs: a failed query
+    # keeps the archive in the set, so the conservative direction is always
+    # pacman -U, never silence. tests/install-archive-guard.sh pins both
+    # directions plus the force bypass.
+    if test "$_INSTALL_FORCE" != "1"
+        set -l to_install
+        set -l kept_count 0
+        set -l kept_version ""
+        for pkg in $pkgs
+            set -l iver (install_skip_reason "$pkg")
+            if test $status -eq 0
+                set kept_count (math $kept_count + 1)
+                set kept_version "$iver"
+            else
+                set -a to_install $pkg
+            end
+        end
+        if test $kept_count -gt 0
+            if test "$_BUILD_QUIET" = "1"
+                printf '%s %s of %s package(s) already installed at %s — skipping their install\n' \
+                    "$_UI_ICON_INFO" "$kept_count" (count $pkgs) "$kept_version" >>"$log_file"
+            else
+                ui_info "$kept_count of "(count $pkgs)" package(s) already installed at $kept_version — skipping their install"
+            end
+        end
+        if test (count $to_install) -eq 0
+            return 0
+        end
+        set pkgs $to_install
     end
     set -l irc 1
     # Install: root mode runs pacman directly (no timestamp to expire);
@@ -2455,12 +2553,12 @@ end
 
 # Nearest known long option to a mistyped flag, or nothing. Only long options
 # are hinted — a one-letter flag is a different flag rather than a typo, and the
-# usage dump that follows lists them all. No first-character prefilter: with 18
+# usage dump that follows lists them all. No first-character prefilter: with 19
 # options, distance <= 2 yields a single candidate for every typo measured and a
 # prefilter only cost true positives (`--xanels` -> `--lanes`).
 function _suggest_option -a given
     string match -qr '^--' -- "$given"; or return 0
-    set -l options --install --clean --skip --no-sync --lanes --jobs --intensity \
+    set -l options --install --forceinstall --clean --skip --no-sync --lanes --jobs --intensity \
         --allow-broken-rustc --no-deps --dry-run --list --group --help \
         --installall --cleanup --nuclear --link-sources --audit
     set -l hit (printf '%s\n' $options | _nearest_lines "$given" 2 \
@@ -2529,10 +2627,13 @@ function canonicalize_pkg_ref -a pkg
 end
 
 # ─── Build a single package ──────────────────────────────────────────────────
-function build_package -a package_id install_flag clean_flag skip_flag no_sync_flag quiet_flag
+function build_package -a package_id install_flag clean_flag skip_flag no_sync_flag quiet_flag force_install_flag
     # quiet_flag=1: background lane mode — no human echoes; everything goes to
     # the per-package log; the parent dispatcher renders lane state.
     set -g _BUILD_QUIET (test "$quiet_flag" = "1"; and echo 1; or echo 0)
+    # -fi/--forceinstall hand-off to install_pkgs_now (same pattern as
+    # _BUILD_QUIET): the installer reads the global, not this argv.
+    set -g _INSTALL_FORCE (test "$force_install_flag" = "1"; and echo 1; or echo 0)
     # Absolute path consolidation: never depend on the ambient cwd
     set -l pkg_path (package_path "$package_id" | string collect)
     set -l pkg_name "$package_id"
@@ -3604,7 +3705,7 @@ function pick_next_ready -a solo_ok
     return 1
 end
 
-function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip_flag no_sync_flag
+function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip_flag no_sync_flag force_install_flag
     # Runs in a separate fish process with its stdout/stderr redirected by the
     # parent: no tty for sudo, no shared mutable state — communicates by result file.
     # Route this lane's makepkg -s dep installs through the builder mutex
@@ -3644,7 +3745,7 @@ function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip
     # See MAKEFLAGS above: `string join` cannot take a "-jN" argument.
     set -gx NINJAFLAGS "$ninja_flags"
     set -l start_s (date +%s)
-    build_package $pkg_dir $install_flag $clean_flag $skip_flag $no_sync_flag 1
+    build_package $pkg_dir $install_flag $clean_flag $skip_flag $no_sync_flag 1 $force_install_flag
     set -l rc $status
     set -l dur (math (date +%s) - $start_s)
     if not write_lane_result "$result_file" "$pkg_dir" "$rc" "$dur"
@@ -3687,9 +3788,9 @@ function available_cpu_threads
     nproc
 end
 
-function run_lanes -a lanes jobs_override intensity_level install_flag clean_flag skip_flag no_sync_flag
+function run_lanes -a lanes jobs_override intensity_level install_flag clean_flag skip_flag no_sync_flag force_install_flag
     # Remaining argv = the topo-sorted package list
-    set -l sorted $argv[8..-1]
+    set -l sorted $argv[9..-1]
     if not command -v setsid >/dev/null 2>&1
         ui_error "setsid is required for isolated lane processes"
         return 1
@@ -4098,7 +4199,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 # makepkg call, so hooks/signals can never corrupt the dashboard.
                 setsid --wait fish "$SCRIPT_DIR/build-all.fish" --lane-job \
                     "$next" "$rf" $jobs $install_flag $clean_flag \
-                    $skip_flag $no_sync_flag >>"$child_log" 2>&1 &
+                    $skip_flag $no_sync_flag $force_install_flag >>"$child_log" 2>&1 &
                 set lane_pid[$i] $last_pid
                 set -a _ACTIVE_LANE_PIDS $last_pid
                 set -a _ACTIVE_LANE_PKGS $next
@@ -4295,6 +4396,14 @@ function usage
     echo "                    hour first)."
     echo "                    This is the same behaviour the old -si/--sepinstall"
     echo "                    alias selected; that alias was removed 2026-09-17."
+    echo "                    Before pacman runs, -i compares each archive with the"
+    echo "                    installed database and skips a package whose exact"
+    echo "                    version is already installed with an install date not"
+    echo "                    older than the archive (a same-version rebuild still"
+    echo "                    installs). Use -fi to bypass that check."
+    echo "  -fi, --forceinstall"
+    echo "                    Same as -i, but ALWAYS runs pacman -U — no same-version"
+    echo "                    sanity check. Implies -i, so it works with or without it."
     echo "  --no-deps         Build ONLY the named packages — skip dependency-chain"
     echo "                    expansion (leaf rebuild with known-current deps)"
     echo "  -c, --clean       Clean build artifacts before building"
@@ -4553,6 +4662,7 @@ end
 # ─── Main ────────────────────────────────────────────────────────────────────
 function main
     set -l install_flag 0
+    set -l force_install_flag 0
     set -l clean_flag 0
     set -l skip_flag 0
     set -l no_sync_flag 0
@@ -4580,6 +4690,13 @@ function main
                 # -si/--sepinstall alias for this behaviour was dropped
                 # 2026-09-17: -i IS the separated install.
                 set install_flag 1
+            case -fi --forceinstall
+                # -i WITHOUT the same-version sanity check: every selected
+                # archive goes to pacman -U even when its exact version is
+                # already installed (2026-09-25). Implies -i — "-fi" is
+                # install + force, so it works with or without -i.
+                set install_flag 1
+                set force_install_flag 1
             case -c --clean
                 set clean_flag 1
             case -s --skip
@@ -4914,7 +5031,14 @@ function main
     # Build
     ui_heading "Workspace Package Builder"
     echo "Packages: "(count $sorted)
-    echo "Install:  "(test "$install_flag" = "1"; and echo "yes"; or echo "no")
+    set -l install_summary no
+    if test "$install_flag" = "1"
+        set install_summary yes
+        if test "$force_install_flag" = "1"
+            set install_summary "yes (forced)"
+        end
+    end
+    echo "Install:  $install_summary"
     echo "Clean:    "(test "$clean_flag" = "1"; and echo "yes"; or echo "no")
     echo "Lanes:    $lane_count"
     echo "Jobs:     $jobs_override (normal lanes; auto uses CPU/RAM)"
@@ -4930,7 +5054,13 @@ function main
     if test "$_ROOT_MODE" != "1"; and test "$install_flag" = "1"
         # -- separator: args start with flags (-g …), which string join would
         # otherwise parse as its own options
-        set -l rerun_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level" --install
+        set -l rerun_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level"
+        # Mirror the install flavour: a rerun of a -fi run must stay forced.
+        if test "$force_install_flag" = "1"
+            set -a rerun_args --forceinstall
+        else
+            set -a rerun_args --install
+        end
         set -a rerun_args $argv
         set -l rerun_prefix (set_color yellow)
         set -l rerun_suffix (set_color normal)
@@ -4962,7 +5092,7 @@ function main
     # sequential semantics). Installs happen inside lanes in readiness
     # order; a dependent never starts before all its deps are installed.
     run_lanes $lane_count $jobs_override $intensity_level $install_flag $clean_flag \
-        $skip_flag $no_sync_flag $sorted
+        $skip_flag $no_sync_flag $force_install_flag $sorted
     set -l run_rc $status
     set -l succeeded $_RL_SUCCEEDED
     set -l failed $_RL_FAILED
@@ -5034,7 +5164,11 @@ function main
         # user to add "-s -i", so the command printed above it contradicted the
         # advice right next to it.
         set -l resume_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level"
-        if test "$install_flag" = "1"
+        # -fi implies -i, so one flag preserves both halves of the semantics;
+        # a plain -i resume keeps its same-version check.
+        if test "$force_install_flag" = "1"
+            set -a resume_args --forceinstall
+        else if test "$install_flag" = "1"
             set -a resume_args --install
         end
         if test "$no_deps_flag" -eq 1
@@ -5186,21 +5320,21 @@ if test (count $argv) -gt 0; and test "$argv[1]" = --lane-job
         set -g _LANE_JOB_RESULT "$argv[3]"
         set -g _LANE_JOB_START (date +%s)
     end
-    if test (count $argv) -ne 8
-        echo "Error: --lane-job expects package, result file, job count, and four flags" >&2
+    if test (count $argv) -ne 9
+        echo "Error: --lane-job expects package, result file, job count, and five flags" >&2
         exit 2
     end
     if not string match -qr '^[1-9][0-9]*$' -- "$argv[4]"
         echo "Error: --lane-job received an invalid job count: $argv[4]" >&2
         exit 2
     end
-    for flag in $argv[5..8]
+    for flag in $argv[5..9]
         if not string match -qr '^[01]$' -- "$flag"
             echo "Error: --lane-job received an invalid flag: $flag" >&2
             exit 2
         end
     end
-    lane_job "$argv[2]" "$argv[3]" "$argv[4]" "$argv[5]" "$argv[6]" "$argv[7]" "$argv[8]"
+    lane_job "$argv[2]" "$argv[3]" "$argv[4]" "$argv[5]" "$argv[6]" "$argv[7]" "$argv[8]" "$argv[9]"
     exit $status
 end
 

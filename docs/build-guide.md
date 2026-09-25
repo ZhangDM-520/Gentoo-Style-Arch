@@ -251,7 +251,11 @@ delete and then aborts — answering `y` deletes it.
 Read the per-package log named in a failure message. A stale system pacman
 lock is not removed automatically. Resume with the remaining package IDs
 printed by the failure summary, usually adding `--skip --install` after
-checking whether the archive was already produced.
+checking whether the archive was already produced. Under `--install`, a
+package whose exact version is already installed with an install date not
+older than its archive skips its transaction automatically; add
+`--forceinstall` (implies `--install`) when the install must run anyway —
+for example after repackaging a same-version payload.
 
 Per-package logs live in `.state/logs/` — Git-ignored, and removed with the
 state directory. If a run may need post-mortem forensics (a long build, a

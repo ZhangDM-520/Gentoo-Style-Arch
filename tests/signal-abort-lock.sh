@@ -267,7 +267,7 @@ state="$fixture/state-lane"
 mk_env "$state" 1.5
 res="$state/logs/.lane-direct.result"
 run_bg "$state/lane.out" fish "$fixture/build-all.fish" \
-    --lane-job p1 "$res" 1 0 0 0 1
+    --lane-job p1 "$res" 1 0 0 0 1 0
 lane=$disp
 wait_for_file "$state/built/p1" 10 ||
     fail "stub makepkg never started (lane did not reach the build)" \

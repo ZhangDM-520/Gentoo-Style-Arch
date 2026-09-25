@@ -79,8 +79,11 @@ fish build-all.fish --no-deps niri-spicy-git
 ```
 
 Use `--install` only when the immediately installed package state is desired.
-Unprivileged runs use `sudo` for each transaction; long runs are generally more
-reliable when the supervisor is started as:
+A package whose exact version is already installed (with an install date not
+older than its archive) skips its transaction; `--forceinstall` implies
+`--install` and always installs. Unprivileged runs use `sudo` for each
+transaction; long runs are generally more reliable when the supervisor is
+started as:
 
 ```sh
 sudo fish build-all.fish --group core

@@ -101,6 +101,13 @@
     immediate-install flag. `-ia/--installall` is the one-transaction escape
     hatch and deliberately bypasses this rule; never use it for a set whose
     members depend on each other.
+    Since 2026-09-25 `-i` first checks each archive against the installed
+    database: exact version match AND an install date not older than the
+    archive → the transaction is skipped (a same-version rebuild still
+    installs); any doubt — failed query, unparseable date — installs.
+    `-fi/--forceinstall` implies `-i` and bypasses the check (always runs
+    `pacman -U`); `-ia` remains unaffected. Pinned by
+    `tests/install-archive-guard.sh` cases C–H.
     Those installs are background jobs with no tty, so the dispatcher owns
     sudo liveness (see build-guide.md "sudo during --install"): it must never
     infer "installs are impossible" from `sudo -v` alone — a `NOPASSWD`

@@ -122,6 +122,29 @@ if [[ "$RESUME_CMD" != *"p3"* ]]; then
     exit 1
 fi
 
+# ─── A -fi run must resume with --forceinstall, keeping the force semantics ──
+# -fi implies -i, so the resume must carry --forceinstall INSTEAD of --install
+# (one flag preserving both halves) plus every other semantics-changing flag.
+dir="$fixture/with-forceinstall"
+make_workspace "$dir"
+run_expecting_failure "$dir" 'with -fi' --forceinstall --no-deps --allow-broken-rustc --no-sync
+for flag in --forceinstall --no-deps --allow-broken-rustc --no-sync; do
+    if [[ "$RESUME_CMD" != *"$flag"* ]]; then
+        printf 'with -fi: resume command dropped %s:\n  %s\n' "$flag" "$RESUME_CMD" >&2
+        exit 1
+    fi
+done
+if [[ "$RESUME_CMD" == *"--install"* ]]; then
+    printf 'with -fi: resume carries both --install and --forceinstall:\n  %s\n' \
+        "$RESUME_CMD" >&2
+    exit 1
+fi
+if [[ "$RESUME_CMD" != *"p3"* ]]; then
+    printf 'with -fi: resume command does not name the unbuilt package:\n  %s\n' \
+        "$RESUME_CMD" >&2
+    exit 1
+fi
+
 # ─── A run without -i must NOT acquire --install on resume ──────────────────
 dir="$fixture/without-install"
 make_workspace "$dir"

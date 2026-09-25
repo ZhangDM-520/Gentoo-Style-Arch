@@ -193,6 +193,11 @@ before choosing one.
 `-i` installs each package before its dependents compile (core selection turns
 it on automatically), through `pacman -U --noconfirm --ask 4`, and an install
 failure aborts the whole run rather than continuing to build dependents.
+Before the transaction, `-i` compares each archive with the installed
+database: a package whose exact version is already installed with an install
+date not older than the archive skips its install (a same-version rebuild
+still installs, and any doubt installs); `-fi`/`--forceinstall` implies `-i`
+and bypasses that check, always running `pacman -U`.
 `-ia`/`--installall` is the single-transaction escape hatch — it installs after
 everything is built, so it must never stand in for `-i` on a set whose members
 depend on each other; it forwards trailing arguments to pacman
