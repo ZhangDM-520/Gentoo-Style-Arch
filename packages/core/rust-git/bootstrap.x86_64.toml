@@ -28,7 +28,8 @@ tools = [
   "rustfmt",
   "rust-analyzer-proc-macro-srv",
   "analysis",
-  "src",
+  # upstream abcb9780d6d4 renamed the tools entry `src` -> `rust-src`
+  "rust-src",
 ]
 sanitizers = false  # trimmed 2026-09-04: no -Zsanitizer consumers in workspace
 profiler = true  # KEEP — Rust PGO workflow depends on libprofiler-builtins

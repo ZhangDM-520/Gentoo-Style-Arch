@@ -35,6 +35,115 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-25 (stale DESTDIR) — rebuild #2 died 21 minutes in: the failed run #1 poisoned the next install
+
+- **Symptom**: rebuild #2 (rust-src step fixed) compiled cleanly, then
+  `install.sh` aborted at the rustc component with `cp: not writing
+  through dangling symlink …/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy`,
+  and the installer log showed it creating `librustc_driver-….so.old` /
+  `rust-analyzer-proc-macro-srv.old` backups in dest-rust.
+- **Root cause**: makepkg keeps `$srcdir` across runs, and run #1's
+  failed `build()` had already mutated `dest-rust` — deleted the
+  `manifest-*` files, created the relative tool symlinks
+  (`rust-objcopy` → `../../../../bin/llvm-objcopy`, which dangles inside
+  DESTDIR until the package sits at `/usr`), moved the licenses. Run #2's
+  installer no longer recognised those files (manifests gone → `.old`
+  backups) and `cp` refuses to write through a dangling symlink.
+- **Fix**: `build()` now starts with
+  `rm -rf "$srcdir/dest-rust" "$srcdir/dest-src"` — a deterministic
+  fresh DESTDIR on every attempt. `tests/rust-recipe.sh` pins the line.
+- **Validation**: `bash -n`, fixtures green in both trees, `.SRCINFO`
+  regenerated, rebuild #3 launched.
+- **Durable rule**: DESTDIR is build output, not leftover scratch a
+  failed run may half-mutate — wipe it at the top of `build()`, the way
+  makepkg itself wipes `$pkgdir` before `package()`.
+
+## 2026-09-25 (rust-src rename) — upstream renamed x.py's `src` install step; the rebuild died after 35 minutes at `_pick dest-src`
+
+- **Symptom**: the `!lto`-fixed rebuild (Workspace r341498) compiled
+  cleanly — "Build completed successfully in 0:35:26", stage2 clippy
+  installed — then `build()` aborted with `mv: cannot stat
+  'usr/lib/rustlib/src'`. No package, no install. The launcher shell
+  reported rc=0 because its output was piped through `tail`; only the
+  build log's `==> ERROR: A failure occurred in build()` told the truth.
+- **Root cause**: upstream rust-lang/rust@abcb9780d6d4 "Rename the src
+  install build step to rust-src" (2026-09-07 — between the last
+  successful r339451 build and r341498) changed the step's selector from
+  `run.path("src")` to `run.alias("rust-src")` and its tools gate to
+  `tools.contains("rust-src")`. The default-run condition is
+  `config.extended && …` and this recipe's bootstrap.toml never sets
+  `[build] extended`, so bare `x.py install` silently installs
+  rustc/cargo/rustfmt/clippy/rust-std but no `rust-src` component; the
+  following `_pick dest-src usr/lib/rustlib/src` then fails and kills the
+  whole build — at the very end of a 35-minute compile.
+- **Fix**: `build()` now runs a second, explicit
+  `DESTDIR=… python ./x.py install rust-src` (explicit selectors bypass
+  the default gate); the template's tools entry `src` → `rust-src`; and
+  the template's b2sum was refreshed in `b2sums` — makepkg refuses a stale
+  checksum in seconds, before any compiling. `tests/rust-recipe.sh` pins
+  all three: the explicit step, the renamed tools entry, and the
+  checksum↔template match. Mirrored to the canonical repo and the
+  `~/Workspace` copy.
+- **Validation**: probe install of `rust-src` into a scratch DESTDIR
+  produced `usr/lib/rustlib/src` in 36 s (rc=0); `bash -n`,
+  `makepkg --printsrcinfo`, and the fixture are green in both trees;
+  the full rebuild with the fix is running — see the verification note
+  appended below once it lands.
+- **Durable rule**: a recipe that runs `x.py install` and then packages a
+  component split must invoke that component's install step explicitly —
+  upstream renames and default-gate conditions make the implicit set
+  unstable. Editing any `source=` file means refreshing its checksum in
+  the same change. And never judge a build by a piped shell's rc: read the
+  build log / the artifacts.
+
+## 2026-09-25 (rust-git `!lto`) — makepkg's `-flto=auto` and lld disagree: stage1 died with 140 undefined `LLVMRust*`
+
+- **Symptom**: the rust-git rebuild after llvm-git r598801 (r341461,
+  `~/Workspace` copy) failed at stage1 — `ld.lld: error: undefined reference:
+  LLVMRustBuildMemCpy` and ~25 more, when linking `rustc_main` against
+  `stage1-rustc/…/librustc_driver-fe0c….so` under `--no-allow-shlib-undefined`.
+  The new driver .so had **140 U `LLVMRust*`**, only `LLVMRustStringWriteImpl`
+  defined, and **no `NEEDED libstdc++`**; the Sep-8 installed .so had U=0 and
+  libstdc++ present. The rlib and `libllvm-wrapper.a` did define all 166
+  wrapper symbols — the objects existed, the link never took them.
+- **Root cause** (every step measured): rust-git carried
+  `options=( !emptydirs lto )` and the host's `/etc/makepkg.conf` has
+  `OPTIONS=(… lto …)` + `LTOFLAGS="-flto=auto"`, so makepkg's
+  `buildenv/lto.sh` appended **`-flto=auto`** to CXXFLAGS (proof:
+  rustc_llvm's build-script stdout `CXXFLAGS = … -flto=auto -pipe`; the
+  PKGBUILD only appends `-pipe`). `rustc_llvm/build.rs` compiles the five
+  C++ llvm-wrapper files with those flags → every wrapper `.o` was a
+  **GCC-LTO GIMPLE object** (all `.gnu.lto_*` sections; `.gnu.lto_.opts`
+  holds the literal flag; GCC 17.0.0 snapshot20260920). stage0 rustc
+  (`1.99.0-beta.3` nightly-2026-08-30 — proven from
+  `stage1-rustc/.rustc_info.json` — spec `linker-flavor: gnu-lld-cc`)
+  links stage1 via `cc -fuse-ld=lld` → host `/usr/bin/ld.lld`, and **lld
+  never runs GCC's LTO plugin**: a minimal repro (plain `.o` +
+  `libllvm-wrapper.a`) left the symbol undefined with rc=0 under both LLD
+  23.1 (stage0's rust-lld) and LLD 24 (llvm-git r598801), even with gcc's
+  full `-plugin liblto_plugin.so -plugin-opt=lto-wrapper…` chain, while
+  the same objects link `T` with **mold** and with **bfd**. So the wrapper
+  members never entered the driver .so and the `--no-allow-shlib-undefined`
+  link died. This is NOT LLVM ABI skew: llvm-git only happens to supply the
+  `ld.lld` binary (the old rustc's death at r598801 is the separate,
+  expected Rule-13 rebuild case).
+- **Fix**: `lto` → explicit `!lto` in rust-git's `options` — deleting the
+  line is not enough, global OPTIONS enables `lto` for every package.
+  Applied to the canonical recipe and the user's Workspace copy (pkgver
+  r341461 kept); `.SRCINFO` regenerated in both; new `tests/rust-recipe.sh`
+  pins `!lto` in the PKGBUILD **and** the committed `.SRCINFO`.
+- **Validation**: `bash -n`, `makepkg --printsrcinfo`,
+  `fish build-all.fish --audit`/`--list` rc=0, dry-run rc=0, full battery
+  **PASS (34)** including the new fixture. Exposure audit: every other
+  recipe that links through lld (`autofdo-git`, `linux-cachyos`) already
+  carries `!lto`; all remaining makepkg-LTO consumers link with mold or
+  bfd, which do run the GCC plugin (verified empirically).
+- **Durable rule**: rust-git must keep `!lto` — Rust-side fat LTO
+  (`lto = "fat"` in bootstrap.toml) is a different knob and stays. Any
+  recipe whose C/C++ is compiled from makepkg flags and linked by
+  rustc/ld.lld must disable `lto`: mold and bfd run GCC's LTO plugin,
+  lld does not.
+
 ## 2026-09-25 (install skip) — `-s -i` re-ran `pacman -U` for packages already installed at the built version; `-i` now checks, `-fi` forces
 
 - **Symptom**: the documented resume idiom `build-all.fish -s -i` skipped

@@ -405,7 +405,15 @@ install history lives in `NOTE.md`.
   `find <profile-dir> -name '*.gcda'` count > threshold.
 - **Autotools PGO**: CFLAGS bake at ./configure time — every phase must
   re-run ./configure; `make clean` is NOT enough.
-- **Special cases**: rust-git (bootstrap.toml flags, 5 patches); Zen browser
+- **Special cases**: rust-git (bootstrap.toml flags, 5 patches, and
+  `options` must keep `!lto`: makepkg's `-flto=auto` makes the C++
+  llvm-wrapper GCC-LTO, which lld — rustc's `gnu-lld-cc` default linker —
+  cannot link; see §6. Also: `build()` must invoke
+  `x.py install rust-src` explicitly — upstream abcb9780d6d4 renamed the
+  step `src`→`rust-src` and its default run needs `[build] extended`,
+  which we never set; also `build()` must wipe dest-rust/dest-src first —
+  a failed run's half-mutated DESTDIR makes the next install.sh die on a
+  dangling-symlink `cp`; see §6); Zen browser
   (fortify 3→2, HOST_CFLAGS unset — cc-rs re-export hazard, 3-tier mozconfig
   PGO); gcc-snapshot (-O2 stage2–4, format-security stripped); qt5-base-git
   (cflags + nostrip patches — qmake consumes system CFLAGS); libadwaita/
@@ -630,6 +638,45 @@ targets); the stale `gcc-*-snapshot` language splits (only fortran, libs and
 recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
+
+- **DESTDIR survives a failed build(); the next install won't forgive it**
+  (2026-09-25, rust-src chain): makepkg wipes `$pkgdir` before
+  `package()` but keeps `$srcdir`, so a `build()` that fails *after*
+  mutating dest-rust (manifests deleted, relative tool symlinks created,
+  licenses moved) leaves the next run's `install.sh` to die on `cp: not
+  writing through dangling symlink` and to leak `.old` backups into the
+  package. Wipe `dest-rust`/`dest-src` at the top of `build()`; the
+  recipe fixture pins the line.
+
+- **Upstream renames make implicit install sets unstable** (2026-09-25,
+  rust-src rename): rust-lang/rust@abcb9780d6d4 renamed x.py's `src`
+  install step to `rust-src`, and its default run also gates on
+  `[build] extended` — which rust-git's bootstrap.toml never set. Bare
+  `x.py install` then silently skipped `rust-src`, and `_pick dest-src`
+  aborted the build *after* a 35-minute compile. A recipe that packages a
+  component split must invoke that component's install step explicitly;
+  a `tools` entry rename means refreshing the `source=` checksum in the
+  same edit (makepkg refuses a stale b2sum before compiling — cheap when
+  you touch the file, ruinous when you forget). Judge builds by the log
+  and the artifacts, never by a piped shell's rc: `cmd | tail` reported
+  rc=0 over a failed makepkg. `tests/rust-recipe.sh` pins the step, the
+  tools entry, and the checksum.
+
+- **lld does not run GCC's LTO plugin; mold and bfd do** (2026-09-25,
+  rust-git `!lto`): makepkg's `lto` option appends `LTOFLAGS=-flto=auto`
+  to CFLAGS/CXXFLAGS/LDFLAGS, and anything that compiles C/C++ from those
+  flags under `lto` produces GCC-LTO GIMPLE objects — invisible to `file`
+  (still "ELF relocatable"), readable by `nm`, but with the real code only
+  in `.gnu.lto_*` sections. rustc's default linker is `gnu-lld-cc`
+  (`cc -fuse-ld=lld`), and lld accepts `-plugin` silently yet never
+  materialises the symbols: rust stage1 shipped a `librustc_driver.so`
+  with 140 undefined `LLVMRust*` and died on `--no-allow-shlib-undefined`
+  (repro: plain `.o` + wrapper archive, rc=0, still `U` — on LLD 23.1 and
+  24, with and without gcc's full plugin chain; mold and bfd both define
+  it). A recipe linking C/C++ through rustc/ld.lld must carry `!lto`
+  (deleting the line does nothing — global OPTIONS enables it);
+  Rust-side fat LTO in bootstrap.toml is unrelated and stays.
+  `tests/rust-recipe.sh` pins the option in PKGBUILD and .SRCINFO.
 
 - **Self-consistent is not verified** (2026-09-20, audit): `sync_stable_version`
   bumps a `packages/stable` recipe to the repo's `pkgver`/`pkgrel` and

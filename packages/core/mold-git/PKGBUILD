@@ -1,31 +1,46 @@
 # Maintainer: Peter Jung <ptr1337@cachyos.org>
 # Maintainer: asyync1024 <asyync1024 at proton dot me>
 
+# Upstream merged the Rust rewrite on 2026-09-18 (af97c800 "Merge Rust
+# implementation and its history"): HEAD is a Cargo workspace (Cargo.toml,
+# cli/, arch/, tests/) with no CMakeLists.txt, so the former CMake/C++ recipe
+# fails at configure time ("source directory does not appear to contain
+# CMakeLists.txt"). The build below is cargo-based with 3-phase Rust PGO:
+# (1) instrumented build, (2) training by relinking mold with its own
+# instrumented binary acting as ld.mold, (3) profile-use + fat LTO + CGU=1.
+
 _reponame=mold
 pkgname=${_reponame}-git
-pkgver=2.42.0.r74.g92eb17a0
+pkgver=2.42.1.r468.g6fc6e191
 pkgrel=1
 pkgdesc='A Modern Linker'
 arch=('x86_64')
 url="https://github.com/rui314/$_reponame"
 license=('MIT')
-# bundled: xxhash
+# Runtime closure of the final Rust binary (derived from readelf -d after
+# building): the C++-era deps are gone — libstdc++/tbb/mimalloc/libblake3
+# shipped binaries before, while blake3, flate2/zlib, zstd and mimalloc are
+# cargo crates now (mimalloc statically linked from the pinned git dep).
 depends=(
   glibc
-  libblake3
-  libstdc++
-  mimalloc
-  tbb
+  gcc-libs
   zlib
-  zstd
 )
+# rust: compiler; git: VCS source + build.rs embeds the commit hash;
+# llvm: llvm-profdata merges the PGO profiles. cmake/ninja/python died with
+# the C++ build. mold itself is deliberately NOT a makedepend: it is only a
+# build-time linker, probed in build(), so mold-git can bootstrap even on a
+# host whose linker is broken.
 makedepends=(
-  cmake
-  ninja
+  rust
   git
-  mold
-  python
+  llvm
 )
+# !debug: release profile already carries no debug info.
+# !lto: rust LTO is controlled via CARGO_PROFILE_RELEASE_* below; the only C
+# compiled here (mold-wrapper.c/lto-message.c via build.rs) must not inherit
+# makepkg's -flto — build.rs links them with a plain gcc driver invocation.
+options=(!debug strip !lto)
 source=("git+${url}.git")
 b2sums=('SKIP')
 provides=("$_reponame=$pkgver")
@@ -36,70 +51,153 @@ pkgver() {
   git describe --long --tags | sed -E 's/^v//;s/([^-]*-g)/r\1/;s/-/./g'
 }
 
-build() {
-  local _cmake_options=(
-    -S "$_reponame"
-    -B build
-    -G Ninja
-    -W no-author
-    -D CMAKE_BUILD_TYPE='Release'
-    -D CMAKE_C_FLAGS_RELEASE='-DNDEBUG'
-    -D CMAKE_CXX_FLAGS_RELEASE='-DNDEBUG'
-    -D CMAKE_INSTALL_PREFIX='/usr'
-    -D CMAKE_INSTALL_LIBEXECDIR='lib'
-    -D MOLD_USE_SYSTEM_MIMALLOC=ON
-    -D MOLD_USE_SYSTEM_TBB=ON
-    -D MOLD_LTO=ON
-    -D MOLD_USE_MOLD=ON
-  )
-
-  # Phase 1: instrumented build (LTO off for speed)
-  msg "PGO Phase 1: instrumented build"
-  cmake "${_cmake_options[@]}" \
-    -D MOLD_LTO=OFF \
-    -D CMAKE_C_FLAGS="-fprofile-generate=$(pwd)/pgo-profiles" \
-    -D CMAKE_CXX_FLAGS="-fprofile-generate=$(pwd)/pgo-profiles" \
-    -D CMAKE_EXE_LINKER_FLAGS="-fprofile-generate=$(pwd)/pgo-profiles" \
-    -D CMAKE_SHARED_LINKER_FLAGS="-fprofile-generate=$(pwd)/pgo-profiles"
-  cmake --build build
-
-  # Phase 2: training — link mold's own object files
-  # NOTE: write to a REAL temp file, not /dev/null — mold mmaps its output
-  # file and a zero-size device file caused an infinite spin (4h+ at 13
-  # cores without finishing a 1.9 GB link). Bounded by timeout: on timeout
-  # no .gcda is written and the gcda_count check below falls back to a
-  # plain LTO-only build.
-  msg "PGO Phase 2: training by linking mold itself"
-  (cd build && timeout -s INT -k 30 600 ./mold -o /tmp/mold-pgo-train-out CMakeFiles/mold.dir/src/*.o 2>/dev/null || true)
-  rm -f /tmp/mold-pgo-train-out
-
-  # Verify profile data
-  # NOTE: -fprofile-generate=<dir> routes ALL .gcda files into that dir
-  local gcda_count=$(find pgo-profiles -name '*.gcda' 2>/dev/null | wc -l)
-  if [ "$gcda_count" -eq 0 ]; then
-    warning "No profile data generated — falling back to LTO-only build"
-    rm -rf build
-    cmake "${_cmake_options[@]}"
-    cmake --build build
-    return 0
-  fi
-  msg "Profile data generated: $gcda_count .gcda files"
-
-  # Phase 3: rebuild with profile + LTO
-  # NOTE: do NOT delete pgo-profiles here — phase 3 needs it for -fprofile-use
-  msg "PGO Phase 3: optimized build"
-  rm -rf build
-  cmake "${_cmake_options[@]}" \
-    -D CMAKE_C_FLAGS="-DNDEBUG -fprofile-use=$(pwd)/pgo-profiles" \
-    -D CMAKE_CXX_FLAGS="-DNDEBUG -fprofile-use=$(pwd)/pgo-profiles"
-  cmake --build build
-  rm -rf pgo-profiles
+prepare() {
+  cd "$_reponame"
+  # Fetch into the source tree, not ~/.cargo; --locked pins the committed
+  # Cargo.lock (including the pinned mimalloc_rust git dependency).
+  export CARGO_HOME="${srcdir}/.cargo"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
-# check() removed 2026-09-04: full ctest suite is release-validation, not packaging
+build() {
+  cd "$_reponame"
+  export CARGO_HOME="${srcdir}/.cargo"
+  # External compiler wrappers must not interfere with the per-phase RUSTFLAGS.
+  unset RUSTC_WRAPPER
+
+  # Start from the RUSTFLAGS provided by the environment (e.g. CachyOS's
+  # /etc/makepkg.conf.d/rust.conf already sets "-C opt-level=3 -C target-cpu=native").
+  local _rustflags="${RUSTFLAGS:-}"
+
+  # ISA fallback for systems whose makepkg.conf does not tune the target.
+  if ! grep -q 'target-cpu' <<<"${_rustflags}"; then
+    _rustflags+=" -C target-cpu=native"
+  fi
+
+  # Fast linker: huge win for fat-LTO link times (build-time only, no output
+  # effect). Probed, not declared — see makedepends above.
+  if command -v mold >/dev/null 2>&1; then
+    _rustflags+=" -C link-arg=-fuse-ld=mold"
+  fi
+
+  # Prevent warning: 'Package contains reference to $srcdir'
+  _rustflags+=" --remap-path-prefix=${srcdir}=/"
+
+  local _pgo_dir="${srcdir}/pgo-data"
+  rm -rf "${_pgo_dir}"
+  mkdir -p "${_pgo_dir}"
+
+  # Phase 1: instrumented build (LTO off — faster, and profiling does not
+  # need it; phase 3 turns LTO back on).
+  msg "PGO Phase 1: instrumented build"
+  RUSTFLAGS="${_rustflags} -Cprofile-generate=${_pgo_dir}" \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    cargo build --frozen --release -p mold-cli
+
+  # Phase 2: training by self-relink. The instrumented binary is copied
+  # aside and exposed as ld.mold (and mold) at the FRONT of PATH, so the
+  # gcc driver resolving -fuse-ld=mold executes it while it relinks mold
+  # itself. The copy-aside is mandatory: cargo relinks over
+  # target/release/mold, and the *executing* linker must not be that same
+  # file (ETXTBSY / relinking the running binary).
+  # Two runs give the profile more than a single link's samples. The output
+  # is a real file (the old C++ recipe's /dev/null mmap spin does not apply),
+  # so no timeout is needed; if no profile appears, the count check below
+  # falls back to a plain fat-LTO build instead of failing the package.
+  msg "PGO Phase 2: training by relinking mold with the instrumented linker"
+  local _bin="target/release/mold"
+  local _train="${_pgo_dir}/train-bin"
+  mkdir -p "${_train}"
+  cp -a "${_bin}" "${_train}/mold-instrumented"
+  ln -s mold-instrumented "${_train}/ld.mold"
+  ln -s mold-instrumented "${_train}/mold"
+
+  local _run
+  for _run in 1 2; do
+    # Removing the output plus touching exactly one crate source dirties only
+    # the mold-cli unit (RUSTFLAGS are identical to phase 1), forcing cargo
+    # to recompile that unit and relink through the PATH route.
+    rm -f "${_bin}"
+    touch cli/main.rs
+    LLVM_PROFILE_FILE="${_pgo_dir}/mold-%p-%m.profraw" \
+      PATH="${_train}:${PATH}" \
+      RUSTFLAGS="${_rustflags} -Cprofile-generate=${_pgo_dir}" \
+      CARGO_PROFILE_RELEASE_LTO=false \
+      cargo build --frozen --release -p mold-cli
+  done
+
+  local profraw_count
+  profraw_count=$(find "${_pgo_dir}" -name '*.profraw' 2>/dev/null | wc -l)
+  if [ "$profraw_count" -eq 0 ]; then
+    warning "No profile data generated — falling back to a plain fat-LTO build"
+    RUSTFLAGS="${_rustflags} -Cstrip=symbols" \
+      CARGO_PROFILE_RELEASE_LTO=fat \
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+      cargo build --frozen --release -p mold-cli
+    rm -rf "${_pgo_dir}"
+    return 0
+  fi
+  msg "Profile data generated: $profraw_count .profraw files"
+
+  # Phase 3: merge the profiles, then rebuild with profile-use + fat LTO +
+  # CGU=1 (max cross-crate optimization; overrides the upstream thin-LTO
+  # intent without editing Cargo.toml) + symbol stripping. The RUSTFLAGS
+  # differ from phase 1, so every unit recompiles — no instrumentation can
+  # survive into the final binary.
+  msg "PGO Phase 3: optimized build"
+  llvm-profdata merge -o "${_pgo_dir}/merged.profdata" "${_pgo_dir}"/*.profraw
+  RUSTFLAGS="${_rustflags} -Cprofile-use=${_pgo_dir}/merged.profdata -Cstrip=symbols" \
+    CARGO_PROFILE_RELEASE_LTO=fat \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    cargo build --frozen --release -p mold-cli
+  rm -rf "${_pgo_dir}"
+}
+
+# check() removed 2026-09-04 (C++ era): upstream's suite is release
+# validation, not packaging. The Rust tree's CI equivalent (cargo test plus
+# the bash tests/) was likewise not adopted when the recipe was rewritten
+# on 2026-09-25.
+
+# A PGO binary that reaches the payload bakes its profile destination into
+# .rodata, and the LLVM runtime recreates that whole tree on every
+# invocation. Two checks, because they cover different artifacts:
+#   - readelf: sound here inside package(), before makepkg strips
+#   - strings: the only one that survives stripping, so an installed binary
+#     is still auditable — readelf alone reports clean on a stripped binary
+#     that carries every one of those paths
+# The `pgo-data` literal catches a baked profile *directory* even when the
+# string has no .profraw/.gcda suffix (clang/rustc may embed the dir alone).
+# The caller uses `|| return 1`: bash returns a function's LAST command's
+# status, so a bare mid-function call would print the error and succeed anyway.
+verify_no_profile_instrumentation() {
+  local _root="$1" _binary _rc=0
+  while IFS= read -r -d '' _binary; do
+    if readelf -sW "$_binary" 2>/dev/null | grep -Eq '__gcov_|__llvm_profile'; then
+      error "final package still contains profile instrumentation: $_binary"
+      _rc=1
+    fi
+    # The char class excludes `/` and `*` so a match must be an absolute
+    # baked destination, not a glob or a path fragment.
+    if strings -a "$_binary" 2>/dev/null | grep -qE '^/[^[:space:]/*][^[:space:]]*\.(gcda|profraw)'; then
+      error "final package still carries profile destinations: $_binary"
+      _rc=1
+    fi
+    if strings -a "$_binary" 2>/dev/null | grep -qF 'pgo-data'; then
+      error "final package still carries the PGO work directory: $_binary"
+      _rc=1
+    fi
+  done < <(find "$_root" -type f \( -name '*.so' -o -name '*.so.*' -o -perm -u+x \) -print0)
+  return $_rc
+}
 
 package() {
-  DESTDIR="$pkgdir" cmake --install build
-  install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$_reponame/LICENSE"
+  cd "$_reponame"
+  # Upstream's installer: /usr/bin/mold + ld.mold symlink, the wrapper in
+  # /usr/lib/mold, /usr/libexec/mold/ld, man pages, LICENSE under doc/.
+  DESTDIR="$pkgdir" PREFIX=/usr ./install-mold.sh
+
+  verify_no_profile_instrumentation "$pkgdir" || return 1
+
+  install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
 }
 # vim: ts=2 sw=2 et:

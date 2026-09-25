@@ -1413,8 +1413,10 @@ function install_all
 end
 
 # ─── PGO payload verification ────────────────────────────────────────────────
-# An installed PGO *phase-1* binary bakes absolute `.gcda` destinations into
-# `.rodata`, and libgcov recreates that entire tree on every invocation — the
+# An installed PGO *phase-1* binary bakes absolute profile destinations into
+# `.rodata` — `.gcda` for C/C++ `-fprofile-generate`, `.profraw` for Rust's
+# `-Cprofile-generate` — and its runtime recreates that entire tree on every
+# invocation: libgcov for the C path, the LLVM profile runtime for Rust. The
 # 2026-09-20 incident: `cmake`, `ccmake`, `cpack`, `ctest` and `Xwayland`
 # rebuilt .Heavyweight/cmake-git and xorg-xwayland-git in full (779 files) from
 # one command each. The damage lands only once such a package is INSTALLED, so
@@ -1431,11 +1433,13 @@ end
 # live in a helper under usr/libexec or opt just as well as in usr/bin, and
 # scoping to the obvious two directories would miss exactly those. Precision
 # comes from the predicate instead — it matches a *standalone* absolute path, so
-# valid metadata (.BUILDINFO, .PKGINFO record no `.gcda` at all), prose docs,
+# valid metadata (.BUILDINFO, .PKGINFO record no `.gcda`/`.profraw` at all),
+# prose docs,
 # and a source comment quoting a path all pass while a real baked destination
 # does not. Gating on the recipe keeps the extract cost on the few recipes that
 # can leak, and covers a recipe that *starts* instrumenting with no further edit
-# here.
+# here. Both spellings of the instrumenting flag count: the C `-fprofile-generate`
+# and rustc's `-Cprofile-generate` (mold-git's self-relink PGO).
 #
 # The char class after the leading slash excludes `/` and `*` for that reason:
 # a glob literal is not a standalone path, and `ctest` (CMake's coverage tool)
@@ -1450,7 +1454,7 @@ function verify_pgo_payload
     set -l failed 0
     for archive in $argv
         set -l recipe_dir (dirname -- "$archive")
-        if not grep -q -- '-fprofile-generate' "$recipe_dir/PKGBUILD" 2>/dev/null
+        if not grep -Eq -- '-fprofile-generate|-C ?profile-generate' "$recipe_dir/PKGBUILD" 2>/dev/null
             continue
         end
         set -l tmp_root "$TMPDIR"
@@ -1480,7 +1484,7 @@ function verify_pgo_payload
         # covers the whole payload and still names the offender. The scan runs
         # from inside $work, so the reported paths are relative to the archive.
         set -l hits (cd "$work"; and find . -type f -exec strings -a -f {} + 2>/dev/null \
-            | grep -E '^[^:]+: /[^[:space:]/*][^[:space:]]*\.gcda' \
+            | grep -E '^[^:]+: /[^[:space:]/*][^[:space:]]*\.(gcda|profraw)' \
             | cut -d: -f1 | sort -u)
         rm -rf -- "$work"
         if test (count $hits) -gt 0
@@ -1895,7 +1899,8 @@ function audit_workspace
 
     echo ""
     echo "Installed PGO payloads:"
-    # An installed binary that still carries -fprofile-generate is the one
+    # An installed binary that still carries -fprofile-generate or
+    # -Cprofile-generate is the one
     # PGO defect the recipe-level check cannot see: it fails only on machines
     # that do not have the instrumenting build's directory tree.  The builder
     # refuses such an archive at install time (verify_pgo_payload), but an
@@ -1903,13 +1908,13 @@ function audit_workspace
     # the audit reports it.  Every file is scanned rather than the obvious
     # usr/bin+usr/lib pair, because scoping to those embeds an assumption
     # about where a recipe installs its binaries.  Archive metadata is not a
-    # false-positive source here: the predicate matches a `.gcda` path, not
-    # the `-fprofile-generate` flag that `.BUILDINFO` happens to record.
+    # false-positive source here: the predicate matches a `.gcda`/`.profraw`
+    # path, not the instrumenting flag that `.BUILDINFO` happens to record.
     set -l pgo_names
     for entry in $_PACKAGE_MAP
         set -l fields (string split '|' -- "$entry")
         set -l recipe "$SCRIPT_DIR/$fields[2]"
-        grep -q -- '-fprofile-generate' "$recipe/PKGBUILD" 2>/dev/null; or continue
+        grep -Eq -- '-fprofile-generate|-C ?profile-generate' "$recipe/PKGBUILD" 2>/dev/null; or continue
         # Names come from .SRCINFO, never PKGBUILD: the kernel assigns pkgbase
         # in a variable, so PKGBUILD scraping would misreport it as absent.
         for name in (sed -n 's/^pkgname = //p' "$recipe/.SRCINFO" 2>/dev/null)
@@ -1941,9 +1946,9 @@ function audit_workspace
     else
         echo "  inspected $pgo_files files from "(count $pgo_names)" PGO recipes"
         set -l pgo_hits (xargs -d'\n' -r -n 400 strings -a -f < $pgo_list 2>/dev/null \
-            | grep -E '^[^:]+: /[^[:space:]/*][^[:space:]]*\.gcda' | cut -d: -f1 | sort -u)
+            | grep -E '^[^:]+: /[^[:space:]/*][^[:space:]]*\.(gcda|profraw)' | cut -d: -f1 | sort -u)
         if test (count $pgo_hits) -eq 0
-            echo "  none carry baked .gcda paths"
+            echo "  none carry baked .gcda/.profraw paths"
         else
             for hit in $pgo_hits
                 echo "  $hit"
@@ -4379,7 +4384,8 @@ function usage
     echo "                    clones, and downloaded source tarballs (asks first)"
     echo "  --audit           Read-only report of legacy paths, package drift,"
     echo "                    stale runtime/error artifacts, and installed PGO"
-    echo "                    packages still carrying -fprofile-generate payloads"
+    echo "                    packages still carrying -fprofile-generate or"
+    echo "                    -Cprofile-generate payloads"
     echo "  -ln, --link-sources"
     echo "                    Dedup git source clones: symlink twins to one"
     echo "                    canonical mirror; repair origin/refspec; asks first"

@@ -7,15 +7,20 @@
 #
 # This asserts the install gate directly, with hand-placed archives and no
 # makepkg at all: the property belongs to `install_all`/`install_pkgs_now`, not
-# to any one recipe. Four payloads cover the four outcomes:
+# to any one recipe. Payloads cover the outcomes:
 #
 #   pgo-bad    PGO recipe, instrumented usr/bin      -> refuse, install nothing
 #   deep-bad   PGO recipe, instrumented usr/libexec   -> refuse. Completeness:
 #              a leak outside usr/bin and usr/lib is still a leak
+#   rust-bad   Rust PGO recipe (-Cprofile-generate), payload baking a
+#              pgo-data/*.profraw destination -> refuse. The gate must name
+#              rustc's spelling of the flag, not only C's -fprofile-generate
 #   pgo-clean  PGO recipe, clean payload, metadata and a doc that quotes a
 #              .gcda path -> install. Precision: a mere mention is not a leak
 #   plain-bad  non-PGO recipe, instrumented payload   -> install. Gate: a recipe
 #              that never instruments cannot leak, so it is never unrolled
+#   rust-clean Rust PGO recipe, clean payload         -> install (a Rust recipe
+#              that really replaced its phase-3 flags must not be refused)
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -39,29 +44,36 @@ for group in git stable core misc third-party app; do
     : >"$fixture/config/groups/$group.list"
 done
 
-# A recipe counts as PGO to the gate purely by naming -fprofile-generate, so the
-# gate and the payload are varied independently.
+# A recipe counts as PGO to the gate purely by naming an instrumenting flag,
+# so the gate and the payload are varied independently.
 add_recipe() {
     local id="$1" instrumenting="$2"
     mkdir -p "$fixture/packages/$id"
     {
         printf 'pkgname=%s\npkgver=1.0\npkgrel=1\narch=(x86_64)\n' "$id"
-        if [[ "$instrumenting" == yes ]]; then
-            printf 'build() {\n  CFLAGS+=" -fprofile-generate"\n}\n'
-        else
-            printf 'build() {\n  :\n}\n'
-        fi
+        case "$instrumenting" in
+            yes) printf 'build() {\n  CFLAGS+=" -fprofile-generate"\n}\n' ;;
+            rust) printf 'build() {\n  RUSTFLAGS+=" -Cprofile-generate=$srcdir/pgo-data"\n}\n' ;;
+            *) printf 'build() {\n  :\n}\n' ;;
+        esac
     } >"$fixture/packages/$id/PKGBUILD"
     printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
     printf '%s\n' "$id" >>"$fixture/config/groups/git.list"
 }
 
 leak_path() { printf '/home/someone/build/pgo-fixture/%s/src/A.dir/b.cxx.gcda' "$1"; }
+rust_leak_path() { printf '/home/someone/build/pgo-fixture/%s/src/pgo-data/mold-%%p.profraw' "$1"; }
 
 # $1 recipe id, $2 "" | usr/bin | usr/libexec  (where the leak is baked)
+# $3 gcda (default) | profraw — which kind of baked destination the leak is
 add_archive() {
-    local id="$1" where="$2" stage
+    local id="$1" where="$2" stage leak
     stage=$(mktemp -d "$fixture/stage.XXXXXX")
+    if [[ "${3:-gcda}" == profraw ]]; then
+        leak=$(rust_leak_path "$id")
+    else
+        leak=$(leak_path "$id")
+    fi
     mkdir -p "$stage/usr/bin" "$stage/usr/lib" "$stage/usr/libexec" \
         "$stage/usr/share/doc/$id"
     # Metadata is never a leak: .BUILDINFO records the build's own flags.
@@ -75,8 +87,8 @@ add_archive() {
     printf 'code\0/usr/lib/clean.so\0code\n' >"$stage/usr/bin/$id"
     printf 'data\n' >"$stage/usr/lib/lib$id.so"
     case "$where" in
-        usr/bin) printf 'code\0%s\0code\n' "$(leak_path "$id")" >"$stage/usr/bin/$id" ;;
-        usr/libexec) printf 'code\0%s\0code\n' "$(leak_path "$id")" >"$stage/usr/libexec/$id-helper" ;;
+        usr/bin) printf 'code\0%s\0code\n' "$leak" >"$stage/usr/bin/$id" ;;
+        usr/libexec) printf 'code\0%s\0code\n' "$leak" >"$stage/usr/libexec/$id-helper" ;;
     esac
     tar --zstd -cf "$fixture/packages/$id/$id-1.0-1-x86_64.pkg.tar.zst" \
         -C "$stage" .
@@ -89,10 +101,14 @@ add_recipe pgo-bad yes
 add_recipe deep-bad yes
 add_recipe pgo-clean yes
 add_recipe plain-bad no
+add_recipe rust-bad rust
+add_recipe rust-clean rust
 add_archive pgo-bad usr/bin
 add_archive deep-bad usr/libexec
 add_archive pgo-clean ""
 add_archive plain-bad usr/bin
+add_archive rust-bad usr/bin profraw
+add_archive rust-clean ""
 
 cat >"$fixture/bin/pacman" <<'EOF'
 #!/usr/bin/env bash
@@ -147,13 +163,19 @@ refuses pgo-bad './usr/bin/pgo-bad'
 rm -f "$(archive_of pgo-bad)"
 refuses deep-bad './usr/libexec/deep-bad-helper'
 
-# ── Case C: a clean PGO archive installs, and the non-PGO one is not unrolled
+# ── Case D: a Rust -Cprofile-generate recipe with a baked .profraw destination
+# is refused by name — the gate must match rustc's flag spelling and the
+# LLVM runtime's file extension, not only C's -fprofile-generate/.gcda.
 rm -f "$(archive_of deep-bad)"
+refuses rust-bad './usr/bin/rust-bad'
+
+# ── Case C: a clean PGO archive installs, and the non-PGO one is not unrolled
+rm -f "$(archive_of rust-bad)"
 if ! output=$(run_builder); then
     printf 'clean payloads were incorrectly refused:\n%s\n' "$output" >&2
     exit 1
 fi
-for expected in pgo-clean plain-bad; do
+for expected in pgo-clean plain-bad rust-clean; do
     if ! grep -F "$expected-1.0-1-x86_64.pkg.tar.zst" "$fixture/pacman.log" >/dev/null; then
         printf '%s was not installed:\n' "$expected" >&2
         cat "$fixture/pacman.log" >&2

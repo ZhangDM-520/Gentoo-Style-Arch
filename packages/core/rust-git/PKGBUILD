@@ -47,7 +47,12 @@ makedepends=(
 # checkdepends (gdb, procps-ng) removed 2026-09-04 — no check() exists
 options=(
   !emptydirs
-  lto
+  # !lto: makepkg's LTOFLAGS (-flto=auto) would make the C++ llvm-wrapper
+  # objects GCC-LTO GIMPLE, which lld (rustc's gnu-lld-cc default linker)
+  # cannot materialize — librustc_driver.so then ships undefined LLVMRust*
+  # and stage1 dies on --no-allow-shlib-undefined. Rust-side fat LTO in
+  # bootstrap.toml is unaffected.
+  !lto
 )
 source=(
   git+https://github.com/rust-lang/rust.git
@@ -66,7 +71,7 @@ b2sums=('SKIP'
         'd587ff9463f09b5e04b556e22f60d0fee204931676f821d5d86b5b67429f158bd2f83693f7ed4d676b14c23ff171b91e7e28b601985e973f2b98fd2419bb704c'
         '7210f6762473d1cdc6a5e2c703be9d6d9aeeb813ec1e1dff099d90497c9fdb6cb8f298f34801bb0ff958fe2ac10635bb8631fa6cebeca203a3863bf789b069f9'
         '991cb47155fb2a0d7969e3e2cbc44d030e9eb13474a38d9c9ad88365ce6ab6ecfb69692dd420d68f439585fa2a6e0139cd6f294b5487b77f6b875b773382a459'
-        'ad5271e21aa7cb6cf6ab2b92a06c6d82085d07dad4518b0bdad205f21d77f9ab9f6bcd11ceac7b5dfc818f94aeb2feff7dd813bf93335064dc7cabc1f6676cac')
+        '64ef4657d265beaf0d1431136a29cf7bd4db840e0a28abc606ff5b83ca71bc7b5f59e20f739c5e8f1a2fa21975fa6749e97659fe8209f71ff74b983dbeb8a823')
 
 COMPRESSZST+=(--long)
 
@@ -146,8 +151,21 @@ build() {
     -j "${GSA_BUILD_JOBS:-$(nproc)}"
   )
 
+  # Start from a clean DESTDIR: a previously failed build() leaves dest-rust
+  # mutated (manifests deleted, tool symlinks created, licenses moved), and
+  # the next install.sh then dies on `cp: not writing through dangling
+  # symlink` and leaks `.old` backups into the package.
+  rm -rf "$srcdir/dest-rust" "$srcdir/dest-src"
+
   echo "Building Rust compiler..."
   DESTDIR="$srcdir/dest-rust" python ./x.py install "${xpy_options[@]}"
+
+  # Upstream abcb9780d6d4 (2026-09-07) renamed the install step from `src`
+  # to `rust-src`, and its default run additionally requires
+  # [build] extended = true — which this config deliberately does not set.
+  # Without this explicit step the rust-src split receives no
+  # usr/lib/rustlib/src and _pick below aborts the whole build.
+  DESTDIR="$srcdir/dest-rust" python ./x.py install rust-src "${xpy_options[@]}"
 
   cd ../dest-rust
 
