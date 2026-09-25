@@ -31,24 +31,6 @@ _pkgfn=${pkgname/6-/}
 source=(git+https://code.qt.io/qt/$_pkgfn#branch=dev)
 sha256sums=('SKIP')
 
-prepare() {
-  cd $_pkgfn
-  # Qt dev skew (2026-09-08): qtlanguageserver r650 regenerated the LSP spec
-  # types — TextDocumentContentChangeEventVariant{1,2} became
-  # TextDocumentContentChangePartial / TextDocumentContentChangeWholeDocument.
-  # qtdeclarative dev still uses the old aliases in qmlls/qtextsynchronization.cpp.
-  # Apply ONLY when the installed header has the new generation — the
-  # languageserver is currently PINNED to r647 (old names), where this sed
-  # would break the build. Private-API coupling: MEMORY.md rule 14.
-  local _ls_header=/usr/include/qt6/QtLanguageServer/6.13.0/QtLanguageServer/private/qlanguageserverspectypes_p.h
-  if grep -q "TextDocumentContentChangePartial" "$_ls_header" 2>/dev/null; then
-    sed -i \
-      -e 's/TextDocumentContentChangeEventVariant2/TextDocumentContentChangeWholeDocument/g' \
-      -e 's/TextDocumentContentChangeEventVariant1/TextDocumentContentChangePartial/g' \
-      src/qmlls/qtextsynchronization.cpp
-  fi
-}
-
 # PGO toggle — false for quick rebuilds
 _pgo=true
 

@@ -13,7 +13,7 @@ pkgbase = qt6-languageserver
 	makedepends = git
 	makedepends = ninja
 	depends = qt6-base
-	source = git+https://code.qt.io/qt/qtlanguageserver#commit=d845a857c0354e01286017e5a514f50b4546cf0d
+	source = git+https://code.qt.io/qt/qtlanguageserver#branch=dev
 	sha256sums = SKIP
 
 pkgname = qt6-languageserver

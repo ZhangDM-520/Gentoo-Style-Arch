@@ -35,6 +35,36 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-26 (qt6 spec-type unpin) — qtdeclarative adapted to the LSP-3.18 regeneration, so the qtlanguageserver pin hit its exit condition
+
+- **Symptom**: `qt6-declarative` fails compiling qmlls —
+  `qworkspace.cpp:68: 'class QJsonObject' has no member named
+  'workspaceFolders'` and
+  `qtextsynchronization.cpp:47: 'TextDocumentContentChangeWholeDocument' was
+  not declared in this scope` (only the two `QmlLSPrivate` objects fail).
+- **Root cause**: Qt private-API skew between qtlanguageserver and
+  qtdeclarative. `qt6-languageserver` was deliberately pinned below
+  qtlanguageserver's LSP-3.18 spec regeneration (`dba4b9f`) with the
+  documented exit condition "unpin when qtdeclarative adapts"; qtdeclarative
+  dev HEAD (c0289db7c8, 2026-09-25) adapted, so the pin's private header
+  still carried `std::optional<QJsonObject> workspace` /
+  `TextDocumentContentChangeEventVariant1/2` where the new code expects
+  `workspaceFolders` / `Partial`/`WholeDocument`.
+- **Fix**: unpin `qt6-languageserver` back to `#branch=dev` (pre-pin idiom;
+  dev tip 146b9ac has `dba4b9f` as ancestor and the regenerated types in
+  `qlanguageserverspecttypes_p.h`), record the met exit condition in
+  PINNED-README.md + the PKGBUILD comment, and delete qt6-declarative's now-
+  stale 2026-09-08 prepare() skew shim (18 lines, an inverted no-op once both
+  sides speak the new spec). Both `.SRCINFO`s regenerated.
+- **Validation**: `bash -n` both; printsrcinfo deltas as expected; shim
+  residue grep clean; evidence the regeneration is included verified by
+  `git grep` at the mirror's dev tip. Real verification is the build order
+  qt6-languageserver → qt6-declarative → remaining qt6/qt5 batch.
+- **Rule**: a pin-with-exit-condition must be unpin+cleanup in the SAME batch
+  the exit condition fires (including inverse shims in sibling recipes), and
+  the qtlanguageserver↔qtdeclarative pair moves as one ABI-coupled unit —
+  fetch both from the same dev day.
+
 ## 2026-09-25 (toolchain drift recipes) — post-10-Sep toolchain snapshots broke recipes independently of the llvm skew; fixes land one commit each
 
 Four recipes broke while the llvm/rust skew recovery was in flight — three
