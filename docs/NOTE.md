@@ -37,9 +37,10 @@ dependency edges, and incident root causes are unaffected by the renames.
 
 ## 2026-09-25 (toolchain drift recipes) — post-10-Sep toolchain snapshots broke recipes independently of the llvm skew; fixes land one commit each
 
-Four recipes broke against newer host toolchain snapshots (cmake-git
-4.4.20260919, GCC 17.0.0 20260920) while the llvm/rust skew recovery was in
-flight. Each fix is its own commit; entries append here as they land.
+Four recipes broke while the llvm/rust skew recovery was in flight — three
+against newer host toolchain snapshots (cmake-git 4.4.20260919, GCC
+17.0.0 20260920) and one from upstream drift. Each fix is its own commit;
+entries append here as they land.
 
 ### fish 4.9.3 vs cmake-git 4.4: `install(SCRIPT CODE)` rejected
 
@@ -57,6 +58,27 @@ flight. Each fix is its own commit; entries append here as they land.
 - **Rule**: a cmake *snapshot* tightens syntax before the stable release does;
   when a recipe fails on a tightened legacy form, migrate the call to the
   canonical form (do not pin an older cmake).
+
+### xwayland-satellite-git: round-half-up patch conflicted after upstream main moved
+
+- **Symptom**: `prepare()` fails applying `0001-round-half-up.patch` —
+  upstream main moved add2795 → 63cdf17 (v0.8.3 era).
+- **Root cause**: upstream commit 5274bdc (#496) rewrote exactly the height
+  code the patch hunked, so `git apply -3` conflicted. The patch is still
+  needed: issue #479 is open, and 63cdf17 (#448) only rounds popup
+  xdg_positioner rects — a different conversion path.
+- **Fix**: patch rebased onto 63cdf17 — round-half-up kept on x/y/w/h,
+  #496's titlebar-height move absorbed into the configure arm (both
+  conversions round), `update_surface_viewport` rounds instead of `ceil()`,
+  #496's test expectations retargeted (112→113, 93→104), #479 regression
+  test kept. pkgver 0.8.2.r16.g63cdf17, new b2sum, `.SRCINFO` regenerated.
+- **Validation**: `git apply --check` + `patch --dry-run` clean against the
+  real tree at 63cdf17; apply-verify-reset reproduced the authored diff;
+  `bash -n`; printsrcinfo. Test-module compile-and-pass is unverified by
+  design (no builds before the supervised full build; `!check` host).
+- **Rule**: a `-git` recipe's patch is pinned to a moving upstream; when it
+  conflicts, first check whether the patched behavior landed upstream (drop
+  then), else rebase and re-validate against the exact fetched revision.
 
 ## 2026-09-25 (abi batch policy) — the run's own llvm-git install broke rustc after the preflight had passed; the builder now refuses llvm-without-rust and re-probes mid-run
 
