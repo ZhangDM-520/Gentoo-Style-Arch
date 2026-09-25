@@ -130,6 +130,27 @@ entries append here as they land.
   stays until the compiler fix lands, and `prepare()` must fail loudly when
   upstream moves the patched line.
 
+### blender-git vs cmake-git 4.4: `install(CODE … DEPENDS)` rejected
+
+- **Symptom**: configure aborts at `source/creator/CMakeLists.txt:2163
+  (install)` — `install CODE given unknown argument: "DEPENDS"`.
+- **Root cause**: upstream's manpage block calls
+  `install(CODE "…manpage gen…" DEPENDS blender)`; `DEPENDS` was never a
+  valid `install(CODE)` argument — old CMake silently ignored it, the
+  cmake-git 4.4.3 snapshot hard-errors. Same drift class as the fish case.
+- **Fix**: recipe patch deletes the dead `DEPENDS blender` token (behavior-
+  neutral: it was always ignored, install-phase ordering already guarantees
+  the binary exists); picked up by prepare()'s existing `*patch` →
+  `git apply` mechanism.
+- **Validation**: `patch --dry-run --fuzz=0` + `git apply --check` clean
+  against the real checkout (a72cf3c0d50367bb, stable 3-line context
+  surviving pkgver drift); resulting call has `CODE` as sole argument;
+  `bash -n`; printsrcinfo.
+- **Rule**: when cmake-git tightens parsing, the fix is to migrate the call
+  to its canonical argument set (fish: `install(CODE …)`; blender: drop the
+  never-valid token) — never pin an older cmake; expect more lenient-parsing
+  victims to surface one at a time.
+
 ## 2026-09-25 (abi batch policy) — the run's own llvm-git install broke rustc after the preflight had passed; the builder now refuses llvm-without-rust and re-probes mid-run
 
 - **Symptom**: 20:50:26 — a running batch installed `llvm-git`

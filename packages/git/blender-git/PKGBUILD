@@ -51,9 +51,15 @@ makedepends+=('makepkg-git-lfs-proto') # provides /usr/share/makepkg/source/git-
 provides=('blender')
 conflicts=('blender')
 license=('GPL')
+# cmake-git 4.4 hard-errors on the trailing `DEPENDS blender` in the manpage
+# `install(CODE ...)` call in source/creator/CMakeLists.txt (that form takes no
+# DEPENDS; older CMake silently ignored the token). prepare() auto-applies any
+# `*patch`/`*diff` source via `git apply`.
 source=("blender::git-lfs+https://projects.blender.org/blender/blender${_fragment}"
+  '0001-CMakeLists-drop-invalid-DEPENDS-from-install-CODE.patch'
   )
 sha256sums=('SKIP'
+  'f1f218b643ee22a3fc1831ef0e04e18e80a5b961897764294e3ed56f496e49a3'
   )
 
 pkgver() {
