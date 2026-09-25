@@ -105,6 +105,31 @@ entries append here as they land.
   migration (here: openxla/xla@91888df6ce), guard by version in the recipe's
   existing compat patch, and document any behavior delta in the patch itself.
 
+### autofdo-git vs GCC 17 snapshot: constexpr brace-init ICE (gcc PR 127395)
+
+- **Symptom**: compile dies in bundled abseil's
+  `crc_memcpy_x86_arm_combined.cc:164` — `internal compiler error: in
+  verify_ctor_sanity, at cp/constexpr.cc:7362` (GCC 17.0.0 20260920).
+  autofdo was also the one runtime-broken skew consumer (`create_llvm_prof`
+  had 138 undefined symbols), so a successful rebuild fixes both.
+- **Root cause**: `constexpr uint32_t kCrcDataXor = uint32_t{0xffffffff};` —
+  the braced scalar cast is a CONSTRUCTOR of scalar type; the GCC snapshot
+  folds it at template-parse but `reduced_constant_expression_p()` rejects
+  non-aggregate CONSTRUCTORs → `gcc_assert(ctx->ctor)`. Matches gcc
+  **PR 127395** exactly (ASSIGNED, draft fix withdrawn 2026-09-17, still
+  unfixed upstream; abseil master still has the line).
+- **Fix**: recipe patch replaces the braced cast with the equivalent plain
+  literal `0xffffffffu` — no CONSTRUCTOR, semantics unchanged. grep-guarded
+  `patch --forward` in prepare() (re-run safe, drops loudly on upstream
+  drift); pkgrel 5→6.
+- **Validation**: patch clean against on-disk source (autofdo `5d0de4e` /
+  abseil `2f9e432c`); apply + re-run simulation both exit 0; scan of the
+  compiled trees found no other trigger-shaped site; `bash -n`; printsrcinfo.
+- **Rule**: a GCC-snapshot ICE on a known upstream PR gets a minimal
+  source-shape patch at the recipe level (never a toolchain pin); the patch
+  stays until the compiler fix lands, and `prepare()` must fail loudly when
+  upstream moves the patched line.
+
 ## 2026-09-25 (abi batch policy) — the run's own llvm-git install broke rustc after the preflight had passed; the builder now refuses llvm-without-rust and re-probes mid-run
 
 - **Symptom**: 20:50:26 — a running batch installed `llvm-git`

@@ -5,7 +5,7 @@
 _pkgname=autofdo
 pkgname=${_pkgname}-git
 pkgver=0.30.1.r17.gc9fa188
-pkgrel=5
+pkgrel=6
 pkgdesc='Tool to generate LLVM Propeller profiles from perf.data'
 arch=('x86_64')
 url='https://github.com/google/autofdo'
@@ -21,8 +21,10 @@ source=(
   'perf_data_converter::git+https://github.com/google/perf_data_converter.git'
   'glog::git+https://github.com/google/glog.git'
   'googletest::git+https://github.com/google/googletest.git'
+  '0001-abseil-crc-constexpr-brace-init.patch'
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
+            '9731c1cd583e5497d1557266e80092e6a37a6b6cf99850c12c164134cad88a08')
 options=(!lto)
 
 prepare() {
@@ -37,6 +39,19 @@ prepare() {
   git -C "$repo" -c protocol.file.allow=always submodule update --init --recursive
   git -C "$repo/third_party/llvm-project" checkout --detach \
     "$(git -C "$srcdir/llvm-project" rev-parse HEAD)"
+
+  # Work around GCC 17 snapshot ICE (gcc PR 127395): a block-scope `constexpr`
+  # scalar initialized from a braced scalar CONSTRUCTOR (uint32_t{0xffffffff})
+  # in this function template is constant-folded while the template body is
+  # parsed and aborts in verify_ctor_sanity (cp/constexpr.cc). A plain literal
+  # initializer is equivalent and takes the CONSTRUCTOR out of the fold. Drop
+  # this once GCC fixes PR 127395 or upstream stops using the braced form.
+  local crc_memcpy="$repo/third_party/abseil/absl/crc/internal/crc_memcpy_x86_arm_combined.cc"
+  if grep -qF 'uint32_t{0xffffffff}' "$crc_memcpy"; then
+    patch -d "$repo" -p1 --forward \
+      < "$srcdir/0001-abseil-crc-constexpr-brace-init.patch"
+  fi
+
   sed -i \
     's/message(FATAL_ERROR "Unverified git commit hash/message(WARNING "Unverified git commit hash/' \
     "$repo/CMakeLists.txt"
