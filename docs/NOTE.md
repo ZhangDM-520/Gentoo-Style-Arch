@@ -80,6 +80,31 @@ entries append here as they land.
   conflicts, first check whether the patched behavior landed upstream (drop
   then), else rebase and re-validate against the exact fetched revision.
 
+### openshadinglanguage 1.15.3.0 vs llvm-git 24: removed TargetOptions fields
+
+- **Symptom**: compile errors in `llvm_util.cpp` at the jit-engine and NVPTX
+  option sites — `llvm::FPOpFusion`/`TargetOptions::AllowFPOpFusion` and
+  `HonorSignDependentRoundingFPMathOption` no longer exist in the llvm-git
+  24 snapshot.
+- **Root cause**: llvm-project `9d4a7d05d2` (PR #222683) and `3e3965fa48`
+  (PR #222027) removed both fields; FP contraction now derives solely from
+  per-instruction `contract` FMF and the sign-dependent rounding option was
+  superseded by `strictfp`. Upstream OSL has **no** fix yet (main, release,
+  dev-1.15 and tags through v1.15.7.0 all still use the removed API).
+- **Fix**: `osl-llvm-compat.patch` extended with `#if OSL_LLVM_VERSION < 240`
+  guards at all 5 sites (matches the patch's existing version-guard
+  convention). Behavior-preserving on the jit path (OSL emits no `contract`
+  FMF / no `llvm.fmuladd`, so Standard/Strict never contracted; `HonorSign…`
+  was already LLVM's default). NVPTX `Fast` loses free FMA contraction —
+  perf-only, OptiX not enabled in this recipe. pkgrel 1.1→1.2.
+- **Validation**: patch applies clean against the pristine v1.15.3.0 tarball
+  (sha512-verified); all 5 sites mechanically confirmed inside guards;
+  `bash -n`; printsrcinfo delta = pkgrel + patch sum only.
+- **Rule**: when an LLVM snapshot removes an API and upstream has not caught
+  up, take the semantic mapping from the removal PR and a known-good
+  migration (here: openxla/xla@91888df6ce), guard by version in the recipe's
+  existing compat patch, and document any behavior delta in the patch itself.
+
 ## 2026-09-25 (abi batch policy) — the run's own llvm-git install broke rustc after the preflight had passed; the builder now refuses llvm-without-rust and re-probes mid-run
 
 - **Symptom**: 20:50:26 — a running batch installed `llvm-git`

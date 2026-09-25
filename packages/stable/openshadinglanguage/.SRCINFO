@@ -1,7 +1,7 @@
 pkgbase = openshadinglanguage
 	pkgdesc = Advanced shading language for production GI renderers
 	pkgver = 1.15.3.0
-	pkgrel = 1.1
+	pkgrel = 1.2
 	url = https://github.com/imageworks/OpenShadingLanguage
 	arch = x86_64
 	license = BSD-3-Clause
@@ -29,6 +29,6 @@ pkgbase = openshadinglanguage
 	source = openshadinglanguage-1.15.3.0.tar.gz::https://github.com/AcademySoftwareFoundation/OpenShadingLanguage/archive/refs/tags/v1.15.3.0.tar.gz
 	source = osl-llvm-compat.patch
 	sha512sums = 269ac2e502966d71bb29c56bb7d17984aa01eb77d7637bf17e0f7f7997998c7f0a0ee0af5b16d39c81dfcc5ccbb20de6cdbd7c08e6a08263f5e1c3a5a1232138
-	sha512sums = 4debef9b94cbfa75f3948b82dc101ce51978bf986ab8edbbc70b1a995ba02e9d4c3488a77b0341713c5b8376b68f9ad8a07a8a71b0ba4fa7b1601d5c1005e15e
+	sha512sums = dec762e5fec030c0aa770fee1ab1324e99a4d6a6151215c01cc6fafd4201a9350ee27d004ced61b116da4113115299be0deaeb1a5bcaf51c20bb1a4570d2b5ba
 
 pkgname = openshadinglanguage

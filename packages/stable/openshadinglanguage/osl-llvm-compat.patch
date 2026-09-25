@@ -1,6 +1,6 @@
-diff -ruN /tmp/osl-orig/src/cmake/externalpackages.cmake /tmp/osl-new/src/cmake/externalpackages.cmake
+diff -ruN a/src/cmake/externalpackages.cmake b/src/cmake/externalpackages.cmake
 --- a/src/cmake/externalpackages.cmake	2026-04-02 14:12:59.000000000 +0800
-+++ b/src/cmake/externalpackages.cmake	2026-09-16 10:45:09.982598847 +0800
++++ b/src/cmake/externalpackages.cmake	2026-09-26 02:06:49.810522618 +0800
 @@ -58,7 +58,7 @@
  # LLVM library setup
  checked_find_package (LLVM REQUIRED
@@ -10,9 +10,9 @@ diff -ruN /tmp/osl-orig/src/cmake/externalpackages.cmake /tmp/osl-new/src/cmake/
                        PRINT LLVM_SYSTEM_LIBRARIES CLANG_LIBRARIES
                              LLVM_SHARED_MODE)
  # ensure include directory is added (in case of non-standard locations
-diff -ruN /tmp/osl-orig/src/liboslexec/llvm_passes.h /tmp/osl-new/src/liboslexec/llvm_passes.h
+diff -ruN a/src/liboslexec/llvm_passes.h b/src/liboslexec/llvm_passes.h
 --- a/src/liboslexec/llvm_passes.h	2026-04-02 14:12:59.000000000 +0800
-+++ b/src/liboslexec/llvm_passes.h	2026-09-16 10:49:04.551629907 +0800
++++ b/src/liboslexec/llvm_passes.h	2026-09-26 02:06:49.810738131 +0800
 @@ -380,7 +380,7 @@
  // New pass manager adapter
  template<int WidthT>
@@ -22,9 +22,9 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_passes.h /tmp/osl-new/src/liboslexec
            NewPreventBitMasksFromBeingLiveinsToBasicBlocks<WidthT>> {
      PreventBitMasksFromBeingLiveinsToBasicBlocks<WidthT> m_pass;
  
-diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec/llvm_util.cpp
+diff -ruN a/src/liboslexec/llvm_util.cpp b/src/liboslexec/llvm_util.cpp
 --- a/src/liboslexec/llvm_util.cpp	2026-04-02 14:12:59.000000000 +0800
-+++ b/src/liboslexec/llvm_util.cpp	2026-09-16 10:51:47.096669204 +0800
++++ b/src/liboslexec/llvm_util.cpp	2026-09-26 02:07:32.701824702 +0800
 @@ -78,7 +78,6 @@
  #include <llvm/Transforms/Scalar.h>
  #include <llvm/Transforms/Scalar/GVN.h>
@@ -33,7 +33,26 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec
  
  #include <llvm/Support/DynamicLibrary.h>
  
-@@ -1548,14 +1547,24 @@
+@@ -1536,8 +1535,18 @@
+     // faster). Since we call the option "jit_fma", we interpret that as
+     // switching between Strict and Standard. We will need some other control
+     // if we ever want full "Fast" mode.
++#if OSL_LLVM_VERSION < 240
++    // AllowFPOpFusion and the llvm::FPOpFusion mode enum were removed from
++    // TargetOptions in LLVM 24 (llvm/llvm-project PR #222683); FP contraction
++    // is now derived solely from the per-instruction 'contract' fast-math
++    // flag. OSL's IR never sets 'contract' and never emits llvm.fmuladd, so
++    // neither the Standard nor the Strict branch here ever contracted
++    // anything; simply dropping the assignment for LLVM 24+ preserves the
++    // existing behavior. (fp fusion is also constrained by the CPU feature
++    // selection in detect_cpu_features below.)
+     options.AllowFPOpFusion = jit_fma() ? llvm::FPOpFusion::Standard
+                                         : llvm::FPOpFusion::Strict;
++#endif
+     // Unfortunately enabling UnsafeFPMath allows reciprocals, which we don't want for divides
+     // To match results for existing unit tests we might need to disable UnsafeFPMath
+     // TODO: investigate if reciprocals can be disabled by other means.
+@@ -1548,22 +1557,44 @@
      // control is now handled via per-instruction fast-math flags in IR.
      options.UnsafeFPMath = false;
  #endif
@@ -57,10 +76,17 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec
 +#if OSL_LLVM_VERSION < 240
 +    options.NoTrappingFPMath = true;
 +#endif
++#if OSL_LLVM_VERSION < 240
++    // HonorSignDependentRoundingFPMathOption was removed from TargetOptions
++    // in LLVM 24 (llvm/llvm-project PR #222027); its documented meaning,
++    // honoring a dynamically-changeable rounding mode, is what strictfp
++    // expresses. OSL set it to false (which was LLVM's default) and its JIT
++    // code is not strictfp, so dropping the assignment preserves behavior.
      // We will NOT be changing rounding mode dynamically
      options.HonorSignDependentRoundingFPMathOption = false;
++#endif
  
-@@ -1563,7 +1572,12 @@
+     options.NoZerosInBSS          = false;
      options.GuaranteedTailCallOpt = false;
      options.FunctionSections      = true;
      options.UseInitArray          = false;
@@ -73,7 +99,20 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec
  #if OSL_LLVM_VERSION < 190
      options.RelaxELFRelocations = false;
  #endif
-@@ -1814,10 +1828,17 @@
+@@ -1805,7 +1836,12 @@
+     if (m_nvptx_target_machine == nullptr) {
+         llvm::Triple ModuleTriple(module()->getTargetTriple());
+         llvm::TargetOptions options;
++#if OSL_LLVM_VERSION < 240
++        // AllowFPOpFusion was removed from TargetOptions in LLVM 24; see
++        // make_jit_execengine above. Note this Standard assignment is
++        // overridden by the Fast assignment further below.
+         options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
++#endif
+         // N.B. 'Standard' only allow fusion of 'blessed' ops (currently just
+         // fmuladd). To truly disable FMA and never fuse FP-ops, we need to
+         // instead use llvm::FPOpFusion::Strict.
+@@ -1814,11 +1850,31 @@
          // control is now handled via per-instruction fast-math flags in IR.
          options.UnsafeFPMath = 1;
  #endif
@@ -83,15 +122,29 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec
          options.NoInfsFPMath                           = 1;
          options.NoNaNsFPMath                           = 1;
 +#endif
++#if OSL_LLVM_VERSION < 240
++        // Removed from TargetOptions in LLVM 24 (see make_jit_execengine).
          options.HonorSignDependentRoundingFPMathOption = 0;
++#endif
 +#if OSL_LLVM_VERSION < 240
 +        // Removed from TargetOptions in LLVM 24 (see make_jit_execengine).
          options.FloatABIType          = llvm::FloatABI::Default;
 +#endif
++#if OSL_LLVM_VERSION < 240
++        // Removed from TargetOptions in LLVM 24 (llvm/llvm-project PR #222683).
++        // This Fast mode was the effective value and allowed free fmul/fadd
++        // contraction; on LLVM 24+ contraction is driven solely by the
++        // per-instruction 'contract' fast-math flag, which OSL does not set,
++        // so NVPTX code generation simply emits uncontracted FP ops. This
++        // only affects the optional OptiX path (a perf change, not a
++        // correctness one); reproduce FMA contraction there by setting
++        // 'contract' on emitted fadd/fsub/fmul first.
          options.AllowFPOpFusion       = llvm::FPOpFusion::Fast;
++#endif
          options.NoZerosInBSS          = 0;
          options.GuaranteedTailCallOpt = 0;
-@@ -2315,7 +2336,7 @@
+         options.UseInitArray          = 0;
+@@ -2315,7 +2371,7 @@
              case 16: {
                  // MUST BE THE FINAL PASS!
                  m_new_pass_manager->module_pass_manager.addPass(
@@ -100,7 +153,7 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec
                          NewPreventBitMasksFromBeingLiveinsToBasicBlocks<16>(
                              context())));
                  break;
-@@ -2323,7 +2344,7 @@
+@@ -2323,7 +2379,7 @@
              case 8: {
                  // MUST BE THE FINAL PASS!
                  m_new_pass_manager->module_pass_manager.addPass(
@@ -109,7 +162,7 @@ diff -ruN /tmp/osl-orig/src/liboslexec/llvm_util.cpp /tmp/osl-new/src/liboslexec
                          NewPreventBitMasksFromBeingLiveinsToBasicBlocks<8>(
                              context())));
                  break;
-@@ -2331,7 +2352,7 @@
+@@ -2331,7 +2387,7 @@
              case 4:
                  // MUST BE THE FINAL PASS!
                  m_new_pass_manager->module_pass_manager.addPass(
