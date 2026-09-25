@@ -35,6 +35,29 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-25 (toolchain drift recipes) — post-10-Sep toolchain snapshots broke recipes independently of the llvm skew; fixes land one commit each
+
+Four recipes broke against newer host toolchain snapshots (cmake-git
+4.4.20260919, GCC 17.0.0 20260920) while the llvm/rust skew recovery was in
+flight. Each fix is its own commit; entries append here as they land.
+
+### fish 4.9.3 vs cmake-git 4.4: `install(SCRIPT CODE)` rejected
+
+- **Symptom**: configure stops at `cmake/Install.cmake:74` —
+  `SCRIPT: missing required value` (fish last built clean 15 Sep).
+- **Root cause**: `install(SCRIPT CODE "…")` is a deprecated loose form;
+  the cmake snapshot tightened argument parsing so SCRIPT consumes the CODE
+  keyword. The block only ever ran inline code (no script file).
+- **Fix**: `packages/stable/fish/cmake-install-code.patch` rewrites the call
+  to `install(CODE "…")` — the identical install-time hook, already used
+  unpatched at lines 99–100 of the same file; pkgrel bump.
+- **Validation**: patch applies `--fuzz=0` at the exact site against the real
+  4.9.3 tree; `bash -n`; `.SRCINFO` regenerated. Full build confirms at
+  configure and `cmake --install`.
+- **Rule**: a cmake *snapshot* tightens syntax before the stable release does;
+  when a recipe fails on a tightened legacy form, migrate the call to the
+  canonical form (do not pin an older cmake).
+
 ## 2026-09-25 (abi batch policy) — the run's own llvm-git install broke rustc after the preflight had passed; the builder now refuses llvm-without-rust and re-probes mid-run
 
 - **Symptom**: 20:50:26 — a running batch installed `llvm-git`
