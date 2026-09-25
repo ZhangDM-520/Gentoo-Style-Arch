@@ -37,6 +37,15 @@ batch. ROCm and stock-name replacement packages may require immediate
 installation before the next consumer starts. Verify the installed ABI,
 provides, and dependency closure rather than trusting version strings alone.
 
+For VCS (`-git`) pairs the drift is subtler: a consumer that fetches new
+upstream can start requiring a provider version that a `-s` skip kept stale
+(the skip compares archive mtime to the PKGBUILD, which does not change when
+upstream does). Rebuild such a pair together with `-i` and **without** `-s`
+(vulkan-headers-git → vulkan-icd-loader-git, 2026-09-25), and keep the
+consumer's versioned makedepends (`vulkan-headers>=1:<pkgver base>`) in step
+with the provider's versioned provide so a stale provider fails at the
+dependency check instead of inside the consumer's build.
+
 ## Documentation history
 
 `docs/MEMORY.md` is the compact operational contract. `docs/NOTE.md` is the

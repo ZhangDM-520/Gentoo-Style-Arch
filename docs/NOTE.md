@@ -144,6 +144,44 @@ dependency edges, and incident root causes are unaffected by the renames.
   rustc/ld.lld must disable `lto`: mold and bfd run GCC's LTO plugin,
   lld does not.
 
+## 2026-09-25 (vulkan pair) — a `-s` batch left vulkan-headers-git at 1.4.363 while the loader fetched v1.4.364 requiring it: "VulkanHeaders … not compatible"
+
+- **Symptom**: `vulkan-icd-loader-git: BUILD FAILED (rc=1, 0m02s)` in a wide
+  `-s -i` batch — `CMake Error at CMakeLists.txt:63 (find_package)`:
+  requested VulkanHeaders "1.4.364", while installed
+  `/usr/share/cmake/VulkanHeaders/VulkanHeadersConfig.cmake` reports 1.4.363.
+- **Root cause**: coupled VCS pair drift plus the `-s` blind spot. The
+  batch's `-s` build-skipped `vulkan-headers-git` (its 1.4.363 archive is
+  newer than its PKGBUILD) while `vulkan-icd-loader-git` fetched upstream
+  `v1.4.364`, whose `find_package(VulkanHeaders ${PROJECT_VERSION} CONFIG …)`
+  requires headers ≥ its own version. The skip predicate (archive mtime ≥
+  PKGBUILD mtime) is stale-by-construction for `-git` recipes: the PKGBUILD
+  does not change when upstream does. (The `already installed at 1.4.363 …
+  skipping their install` line in the headers log is the same-day `-i`
+  same-version check working as designed — it skipped a byte-identical
+  reinstall and is not the cause.)
+- **Fix**: rebuild the pair together with `-i` and without `-s`
+  (`fish build-all.fish -i vulkan-icd-loader-git` — bare-name dep expansion
+  builds and installs headers before the loader compiles, rule 11), plus
+  hardening: the loader's makedepends is now
+  `"vulkan-headers>=1:${pkgver%%.r*}"` (epoch 1 matches the headers recipe's
+  versioned provide; the base tracks each loader bump), so a stale provider
+  fails at "Checking buildtime dependencies" with an actionable message
+  instead of a cryptic CMake version error mid-build. A compatibility probe
+  pinned the gate semantics: "at least" (1.4.362 accepted against a 1.4.363
+  config, 1.4.364 rejected).
+- **Validation**: the red-capable loop
+  (`fish build-all.fish --no-deps vulkan-icd-loader-git` in the workspace
+  clone) reproduced the exact symptom before the fix and is green after;
+  `pacman -Q vulkan-headers-git vulkan-icd-loader-git` both ≥ 1.4.364; new
+  fixture `tests/vulkan-pair.sh` passes; `--audit`/`--list` and the full
+  battery green.
+- **Rule**: never resume a coupled VCS pair with `-s` when a consumer may
+  have moved upstream — rebuild provider and consumer together with `-i`
+  (docs/maintainer-guide.md "Updating coupled stacks"). When upstream
+  enforces a version requirement, version-pin the consumer's makedepends to
+  the provider and keep both sides' epochs in step.
+
 ## 2026-09-25 (install skip) — `-s -i` re-ran `pacman -U` for packages already installed at the built version; `-i` now checks, `-fi` forces
 
 - **Symptom**: the documented resume idiom `build-all.fish -s -i` skipped

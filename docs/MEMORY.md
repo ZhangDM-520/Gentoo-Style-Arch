@@ -678,6 +678,15 @@ recipe).
   Rust-side fat LTO in bootstrap.toml is unrelated and stays.
   `tests/rust-recipe.sh` pins the option in PKGBUILD and .SRCINFO.
 
+- **`-s` on a VCS recipe cannot see upstream movement** (2026-09-25,
+  vulkan-pair): the skip predicate is archive-mtime ≥ PKGBUILD-mtime, and a
+  PKGBUILD does not change when upstream does — a `-s -i` batch skipped
+  `vulkan-headers-git` at 1.4.363 while `vulkan-icd-loader-git` fetched
+  v1.4.364, whose CMake requires VulkanHeaders ≥ `${PROJECT_VERSION}`
+  ("not compatible with the version requested"). Rebuild coupled VCS pairs
+  together with `-i` and without `-s`; the loader now carries
+  `vulkan-headers>=1:${pkgver%%.r*}` so a stale provider fails at the
+  dependency check instead (fixture `tests/vulkan-pair.sh`).
 - **Self-consistent is not verified** (2026-09-20, audit): `sync_stable_version`
   bumps a `packages/stable` recipe to the repo's `pkgver`/`pkgrel` and
   deliberately does not refresh `sha256sums`, so `build_package` added
