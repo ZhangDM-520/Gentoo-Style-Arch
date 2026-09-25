@@ -37,6 +37,21 @@ batch. ROCm and stock-name replacement packages may require immediate
 installation before the next consumer starts. Verify the installed ABI,
 provides, and dependency closure rather than trusting version strings alone.
 
+The same trap appears when a recipe *becomes* a Rust consumer.
+`mold-git` was reworked into a cargo-based 3-phase Rust PGO build, which
+silently made it a system rustc/cargo consumer, while its
+`config/dependencies.conf` record stayed the deliberate no-edge `mold-git:` —
+a lone `package-id:` is valid syntax, and the scheduler trusts it blindly, so
+mold could dispatch before `rust-git` and died on an ABI-skewed `rustc` one
+llvm-snapshot bump later (`prepare()`'s `cargo fetch` hit the undefined
+`cl::ParseCommandLineOptions` symbol). A recipe that gains a `cargo`/`rustc`
+invocation in ANY phase (prepare/build/check/package) must gain a `rust-git`
+edge in the same change, and `fish build-all.fish --audit` now flags violations
+of that (toolchain lint). With the edge in place a bare `mold-git` selection
+chain-expands to **three** packages — `llvm-git`, `rust-git`, `mold-git` —
+because the pre-existing `rust-git:llvm-git` edge transitively pulls llvm-git
+in; the ordering guarantee that matters is rust-git before mold-git.
+
 For VCS (`-git`) pairs the drift is subtler: a consumer that fetches new
 upstream can start requiring a provider version that a `-s` skip kept stale
 (the skip compares archive mtime to the PKGBUILD, which does not change when

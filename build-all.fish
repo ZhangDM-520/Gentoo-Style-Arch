@@ -1877,6 +1877,45 @@ function audit_workspace
         end
     end
 
+    # Toolchain lint (2026-09-25 ABI-skew incident): a recipe that compiles
+    # with cargo/rustc only survives a coupled LLVM batch when rust-git
+    # rebuilds BEFORE it, so its dependencies.conf edge record must name
+    # rust-git explicitly. rust-git is the toolchain itself and cannot depend
+    # on its own output, so it is excepted. "Invokes" = any non-comment line
+    # (first non-blank character is not '#') naming cargo or rustc as a bare
+    # word; comment-only mentions are history, not toolchain use.
+    echo ""
+    echo "Toolchain (cargo/rustc) dependency edges:"
+    set -l toolchain_missing
+    for entry in $_PACKAGE_MAP
+        set -l fields (string split '|' -- "$entry")
+        set -l id $fields[1]
+        test "$id" = rust-git; and continue
+        set -l recipe "$SCRIPT_DIR/$fields[2]"
+        set -l toolchain_lines (grep -E '^[[:space:]]*[^#[:space:]]' "$recipe/PKGBUILD" 2>/dev/null \
+            | grep -Ec '(^|[^[:alnum:]_])(cargo|rustc)([^[:alnum:]_]|$)')
+        test -n "$toolchain_lines"; or set toolchain_lines 0
+        test "$toolchain_lines" -gt 0; or continue
+        set -l has_rust_edge 0
+        for dep_entry in $_DEPS
+            set -l dep_fields (string split ':' $dep_entry -m 2)
+            if test "$dep_fields[1]" = "$id"; and test (count $dep_fields) -ge 2
+                for dep in (string split ',' $dep_fields[2])
+                    test "$dep" = rust-git; and set has_rust_edge 1
+                end
+            end
+        end
+        test $has_rust_edge -eq 1; and continue
+        set -a toolchain_missing $id
+    end
+    if test (count $toolchain_missing) -eq 0
+        echo "  none"
+    else
+        for id in $toolchain_missing
+            echo "  toolchain: $id uses cargo/rustc but declares no rust-git edge"
+        end
+    end
+
     echo ""
     echo "Stale runtime/error artifacts:"
     set -l stale (find "$LOG_DIR" -maxdepth 1 -type f \
@@ -3879,6 +3918,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -l blocked 0
     set -l deferred
     set -l sudo_stopped 0
+    set -l probe_stopped 0
     # -i preflight: decide whether installs are possible BEFORE the first hour
     # of building is spent on packages that could never be installed. A prompt
     # belongs here — the human just started the run — so this is the one place
@@ -4053,6 +4093,31 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 if test $rc -eq 0
                     set -a succeeded $p
                     set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_OK completed $p"
+                    # Mid-run ABI-skew probe (2026-09-25 incident): the
+                    # preflight passed at run START, and this run's own
+                    # llvm install can break the system rustc after that.
+                    # Re-probe after a successful -i lane for llvm-git /
+                    # llvm-libs-git, BEFORE anything else dispatches. Failure
+                    # is a real ABI mismatch — even --allow-broken-rustc is
+                    # documented as "not a way past" one — so it takes the
+                    # stop-dispatch contract: stop starting lanes, drain the
+                    # in-flight ones, exit non-zero. Once, not per package.
+                    if test $install_flag -eq 1; and test $probe_stopped -eq 0
+                        if contains "$p" llvm-git llvm-libs-git
+                            if not check_rustc_sanity
+                                ui_error "rustc sanity probe failed after $p was installed — this run's own llvm install broke rustc"
+                                echo "  The selection must rebuild rust-git in the same pass before anything"
+                                echo "  else compiles with rustc — stopping dispatch, draining in-flight lanes."
+                                echo "  Recovery: rebuild rust-git in the same run (add rust-git to the selection"
+                                echo "  and resume with -s -i), or follow the check_rustc_sanity recovery text"
+                                echo "  above (downgrade-rebuild llvm-libs at the snapshot rust-git was built"
+                                echo "  against)."
+                                set probe_stopped 1
+                                set stop_starting 1
+                                set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR rustc probe failed after $p"
+                            end
+                        end
+                    end
                 else if test $rc -eq $_ANCHOR_DEFER_RC
                     # Anchoring refused and build_package parked the recipe:
                     # NOT a failed build. Dispatch keeps going; dependents of
@@ -4339,7 +4404,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     # A dispatch stopped by a lost sudo credential left packages unbuilt: that
     # must never be reported as "All builds succeeded!" (2026-09-17). Nor may
     # a run that parked a recipe — parked work needs the owner (2026-09-24).
-    if test (count $failed) -gt 0 -o "$blocked" -gt 0; or test "$sudo_stopped" -eq 1
+    if test (count $failed) -gt 0 -o "$blocked" -gt 0; or test "$sudo_stopped" -eq 1; or test "$probe_stopped" -eq 1
         return 1
     end
     if test (count $deferred) -gt 0
@@ -4383,8 +4448,9 @@ function usage
     echo "  -ccc, --nuclear   Remove pulled sources: src/pkg/build dirs, source git"
     echo "                    clones, and downloaded source tarballs (asks first)"
     echo "  --audit           Read-only report of legacy paths, package drift,"
-    echo "                    stale runtime/error artifacts, and installed PGO"
-    echo "                    packages still carrying -fprofile-generate or"
+    echo "                    stale runtime/error artifacts, cargo/rustc recipes"
+    echo "                    with no rust-git edge, and installed PGO packages"
+    echo "                    still carrying -fprofile-generate or"
     echo "                    -Cprofile-generate payloads"
     echo "  -ln, --link-sources"
     echo "                    Dedup git source clones: symlink twins to one"
@@ -5000,6 +5066,26 @@ function main
     if test (count $sorted) -eq 0
         ui_error "selection resolved to no packages"
         return 1
+    end
+
+    # ABI-batch refusal (2026-09-25 incident): an llvm-git install changes the
+    # LLVM C++ ABI, and every consumer of that ABI — rust-git first — is stale
+    # the moment the archive lands (the installed rustc breaks on any input).
+    # A REAL build must therefore carry rust-git in the same selection;
+    # -n/-l are read-only and build nothing, so they are exempt.
+    if test $dry_run -eq 0; and test $list_flag -eq 0
+        if contains llvm-git $sorted; and not contains rust-git $sorted
+            if pacman -Q rust-git >/dev/null 2>&1
+                ui_error "refusing to build llvm-git without rust-git — llvm-git changes the LLVM C++ ABI"
+                echo "  Every consumer — rust-git first — must rebuild in the same selection:"
+                echo "  installing a new llvm-git beside the installed rust-git breaks rustc"
+                echo "  the moment the archive lands (LLVM snapshots have no stable C++ ABI)."
+                echo "  Recovery: rebuild rust-git in the same run (add rust-git to the selection);"
+                echo "  if rustc is already broken, follow the check_rustc_sanity recovery text"
+                echo "  (downgrade-rebuild llvm-libs at the snapshot rust-git was built against)."
+                return 1
+            end
+        end
     end
 
     # List — read-only, and deliberately AFTER the range filter: the printed

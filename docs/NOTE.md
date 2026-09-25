@@ -35,6 +35,125 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-25 (abi batch policy) — the run's own llvm-git install broke rustc after the preflight had passed; the builder now refuses llvm-without-rust and re-probes mid-run
+
+- **Symptom**: 20:50:26 — a running batch installed `llvm-git`
+  24.0.0_r598996.57e112ccb2a5 and the system `rustc` broke instantly
+  (`librustc_driver-….so: undefined symbol:
+  llvm::cl::ParseCommandLineOptions…, version LLVM_24.0`). 3 s later a
+  `mold-git` build died in `prepare()`
+  (`cargo fetch --locked --target "$(rustc -vV …)"`) with
+  `rustc: symbol lookup error: … version LLVM_24.0`; `rustc -vV` → rc=127.
+  The `check_rustc_sanity` preflight had passed at 19:31 and never ran again;
+  separately, `mold-git` (a cargo recipe) was dispatched before `rust-git`
+  because its `dependencies.conf` record was the deliberate no-edge
+  `mold-git:`.
+- **Root cause — hypotheses** (diagnosing-bugs record):
+  - **H1 (primary, winning — mechanism confirmed)**: the llvm-git snapshot
+    bump left rust-git ABI-skewed. LLVM trunk changed the
+    `cl::ParseCommandLineOptions` overload (trailing `bool` param dropped)
+    while keeping the `LLVM_24.0` version node — pure C++ ABI churn.
+    `objdump -T`: `librustc_driver` needs `…vfs10FileSystemES2_b`; the new
+    `libLLVM` exports `…vfs10FileSystemES2_`. rust-git (installed 16:46,
+    built against the previous snapshot) was not rebuilt in the batch.
+  - **H2 (secondary, confirmed)**: the `mold-git:` record (line 45 of
+    `config/dependencies.conf` at diagnosis time; now `mold-git:rust-git`) is
+    a deliberate no-edge record, but the reworked cargo-based mold-git recipe
+    invokes system rustc/cargo in prepare()/build(). **The scheduler resolved
+    the chain exactly as declared — the declaration was wrong.** Dry-run
+    evidence at diagnosis time:
+    `-n --no-deps mold-git rust-git` ordered mold first; `-n mold-git`
+    expanded to 1 (empty declared chain).
+  - **H3 (confirmed, timing gap)**: `check_rustc_sanity` (a real
+    rustc-compile preflight) runs once per run before dispatch and
+    legitimately passed at ~19:31 — the run's own llvm install at 20:50:26
+    created the skew mid-run, invisible to the preflight.
+  - **H4 (falsified)**: partial llvm install / broken local db — `pacman -Qk
+    llvm-git` clean (5301 files, 0 missing).
+  - **H5 (falsified)**: library shadowing — `ldd /usr/bin/rustc` resolves
+    `libLLVM.so.24.0` from `/usr/lib`.
+  Net: the rustc sanity probe ran only as a start-of-run preflight, so the
+  run's own llvm install created the ABI skew *after* the last possible probe
+  (H1+H3); and nothing enforced that a recipe compiling with cargo/rustc
+  carries a `rust-git` edge (H2), or that a selection moving the LLVM ABI
+  rebuilds rust-git in the same batch.
+- **Fix** (two halves):
+  (a) dependency graph — 5 new `rust-git` edges: `mold-git:rust-git`,
+  `xwayland-satellite-git:rust-git`, `linux-cachyos:rust-git`,
+  `zen-browser-pgo:rust-git`, `bettbox:rust-git`, each verified against the
+  recipe's actual cargo/rustc usage (linux-cachyos via `CONFIG_RUST=y`
+  in-tree kbuild Rust, bettbox via `fvm flutter build linux` → cargokit
+  `cargo`); pre-existing edges verified for niri-spicy-git, scx-scheds-git,
+  scx-tools-git, fish, zram-generator, rust-bindgen-git; deliberately NO edge
+  for mesa-git (Rust only in non-default `MESA_WHICH_LLVM` cases — the
+  default build compiles none).
+  (b) three builder policies in `build-all.fish` (contract items 1–3):
+  (1) `--audit` toolchain lint — every mapped recipe whose PKGBUILD invokes
+  `cargo`/`rustc` (rust-git excepted) must name `rust-git` in its edge record,
+  or the audit reports `toolchain: <id> uses cargo/rustc but declares no
+  rust-git edge`; (2) ABI-batch refusal in `main` — a real build (`dry_run=0`,
+  `list_flag=0`) whose selection contains `llvm-git` but not `rust-git` is
+  refused while `rust-git` is installed, with recovery text pointing at the
+  same-pass rebuild; (3) `run_lanes` re-runs `check_rustc_sanity` after a
+  successful `-i` lane for `llvm-git`/`llvm-libs-git`, before anything else
+  dispatches — on failure it takes the existing stop-dispatch contract (stop
+  starting lanes, drain in-flight ones, exit non-zero). `--allow-broken-rustc`
+  deliberately does NOT cover the mid-run probe: it is documented as "not a
+  way past a real ABI mismatch", and a probe failure after this run's own
+  llvm install is exactly that. (The `mold-git:rust-git` edge itself is (a)
+  above.)
+- **Validation**: new `tests/abi-batch-policy.sh` (four sections: audit lint
+  fires for a cargo recipe without the edge, stays silent with it / for
+  comments / for rust-git itself; llvm-without-rust refusal while `-n`/`-l`
+  stay green and llvm+rust is not over-refused; dispatcher probe stops before
+  the next package with the probe message; `mold-git:rust-git` declared and
+  ordering a mold-git selection). Fixture red before, green after, and every
+  seam falsified by mutation (lint off → A fails, refusal off → B fails, probe
+  off → C fails). `bash -n tests/abi-batch-policy.sh`,
+  `fish -n build-all.fish`; `--audit` rc=0 with `toolchain: none`; `--list`;
+  `--dry-run` clean for git(58)/stable(29)/core(41); full battery
+  `bash tests/run-all.sh` 35/36 — the ONLY failure is
+  `srcinfo-freshness.sh` on `packages/core/mold-git`, a pre-existing stale
+  `.SRCINFO` from the concurrent commit ef03218, not this fix. Post-fix
+  `-n mold-git` (bare name, dep expansion) expands to **3** — `llvm-git`,
+  `rust-git`, `mold-git` — because the pre-existing `rust-git:llvm-git` edge
+  transitively pulls llvm-git in (correct per the documented bare-name
+  semantics); the ordering guarantee that matters is rust-git before
+  mold-git. Host `rustc` was found still broken at implementation time — the
+  incident's recovery had not yet run.
+- **host recovery**: recovery rebuild finished clean. `rustc -vV` rc=0 —
+  `rustc 1.100.0-nightly (2c1a66d7d 2026-09-25)`; `rust-git
+  1:1.100.0.r341518.g2c1a66d` rebuilt via stage0 bootstrap (39m24s,
+  `--allow-broken-rustc` used only for that self-rebuild); `ldd -r
+  /usr/lib/librustc_driver-*.so` → 0 undefined. Workspace loop
+  `fish build-all.fish --no-deps mold-git`: `✓ mold-git (6m59s)` →
+  `All builds succeeded!` (mold-git 2.42.1.r468.g6fc6e191). Tier-2
+  rebuilt+installed 11/15 — mold-git, niri-spicy-git, scx-scheds-git,
+  scx-tools-git, zram-generator, rust-bindgen-git, mesa-git, libclc-git,
+  spirv-llvm-translator-git (4→0 undefined) — llvm-git kept as ABI base;
+  runtime skew cleared except autofdo. Four recipe-level blockers remain,
+  NOT skew but post-10-Sep toolchain snapshot drift — two toolchain
+  snapshots broke recipes independent of the LLVM skew: (1) fish 4.9.3 vs
+  cmake-git 4.4.20260919 `install(SCRIPT CODE)` → "SCRIPT: missing required
+  value"; (2) xwayland-satellite-git upstream main moved add2795→63cdf17,
+  `0001-round-half-up.patch` conflicts; (3) openshadinglanguage 1.15.3.0:
+  `llvm::FPOpFusion`/`AllowFPOpFusion`/`HonorSignDependentRoundingFPMathOption`
+  removed in the llvm-git 24 snapshot; (4) autofdo-git: GCC 17.0.0 20260920
+  ICE `verify_ctor_sanity` — still 138 undefined in `create_llvm_prof`, the
+  one hard-broken runtime consumer. Tracked and fixed separately (recipe
+  fixes land as their own commits). Deferred provenance rebuilds
+  (runtime-clean, optional): zen-browser-pgo, bettbox, linux-cachyos
+  (rust-enabled kernel).
+- **Durable rule**: a probe that runs only at run start cannot see a skew the
+  run itself installs — re-probe the toolchain after any lane that installs
+  llvm-git/llvm-libs-git, before dispatching more work. A selection that moves
+  the LLVM C++ ABI must rebuild rust-git in the same batch, and every
+  cargo/rustc recipe declares its `rust-git` edge explicitly — in ANY phase
+  (prepare/build/check/package), in the same change that introduces the
+  invocation. A bare `package-id:` no-edge record is valid syntax the
+  scheduler trusts blindly: re-verify it against the recipe's real toolchain
+  usage, not its history.
+
 ## 2026-09-25 (stale DESTDIR) — rebuild #2 died 21 minutes in: the failed run #1 poisoned the next install
 
 - **Symptom**: rebuild #2 (rust-src step fixed) compiled cleanly, then

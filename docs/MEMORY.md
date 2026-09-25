@@ -129,7 +129,13 @@
     the broken rustc). Recovery when it happens: downgrade-rebuild llvm-libs
     at the rust-compatible snapshot (old version from /var/log/pacman.log,
     pin `#commit=` in PKGBUILD source, unpin after install — BPF target is
-    build config, survives the snapshot change).
+    build config, survives the snapshot change). Enforced by the builder since
+    2026-09-25: `--audit` lints every cargo/rustc recipe for a `rust-git` edge
+    in its `dependencies.conf` record; a real build whose selection contains
+    llvm-git but not rust-git is refused while rust-git is installed; and an
+    `-i` run re-runs `check_rustc_sanity` right after its own
+    llvm-git/llvm-libs-git install and stops dispatch on failure (the
+    `--allow-broken-rustc` escape hatch does not cover that mid-run probe).
 14. **Qt -git private-API coupling** (2026-09-08 incident): a Qt module that
     regenerates generated headers breaks consumers built against the OLD
     headers. qtlanguageserver r650 renamed `TextDocumentContentChangeEvent
@@ -294,7 +300,8 @@ nothing can restore it. A system pacman database lock is never deleted
 automatically.
 
 `--no-deps` is a deliberate leaf rebuild. `--audit` checks active topology and
-runtime drift. `--link-sources` deduplicates compatible VCS mirrors without
+runtime drift, including cargo/rustc recipes that declare no `rust-git` edge.
+`--link-sources` deduplicates compatible VCS mirrors without
 publishing them. `--nuclear` removes fetched sources only after an explicit
 confirmation and preserves recipe-local inputs.
 
@@ -638,6 +645,25 @@ targets); the stale `gcc-*-snapshot` language splits (only fortran, libs and
 recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
+
+- **A run can create the skew its own preflight just cleared** (2026-09-25,
+  llvm/rust ABI skew): `check_rustc_sanity` passed at 19:31; the run's own
+  `llvm-git` install at 20:50:26 broke system rustc 3 s later — LLVM trunk
+  dropped the trailing `bool` of `cl::ParseCommandLineOptions` while keeping
+  the `LLVM_24.0` version node, so `librustc_driver` needed
+  `…vfs10FileSystemES2_b` and the new `libLLVM` exported `…vfs10FileSystemES2_`
+  (rust-git, built against the previous snapshot, was not in the batch). A run
+  whose selection installs llvm-git MUST rebuild rust-git in the same
+  selection — a start-of-run probe cannot see a skew the run itself creates
+  mid-run (enforcement in rule 13). Companion rule: every recipe invoking
+  `cargo`/`rustc` in ANY phase needs a `rust-git` edge in its
+  `config/dependencies.conf` record — `mold-git`'s deliberate no-edge record
+  `mold-git:` was valid syntax but a wrong declaration once its cargo-based
+  Rust-PGO rework made it a system rustc consumer, so the scheduler dispatched
+  mold before rust-git exactly as declared and mold died on the skewed `rustc`
+  one llvm-snapshot bump later. `--audit`'s toolchain lint now flags
+  violations; re-verify a `pkg:` no-edge record against the recipe's real
+  toolchain usage, not its history.
 
 - **DESTDIR survives a failed build(); the next install won't forgive it**
   (2026-09-25, rust-src chain): makepkg wipes `$pkgdir` before
