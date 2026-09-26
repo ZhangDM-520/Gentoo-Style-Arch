@@ -1838,6 +1838,186 @@ function nuclear_cleanup
     ui_success "Nuclear cleanup complete."
 end
 
+# ─── Workspace audit lints (recipe contract) ─────────────────────────────────
+# One implementation per rule, two consumers: audit_workspace renders these
+# into --audit's report and the hidden --audit-lint seam (bottom of this file)
+# runs one of them against the loaded workspace. tests/recipe-contract.sh is
+# the gating walker. All three lints are REPORT-ONLY everywhere: a finding
+# never changes an exit status. Inputs are the committed .SRCINFO files — the
+# same metadata install/depends decisions read — PKGBUILD is never evaluated.
+#
+# Rules (docs/MEMORY.md provides discipline + purged tools + IgnorePkg closure):
+#   provides   a VERSIONED name-provide wherever some workspace consumer
+#              constrains that name (an unversioned provide cannot satisfy
+#              `>=N`, so pacman silently falls back to the repo package — the
+#              meson incident class), and BARE soname stems (`libfoo.so`,
+#              never `libfoo.so=2-64`: makepkg auto-versions a bare stem from
+#              the built ELF, a hand-pinned one only rots).
+#   purged     host-purged tools must not re-enter through makedepends/
+#              checkdepends (makepkg reinstalls them silently).
+#   ignorepkg  every workspace pkgbase/pkgname must sit in the host's
+#              IgnorePkg closure, read the way pacman reads /etc/pacman.conf:
+#              repeated IgnorePkg lines inside [options] ACCUMULATE, and a
+#              line inside a repo section — or before any section — is
+#              dropped. An [options] Include cannot be followed here, so it
+#              is reported instead of silently under-counting the closure.
+
+# Bare soname stem for a provide NAME ('libfoo.so' or 'libfoo.so.1.2' →
+# 'libfoo.so'); prints nothing when the name is not soname-shaped.
+function _lint_soname_stem -a name
+    if string match -qr '^(.+)\.so$' -- "$name"
+        printf '%s\n' "$name"
+        return 0
+    end
+    set -l m (string match -r -g '^(.+)\.so\..+$' -- "$name")
+    if test (count $m) -ge 1
+        printf '%s.so\n' $m[1]
+    end
+    return 0
+end
+
+function audit_lint_provides
+    set -l constraints # name|op|ver|consumer — every versioned dep in the set
+    set -l entries # id|provide-value — every provide in the set
+    for entry in $_PACKAGE_MAP
+        set -l fields (string split '|' -- "$entry")
+        set -l id $fields[1]
+        set -l srcinfo "$SCRIPT_DIR/$fields[2]/.SRCINFO"
+        test -f "$srcinfo"; or continue
+        for field in depends makedepends optdepends checkdepends
+            for value in (sed -n "s/^[[:space:]]*$field = //p" "$srcinfo" 2>/dev/null)
+                # optdepends carry a `: description` suffix; names never do.
+                set -l v (string split -m1 ':' -- "$value")[1]
+                set -l m (string match -r -g '^(.+?)(>=|<=|=|>|<)(.+)$' -- (string trim -- $v))
+                test (count $m) -ge 3; or continue
+                set -a constraints "$m[1]|$m[2]|$m[3]|$id"
+            end
+        end
+        for value in (sed -n 's/^[[:space:]]*provides = //p' "$srcinfo" 2>/dev/null)
+            set -a entries "$id|$value"
+        end
+    end
+
+    set -l findings
+    for entry in $entries
+        set -l parts (string split -m 1 '|' -- $entry)
+        set -l id $parts[1]
+        set -l value $parts[2]
+        set -l pp (string split -m 1 '=' -- $value)
+        set -l name $pp[1]
+        set -l ver ''
+        test (count $pp) -ge 2; and set ver $pp[2]
+        test -n "$name"; or continue
+        set -l stem (_lint_soname_stem "$name")
+        if set -q stem[1]
+            if string match -q '*.so.*' -- "$name"
+                set -a findings "provides: $id: soname provide '$value' names a versioned soname — declare the bare stem '$stem'"
+            else if test -n "$ver"
+                set -a findings "provides: $id: soname provide '$value' is hand-versioned — declare the bare stem '$name' and let makepkg auto-version it from the built ELF"
+            end
+            continue
+        end
+        # A versioned name-provide satisfies its own version; only an
+        # UNVERSIONED provide falls back to the repo package.
+        test -z "$ver"; or continue
+        for c in $constraints
+            set -l cp (string split '|' -- $c)
+            test "$cp[1]" = "$name"; or continue
+            set -a findings "provides: $id: unversioned provide '$name' cannot satisfy '$name$cp[2]$cp[3]' (required by $cp[4]) — version it as provides=('$name=\${pkgver}')"
+        end
+    end
+    if test (count $findings) -gt 0
+        printf '%s\n' $findings | sort -u
+    end
+    return 0
+end
+
+function audit_lint_purged
+    # The purged set docs/MEMORY.md rule 8 keeps out of build-time fields.
+    set -l denylist po4a python-sphinx python-myst-parser lvm2 libblockdev-lvm systemd-tests cuda gcc15
+    set -l findings
+    for entry in $_PACKAGE_MAP
+        set -l fields (string split '|' -- "$entry")
+        set -l id $fields[1]
+        set -l srcinfo "$SCRIPT_DIR/$fields[2]/.SRCINFO"
+        test -f "$srcinfo"; or continue
+        for field in makedepends checkdepends
+            for value in (sed -n "s/^[[:space:]]*$field = //p" "$srcinfo" 2>/dev/null)
+                set -l v (string split -m1 ':' -- "$value")[1]
+                set -l m (string match -r -g '^(.+?)(>=|<=|=|>|<)(.+)$' -- (string trim -- $v))
+                set -l name $v
+                test (count $m) -ge 3; and set name $m[1]
+                if contains -- "$name" $denylist
+                    set -a findings "purged: $id: $field reintroduces purged tool '$name' — remove it (docs/MEMORY.md rule 8)"
+                end
+            end
+        end
+    end
+    if test (count $findings) -gt 0
+        printf '%s\n' $findings | sort -u
+    end
+    return 0
+end
+
+function audit_lint_ignorepkg -a conf
+    test -n "$conf"; or set conf /etc/pacman.conf
+    # Names under test: the documented closure is pkgbase+pkgname from every
+    # committed .SRCINFO (docs/MEMORY.md rule 9's verification procedure).
+    set -l names
+    for entry in $_PACKAGE_MAP
+        set -l fields (string split '|' -- "$entry")
+        set -l srcinfo "$SCRIPT_DIR/$fields[2]/.SRCINFO"
+        test -f "$srcinfo"; or continue
+        for name in (sed -n 's/^\(pkgbase\|pkgname\) = //p' "$srcinfo" 2>/dev/null)
+            set -a names "$name"
+        end
+    end
+    if test (count $names) -gt 0
+        set names (printf '%s\n' $names | sort -u)
+    end
+
+    if not test -r "$conf"
+        echo "ignorepkg: skipped — $conf is not readable"
+        return 0
+    end
+    # pacman.conf semantics: directives count only inside their section, so
+    # the section tracker starts OUTSIDE [options] — a line before any section
+    # header belongs to no section and is dropped, exactly like a repo
+    # section's IgnorePkg line.
+    set -l ignored
+    set -l findings
+    set -l in_options 0
+    for raw in (cat "$conf")
+        set -l line (string trim -- (string split -m1 '#' -- "$raw")[1])
+        test -n "$line"; or continue
+        if string match -qr '^\[.+\]$' -- "$line"
+            set -l sec (string replace -r '^\[(.+)\]$' '$1' -- "$line")
+            if test (string trim -- "$sec") = options
+                set in_options 1
+            else
+                set in_options 0
+            end
+            continue
+        end
+        test $in_options -eq 1; or continue
+        if string match -qr '^Include[[:space:]]*=' -- "$line"
+            set -a findings "ignorepkg: $conf: [options] Include is not followed — inline its IgnorePkg entries into the file"
+            continue
+        end
+        set -l m (string match -r -g '^IgnorePkg[[:space:]]*=[[:space:]]*(.*)$' -- "$line")
+        test (count $m) -ge 1; or continue
+        set -a ignored (string split -n ' ' -- (string replace -a \t ' ' -- $m[1]))
+    end
+    for name in $names
+        contains -- "$name" $ignored; and continue
+        set -a findings "ignorepkg: $name is not in the IgnorePkg closure of $conf"
+    end
+    if test (count $findings) -gt 0
+        printf '%s\n' $findings | sort -u
+    end
+    return 0
+end
+
 # ─── Workspace audit (--audit) ───────────────────────────────────────────────
 # Read-only inventory of migration drift. Historical NOTE.md entries and large
 # source/build trees are reported separately from active control-file findings.
@@ -1971,6 +2151,42 @@ function audit_workspace
     else
         for id in $toolchain_missing
             echo "  toolchain: $id uses cargo/rustc but declares no rust-git edge"
+        end
+    end
+
+    # Recipe-contract lints (one implementation per rule — the functions above;
+    # the hidden --audit-lint seam runs them individually). Report-only here:
+    # findings never changed this audit's exit status and must not start now.
+    echo ""
+    echo "Provides versioning:"
+    set -l provides_findings (audit_lint_provides)
+    if test (count $provides_findings) -eq 0
+        echo "  none"
+    else
+        for finding in $provides_findings
+            echo "  $finding"
+        end
+    end
+
+    echo ""
+    echo "Purged tools:"
+    set -l purged_findings (audit_lint_purged)
+    if test (count $purged_findings) -eq 0
+        echo "  none"
+    else
+        for finding in $purged_findings
+            echo "  $finding"
+        end
+    end
+
+    echo ""
+    echo "IgnorePkg closure:"
+    set -l ignorepkg_findings (audit_lint_ignorepkg '')
+    if test (count $ignorepkg_findings) -eq 0
+        echo "  none"
+    else
+        for finding in $ignorepkg_findings
+            echo "  $finding"
         end
     end
 
@@ -6223,6 +6439,53 @@ if test (count $argv) -gt 0; and test "$argv[1]" = --install-decide
     end
     install_plan "$argv[2]" $argv[3..-1]
     exit $status
+end
+
+# Hidden fixture seam (same precedent as --stale-lock-check/--local-db-check):
+# run ONE workspace-audit lint against the loaded workspace — no build, no
+# network, no host state beyond the pacman.conf the caller names.
+#   fish build-all.fish --audit-lint <provides|purged|ignorepkg> [pacman-conf]
+# Output: one finding line per finding (prefix `provides: `/`purged: `/
+# `ignorepkg: `) followed by `audit-lint <name>: clean`, `audit-lint <name>:
+# N finding(s)` or `audit-lint ignorepkg: skipped`. rc 0 = the lint RAN — a
+# finding never changes the exit status (report-only, the same contract
+# --audit has) — 2 = usage. No GSA_* test knob.
+if test (count $argv) -gt 0; and test "$argv[1]" = --audit-lint
+    if test (count $argv) -lt 2; or test (count $argv) -gt 3
+        echo "Error: --audit-lint expects <provides|purged|ignorepkg> and an optional pacman.conf path" >&2
+        exit 2
+    end
+    switch $argv[2]
+        case provides purged
+            if test (count $argv) -ne 2
+                echo "Error: --audit-lint $argv[2] takes no pacman.conf path" >&2
+                exit 2
+            end
+        case ignorepkg
+        case '*'
+            echo "Error: --audit-lint expects provides, purged or ignorepkg" >&2
+            exit 2
+    end
+    set -l lint_findings
+    switch $argv[2]
+        case provides
+            set lint_findings (audit_lint_provides)
+        case purged
+            set lint_findings (audit_lint_purged)
+        case ignorepkg
+            set lint_findings (audit_lint_ignorepkg "$argv[3]")
+    end
+    for finding in $lint_findings
+        echo "$finding"
+    end
+    if test "$argv[2]" = ignorepkg; and test (count $lint_findings) -eq 1; and string match -q 'ignorepkg: skipped*' -- $lint_findings[1]
+        echo "audit-lint ignorepkg: skipped"
+    else if test (count $lint_findings) -eq 0
+        echo "audit-lint $argv[2]: clean"
+    else
+        echo "audit-lint $argv[2]: "(count $lint_findings)" finding(s)"
+    end
+    exit 0
 end
 
 main $argv

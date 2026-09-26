@@ -65,6 +65,13 @@ if ((${#fixtures[@]})) && [[ -n $filter ]]; then
         grep -F -e "$filter" || true)
 fi
 
+# A filter that matches nothing is a typo, not an empty battery: exiting 0
+# with `PASS (0 fixture(s))` would let a mistyped filter silently pass.
+if [[ -n $filter && ${#fixtures[@]} -eq 0 ]]; then
+    printf 'run-all.sh: fixture filter "%s" matched no fixtures — typo?\n' "$filter" >&2
+    exit 2
+fi
+
 if ((${#fixtures[@]} == 0)); then
     printf 'fixture battery: PASS (0 fixture(s))\n'
     exit 0
