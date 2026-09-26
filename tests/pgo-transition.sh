@@ -67,16 +67,18 @@ case "${1:-}" in
         mkdir -p build/meson-private
         : >build/meson-private/sanity_check_for_c.exe
         chmod +x build/meson-private/sanity_check_for_c.exe
+        grep -E '^c_args=' "$cache" >>build/compile.log
         exit 0
         ;;
     test)
         mkdir -p build
-        for profile in $(seq 1 120); do
+        for profile in $(seq 1 "${PGO_FIXTURE_GCDA_COUNT:-120}"); do
             : >"build/profile-$profile.gcda"
         done
         exit 0
         ;;
     configure)
+        printf '%s\n' "$*" >>build/configure.log
         exit 0
         ;;
     setup)
@@ -97,15 +99,26 @@ case "${1:-}" in
                 printf 'cached profile-generate flag survived final reconfigure\n' >&2
                 exit 1
             fi
-            if ! grep -Eq '^c_args=.*-fprofile-use=' "$cache" ||
-                ! grep -Eq '^cpp_args=.*-fprofile-use=' "$cache"; then
-                printf 'final reconfigure did not enable profile-use\n' >&2
-                exit 1
-            fi
-            if ! grep -Eq '^c_args=.*-Wno-error=missing-profile' "$cache" ||
-                ! grep -Eq '^cpp_args=.*-Wno-error=missing-profile' "$cache"; then
-                printf 'final reconfigure did not exempt missing-profile probes\n' >&2
-                exit 1
+            if grep -Eq '^c_args=.*-fprofile-use=' "$cache"; then
+                # Profile path: both languages carry the profile, with the
+                # probe exemption that keeps feature detection honest.
+                if ! grep -Eq '^cpp_args=.*-fprofile-use=' "$cache" ||
+                    ! grep -Eq '^c_args=.*-Wno-error=missing-profile' "$cache" ||
+                    ! grep -Eq '^cpp_args=.*-Wno-error=missing-profile' "$cache"; then
+                    printf 'final reconfigure did not enable the full profile-use flag set\n' >&2
+                    exit 1
+                fi
+                : >build/mode-profile
+            else
+                # Fallback path: a thin training run must land on a clean,
+                # non-instrumented configuration — no generate flag may come
+                # back, and no profile-use may appear either.
+                if grep -E '^(c_args|cpp_args|c_link_args|cpp_link_args)=' "$cache" |
+                    grep -Eq -- '-fprofile-(generate|use)'; then
+                    printf 'fallback reconfigure left profile flags in the cache\n' >&2
+                    exit 1
+                fi
+                : >build/mode-fallback
             fi
         fi
         exit 0
@@ -136,86 +149,142 @@ exec /usr/bin/readelf "$@"
 EOF
 chmod +x "$fixture/bin/readelf"
 
-cat >"$fixture/run-build.sh" <<EOF
+cat >"$fixture/run-build.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$fixture"
-package_id="$package_id"
 export CARCH="${CARCH:-x86_64}"
 warning() { :; }
 msg() { :; }
 error() {
-    printf '%s\n' "\$*" >&2
+    printf '%s\n' "$*" >&2
     return 1
 }
+# makepkg shim: $startdir is the recipe directory before the PKGBUILD is
+# sourced — this is how the real builder resolves `source "$startdir/…"`.
+startdir="$root/$recipe_path"
 source "$root/$recipe_path/PKGBUILD"
+
+rm -rf build pkg
 build
-pkgdir="\$PWD/pkg"
-mkdir -p "\$pkgdir/usr/lib"
+
+pkgdir="$PWD/pkg"
+mkdir -p "$pkgdir/usr/lib"
 # A clean payload may still *mention* a .gcda path in shipped text: the
 # predicate matches a standalone absolute path, so prose must not fail it.
 printf 'coverage notes: rebuild /tmp/x/src/A.dir/b.cxx.gcda\n' \
-    >"\$pkgdir/usr/lib/\$package_id.so"
-verify_no_profile_instrumentation "\$pkgdir"
+    >"$pkgdir/usr/lib/$package_id.so"
+verify_no_profile_instrumentation "$pkgdir"
 
 # Two shapes of leak, so both detectors stay load-bearing:
 #  - symbols: what readelf finds, and only before makepkg strips
-#  - paths:   what survives stripping, so only the .gcda predicate sees it
-mkdir -p "\$PWD/instrumented-symbols" "\$PWD/instrumented-paths"
-: >"\$PWD/instrumented-symbols/\$package_id.so"
+#  - paths:   what survives stripping, so only the path predicate sees it
+mkdir -p "$PWD/instrumented-symbols" "$PWD/instrumented-paths"
+: >"$PWD/instrumented-symbols/$package_id.so"
 printf 'code\0/home/someone/build/pgo-fixture/%s/src/A.dir/b.cxx.gcda\0code\n' \
-    "\$package_id" >"\$PWD/instrumented-paths/\$package_id.so"
+    "$package_id" >"$PWD/instrumented-paths/$package_id.so"
 
-if verify_no_profile_instrumentation "\$PWD/instrumented-symbols" 2>/dev/null; then
+# The shared gate (lib/pgo.sh, sourced through the PKGBUILD) is fatal by
+# design — it calls `exit 1` — so the negative cases run it in subshells and
+# assert the subshell's exit status.
+if ( verify_no_profile_instrumentation "$PWD/instrumented-symbols" ) 2>/dev/null; then
     printf 'instrumented package fixture unexpectedly passed (coverage symbols)\n' >&2
     exit 1
 fi
-if verify_no_profile_instrumentation "\$PWD/instrumented-paths" 2>/dev/null; then
+if ( verify_no_profile_instrumentation "$PWD/instrumented-paths" ) 2>/dev/null; then
     printf 'instrumented package fixture unexpectedly passed (.gcda paths)\n' >&2
     exit 1
 fi
+
+# The transition itself: phase 1 compiles instrumented; the final compile
+# must be the one the threshold branch selected.
+first_compile=$(head -n1 build/compile.log)
+last_compile=$(tail -n1 build/compile.log)
+case "${PGO_FIXTURE_EXPECT:?}" in
+    profile)
+        test -f build/mode-profile || {
+            printf 'profile branch: no profile-use reconfigure happened\n' >&2
+            exit 1
+        }
+        case "$last_compile" in
+            *-fprofile-use*) ;;
+            *)
+                printf 'profile branch: final compile is not profile-use: %s\n' \
+                    "$last_compile" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    fallback)
+        test -f build/mode-fallback || {
+            printf 'fallback branch: no clean reconfigure happened\n' >&2
+            exit 1
+        }
+        case "$first_compile" in
+            *-fprofile-generate*) ;;
+            *)
+                printf 'fallback branch: phase-1 compile was not instrumented: %s\n' \
+                    "$first_compile" >&2
+                exit 1
+                ;;
+        esac
+        # The below-threshold branch must compile a FINAL NON-INSTRUMENTED
+        # build — the 2026-09-16 bug class half-reconfigured and compiled a
+        # still-instrumented payload.
+        case "$last_compile" in
+            *-fprofile-*)
+                printf 'fallback branch: final compile still carries profile flags: %s\n' \
+                    "$last_compile" >&2
+                exit 1
+                ;;
+        esac
+        # ...and it re-enables LTO on the way out.
+        case "$(tail -n1 build/configure.log)" in
+            *b_lto=true*) ;;
+            *)
+                printf 'fallback branch: LTO was not re-enabled on the final configure\n' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        printf 'unexpected PGO_FIXTURE_EXPECT: %s\n' "$PGO_FIXTURE_EXPECT" >&2
+        exit 1
+        ;;
+esac
 EOF
 chmod +x "$fixture/run-build.sh"
 
-PATH="$fixture/bin:$PATH" \
-CFLAGS='-O3' \
-CXXFLAGS='-O3' \
-LDFLAGS='' \
-"$fixture/run-build.sh"
+env \
+    PATH="$fixture/bin:$PATH" \
+    CFLAGS='-O3' \
+    CXXFLAGS='-O3' \
+    LDFLAGS='' \
+    fixture="$fixture" \
+    root="$root" \
+    recipe_path="$recipe_path" \
+    package_id="$package_id" \
+    PGO_FIXTURE_GCDA_COUNT=120 \
+    PGO_FIXTURE_EXPECT=profile \
+    "$fixture/run-build.sh"
 
-# Repo-wide: a recipe-level check that cannot fail the build is decorative.
-# bash returns the status of the LAST command in a function, so a call placed
-# mid-`package()` without `|| return 1` is discarded and makepkg packages the
-# instrumented payload anyway — the check prints its ERROR and exits 0. That is
-# how four recipes carried a "guard" that never guarded anything.
-call_site_failures=0
-while IFS= read -r recipe; do
-    mapfile -t lines <"$recipe"
-    for i in "${!lines[@]}"; do
-        line=${lines[$i]}
-        # The definition is `verify_...() {`; only calls have a space after the
-        # name, so this cannot mistake one for the other.
-        [[ $line =~ ^[[:space:]]*verify_no_profile_instrumentation[[:space:]] ]] || continue
-        [[ $line == *'|| return 1'* ]] && continue
-        j=$((i + 1))
-        while :; do
-            next=${lines[$j]:-}
-            next=${next#"${next%%[![:space:]]*}"}
-            if [[ -z $next || $next == \#* ]]; then
-                j=$((j + 1))
-                continue
-            fi
-            break
-        done
-        if [[ $next != '}' ]]; then
-            printf 'pgo-transition: %s:%s discards the check result — add `|| return 1` or make it the last command\n' \
-                "${recipe#"$root"/}" "$((i + 1))" >&2
-            call_site_failures=1
-        fi
-    done
-done < <(grep -rl 'verify_no_profile_instrumentation()' "$root"/packages/*/*/PKGBUILD)
-if ((call_site_failures != 0)); then
-    exit 1
-fi
+# The below-threshold branch is a real branch, not dead code: it is what a
+# thin or failed training run falls back to, and it harboured the 2026-09-16
+# bug class (a half-reconfigure that compiled a still-instrumented final
+# build). Drive it with a stub training run that touches only 3 TUs — below
+# every pair's threshold — and assert the fallback reconfigures cleanly,
+# re-enables LTO and compiles a final non-instrumented build.
+env \
+    PATH="$fixture/bin:$PATH" \
+    CFLAGS='-O3' \
+    CXXFLAGS='-O3' \
+    LDFLAGS='' \
+    fixture="$fixture" \
+    root="$root" \
+    recipe_path="$recipe_path" \
+    package_id="$package_id" \
+    PGO_FIXTURE_GCDA_COUNT=3 \
+    PGO_FIXTURE_EXPECT=fallback \
+    "$fixture/run-build.sh"
 
 printf 'PGO transition fixture (%s): PASS\n' "$package_id"

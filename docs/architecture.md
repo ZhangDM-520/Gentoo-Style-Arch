@@ -39,9 +39,12 @@ maintainer contract.
 
 The install path also owns one payload invariant: a package built from a
 recipe that instruments with `-fprofile-generate` is refused if its archive
-still carries an absolute `.gcda` destination. This belongs to the builder
-rather than to the recipes because it must hold for every PGO recipe,
-including ones that have not been written yet — verification copy-pasted into
+still carries an absolute `.gcda` destination. The verification *code*
+belongs in one module (`lib/pgo.sh`), because verification copy-pasted into
 individual recipes is the failure mode that produced two separate recurrences
-in 2026-09-16 and 2026-09-19. The check sits on the runtime state seam as
-well: it is the last point before files are written into `/usr`.
+in 2026-09-16 and 2026-09-19; the per-recipe *calls* remain, because the
+`readelf`/symbol predicate is only reachable before makepkg strips. The
+builder's payload verification is the fail-closed whole-set backstop, and it
+must hold for every PGO recipe, including ones that have not been written
+yet. The check sits on the runtime state seam as well: it is the last point
+before files are written into `/usr`.

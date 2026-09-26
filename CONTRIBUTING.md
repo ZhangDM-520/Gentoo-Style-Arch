@@ -85,10 +85,11 @@ Trim packaging to the maintained target:
 - keep mold, LTO, and PGO phases aligned with the package's documented
   exception (the Meson reconfigure rules and the verification procedure are in
   `docs/build-guide.md`; the failure mechanisms are in `MEMORY.md` §6); a
-  recipe that trains with `-fprofile-generate` must also verify the payload it
-  actually ships — `readelf` **and** `strings` where the staged files are
-  unstripped, `strings` alone against an installed binary — and must not
-  assume the builder's central gate makes its own check optional; and
+  recipe that trains with `-fprofile-generate` must call the shared payload
+  gate (`lib/pgo.sh`) as the last statement of its package function(s) —
+  never copy its implementation; a new PGO family extends the module and
+  earns a fixture — and the builder's central gate does not make the call
+  optional; and
 - never use invalid `options` such as `!check` or `autodeps` to paper over a
   recipe problem.
 

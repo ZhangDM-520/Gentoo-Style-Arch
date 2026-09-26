@@ -2,6 +2,10 @@
 # Contributor: Antonin Décimo <antonin dot decimo at gmail dot com>
 # Contributor: AndyRTR <andyrtr@archlinux.org>
 
+# Shared PGO payload gate — one implementation in lib/pgo.sh, called at the
+# end of package(). A missing module fails at parse time on purpose.
+source "$startdir/../../../lib/pgo.sh"
+
 pkgname=xorg-xwayland-git
 pkgver=24.1.13.r1181.g306071c0b
 pkgrel=2
@@ -76,6 +80,10 @@ build() {
   local _final_ldflags="$LDFLAGS"
 
   # Phase 1: PGO instrumented build
+  # pgo_min_gcda: ≈ minimum distinct TUs the training suite touches before a
+  # profile is worth trusting; below it the profile is too thin and we fall
+  # back to an LTO-only build.
+  local pgo_min_gcda=50
   CFLAGS+=" -fprofile-generate" CXXFLAGS+=" -fprofile-generate"
   arch-meson xserver build "${meson_options[@]}" -Db_lto=false
   meson compile -C build
@@ -86,7 +94,7 @@ build() {
   # Phase 3: verify profile quality
   local _gcda_count
   _gcda_count="$(find build -name '*.gcda' 2>/dev/null | wc -l)"
-  if ((_gcda_count < 50)); then
+  if ((_gcda_count < pgo_min_gcda)); then
     warning "PGO produced only %d gcda files — rebuilding with LTO only" "$_gcda_count"
     CFLAGS="$_final_cflags"
     CXXFLAGS="$_final_cxxflags"
@@ -113,36 +121,8 @@ build() {
   fi
 }
 
-# Two checks, because they cover different artifacts. readelf is sound here,
-# inside package(), where makepkg has not stripped yet; the `.gcda` path check
-# is the only one that survives stripping, so an installed binary stays
-# auditable — readelf alone reports clean on a stripped binary that still
-# carries every baked path (measured 2026-09-20: `readelf -sW /usr/bin/Xwayland`
-# matched nothing, `strings` found all 348). Both run, so a hit either way fails
-# the package. The caller uses `|| return 1`, which this recipe lacked until
-# 2026-09-20: without it the check printed its error and the build succeeded.
-verify_no_profile_instrumentation() {
-  local _root="$1" _binary _rc=0
-  while IFS= read -r -d '' _binary; do
-    if readelf -sW "$_binary" 2>/dev/null | grep -Eq '__gcov_|__llvm_profile'; then
-      error "final Xwayland package still contains profile instrumentation: $_binary"
-      _rc=1
-    fi
-    # The char class excludes `/` and `*` for a reason: ctest legitimately
-    # ships the glob literal `/*.gcda` in its own GCOV support, and a glob is
-    # not a baked destination. Without the exclusion a correctly rebuilt
-    # cmake-git fails its own guard.
-    if strings -a "$_binary" 2>/dev/null | grep -qE '^/[^[:space:]/*][^[:space:]]*\.gcda'; then
-      error "final Xwayland package still carries .gcda destinations: $_binary"
-      _rc=1
-    fi
-  done < <(find "$_root" -type f \( -name '*.so' -o -name '*.so.*' -o -perm -u+x \) -print0)
-  return $_rc
-}
-
 package() {
   meson install -C build --destdir "${pkgdir}"
-  verify_no_profile_instrumentation "$pkgdir" || return 1
   # xorg-server-common file /usr/lib/xorg/protocol.txt
   rm "${pkgdir}"/usr/lib/xorg/protocol.txt
   rmdir "${pkgdir}"/usr/lib/xorg
@@ -150,4 +130,8 @@ package() {
 
   # license
   install -m644 -Dt "${pkgdir}/usr/share/licenses/${pkgname}" xserver/COPYING
+
+  # Fatal shared gate (lib/pgo.sh) — last statement on purpose: nothing may be
+  # added to $pkgdir after the payload is verified.
+  verify_no_profile_instrumentation "$pkgdir"
 }

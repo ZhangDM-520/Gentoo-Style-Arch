@@ -351,15 +351,27 @@ predicate:
 
 | Seam | Where | Predicate |
 | --- | --- | --- |
-| Recipe | `package()`, against the staged `$pkgdir` tree, before makepkg strips | `readelf` **and** `strings` |
+| Recipe | `package()`, against the staged `$pkgdir` tree, before makepkg strips | `readelf` **and** `strings` (shared gate `lib/pgo.sh`) |
 | Builder | `install_pkgs_now()` / `install_all()`, against the finished `.pkg.tar.zst` | `strings` only |
 
-A recipe-level check must be able to **fail the build**. Called mid-`package()`
-without `|| return 1`, it cannot: bash returns the status of the function's
-last command, so the check prints its error, exits 0, and makepkg packages the
-instrumented payload anyway. Four recipes were in exactly that state until
-2026-09-20. Write `verify_no_profile_instrumentation "$pkgdir" || return 1`, or
-place the call last; `tests/pgo-transition.sh` enforces it repo-wide.
+A recipe-level check must be able to **fail the build**, and the shared gate is
+built so it cannot do anything else. `verify_no_profile_instrumentation` lives
+in **one module**, `lib/pgo.sh`, sourced by every PGO recipe through `source
+"$startdir/../../../lib/pgo.sh"` and called as the LAST statement of
+`package()` — of each `package_*` function in a split recipe, against that
+function's own `$pkgdir`. On any hit it prints the offending binary and the
+predicate that matched, then `exit 1`, which kills makepkg's function
+subshell and fails the build. The `|| return 1` convention this replaces was
+unenforceable: bash returns the status of a function's last command, so a
+check whose status a later command overwrote was silently discarded and
+makepkg packaged the instrumented payload anyway (four recipes were in
+exactly that state until 2026-09-20). Recipes call the gate; they never copy
+its implementation — the copied versions had drifted (mold-git's predicates
+were stricter than the rest) and the copy-paste mandate was itself the
+recurrence engine. A new PGO family extends `lib/pgo.sh` and earns a fixture;
+`tests/pgo-lib.sh` pins the module's behaviour and how each recipe resolves
+it, and `tests/pgo-transition.sh` drives each recipe's profile *and*
+below-threshold fallback branches.
 
 Both are deliberate. The recipe seam sees unstripped files, which is the only
 place `readelf -sW` is meaningful. The builder seam is the durable one: it

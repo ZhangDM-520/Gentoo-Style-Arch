@@ -4,6 +4,10 @@
 # Contributor: Jan de Groot <jgc@archlinux.org>
 # Contributor: Brice Carpentier <brice@daknet.org>
 
+# Shared PGO payload gate — one implementation in lib/pgo.sh, called at the
+# end of package_cairo-git. A missing module fails at parse time on purpose.
+source "$startdir/../../../lib/pgo.sh"
+
 pkgbase=cairo-git
 pkgname=(cairo-git)
 pkgver=1.18.6.r4.g74755964e
@@ -57,6 +61,10 @@ build() {
   local _final_cxxflags="$CXXFLAGS"
 
   # Phase 1: PGO instrumented build (tests enabled for training)
+  # pgo_min_gcda: ≈ minimum distinct TUs the training suite touches before a
+  # profile is worth trusting; below it the profile is too thin and we fall
+  # back to an LTO-only build.
+  local pgo_min_gcda=50
   CFLAGS+=" -fprofile-generate" CXXFLAGS+=" -fprofile-generate"
   arch-meson cairo build "${meson_options[@]}" \
     -D tests=enabled \
@@ -69,7 +77,7 @@ build() {
   # Phase 3: verify profile quality
   local _gcda_count
   _gcda_count="$(find build -name '*.gcda' 2>/dev/null | wc -l)"
-  if ((_gcda_count < 50)); then
+  if ((_gcda_count < pgo_min_gcda)); then
     warning "PGO produced only %d gcda files — rebuilding with LTO only" "$_gcda_count"
     CFLAGS="$_final_cflags"
     CXXFLAGS="$_final_cxxflags"
@@ -95,30 +103,6 @@ build() {
 
 }
 
-# Two checks, because they cover different artifacts. readelf is sound here,
-# inside package(), where makepkg has not stripped yet; the `.gcda` path check
-# is the only one that survives stripping, so an installed binary stays
-# auditable — readelf alone reports clean on a stripped binary that still
-# carries every baked path. Both run, so a hit either way fails the package.
-verify_no_profile_instrumentation() {
-  local _root="$1" _binary _rc=0
-  while IFS= read -r -d '' _binary; do
-    if readelf -sW "$_binary" 2>/dev/null | grep -Eq '__gcov_|__llvm_profile'; then
-      error "final Cairo package still contains profile instrumentation: $_binary"
-      _rc=1
-    fi
-    # The char class excludes `/` and `*` for a reason: ctest legitimately
-    # ships the glob literal `/*.gcda` in its own GCOV support, and a glob is
-    # not a baked destination. Without the exclusion a correctly rebuilt
-    # cmake-git fails its own guard.
-    if strings -a "$_binary" 2>/dev/null | grep -qE '^/[^[:space:]/*][^[:space:]]*\.gcda'; then
-      error "final Cairo package still carries .gcda destinations: $_binary"
-      _rc=1
-    fi
-  done < <(find "$_root" -type f \( -name '*.so' -o -name '*.so.*' -o -perm -u+x \) -print0)
-  return $_rc
-}
-
 package_cairo-git() {
   provides=(
     libcairo-gobject.so
@@ -130,7 +114,9 @@ package_cairo-git() {
   options+=(!emptydirs)
 
   meson install -C build --destdir "$pkgdir"
-  verify_no_profile_instrumentation "$pkgdir" || return 1
+  # Fatal shared gate (lib/pgo.sh) — last statement on purpose: nothing may be
+  # added to $pkgdir after the payload is verified.
+  verify_no_profile_instrumentation "$pkgdir"
 }
 
 # vim: set ts=2 sw=2 et:

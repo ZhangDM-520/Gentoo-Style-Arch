@@ -5,7 +5,6 @@ pkgbase = cmake-git
 	url = http://www.cmake.org/
 	arch = x86_64
 	license = custom
-	makedepends = python-sphinx
 	makedepends = nlohmann-json
 	makedepends = git
 	depends = curl
