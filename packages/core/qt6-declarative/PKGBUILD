@@ -4,7 +4,7 @@
 
 pkgname=qt6-declarative
 # placeholder — overridden by pkgver() (git describe on dev branch)
-pkgver=6.13.0_r39459.g79bf949ca8
+pkgver=6.13.0_r39580.g1171fd3c02
 pkgrel=1
 arch=(x86_64)
 url='https://www.qt.io'

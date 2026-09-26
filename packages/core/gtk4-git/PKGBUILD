@@ -4,8 +4,8 @@
 
 _pkgname="gtk4"
 pkgbase="$_pkgname-git"
-pkgver=4.24.r45.g539d28f
-pkgrel=2
+pkgver=4.25.r11.g57f569a
+pkgrel=1
 pkgdesc="GObject-based multi-platform GUI toolkit"
 url="https://gitlab.gnome.org/GNOME/gtk"
 license=('LGPL-2.1-or-later')

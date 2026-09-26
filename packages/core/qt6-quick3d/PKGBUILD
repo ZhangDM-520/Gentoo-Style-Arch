@@ -4,7 +4,7 @@
 
 pkgname=qt6-quick3d
 # placeholder — overridden by pkgver() (git describe on dev branch)
-pkgver=6.13.0_r5487.g082239e1e
+pkgver=6.13.0_r5516.gbc81cf8b6
 pkgrel=1
 arch=(x86_64)
 url='https://www.qt.io'

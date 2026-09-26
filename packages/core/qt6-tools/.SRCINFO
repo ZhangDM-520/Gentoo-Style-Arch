@@ -1,6 +1,6 @@
 pkgbase = qt6-tools
 	pkgdesc = A cross-platform application and UI framework (Development Tools, QtHelp)
-	pkgver = 6.13.0_r7492.g7f1901f2b
+	pkgver = 6.13.0_r7520.g3f9e9a6f0
 	pkgrel = 1
 	url = https://www.qt.io
 	arch = x86_64

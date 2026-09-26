@@ -12,7 +12,7 @@
 _pkgname="libadwaita"
 pkgbase=libadwaita-git
 pkgname=(libadwaita-git)
-pkgver=1.10.beta.1.r35.g6fd61bf
+pkgver=1.10.0.r12.g0ffcd2c
 pkgrel=1
 pkgdesc="Building blocks for modern adaptive GNOME applications"
 url="https://gnome.pages.gitlab.gnome.org/libadwaita"

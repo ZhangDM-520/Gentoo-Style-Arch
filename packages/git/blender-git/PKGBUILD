@@ -21,7 +21,7 @@ _git_revert=(49414a72f607ccd15f8b71b81edc9aff040d581e) # v3.1 arch
 [[ -v HIP_ARCH  ]] && _CMAKE_FLAGS+=(-DCYCLES_HIP_BINARIES_ARCH="${HIP_ARCH}")
 
 pkgname=blender-git
-pkgver=5.3.r165155.gf5893e588a13
+pkgver=5.3.r165382.g73cfbda0a06d
 pkgrel=1
 pkgdesc="A fully integrated 3D graphics creation suite (development)"
 arch=('i686' 'x86_64')

@@ -1,7 +1,7 @@
 pkgbase = wireplumber
 	pkgdesc = Session / policy manager implementation for PipeWire
 	pkgver = 0.5.17
-	pkgrel = 1.1
+	pkgrel = 2.1
 	url = https://pipewire.pages.freedesktop.org/wireplumber/
 	arch = x86_64
 	license = MIT
@@ -22,7 +22,7 @@ pkgbase = wireplumber
 
 pkgname = wireplumber
 	install = wireplumber.install
-	depends = libwireplumber=0.5.17-1.1
+	depends = libwireplumber=0.5.17-2.1
 	depends = glibc
 	depends = libgcc
 	depends = libglib-2.0.so

@@ -1,7 +1,7 @@
 # Contributor: Laurent Carlier <lordheavym@gmail.com>
 # Maintainer: Solomon Choina <shlomochoina@gmail.com>
 pkgname=libclc-git
-pkgver=24.0.0_r595879.b1f20dd48e11
+pkgver=24.0.0_r599093.7e91ef5d6aea
 pkgrel=1
 epoch=1
 groups=('chaotic-mesa-git')
