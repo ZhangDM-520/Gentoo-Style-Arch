@@ -3909,11 +3909,14 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -l core_memory_per_job (math "$_CORE_MEMORY_PER_JOB_GIB * $_INTENSITY_CORE_MEMORY_FACTOR")
     set -l core_jobs (math "max(1, min($nproc_count, floor($normal_memory / $core_memory_per_job)))")
     ui_info "parallelism: $nproc_count CPU threads, $memory_gib GiB available, intensity $intensity_level, $lanes lane(s), normal -j$lane_jobs, core -j$core_jobs"
+    # Plan scalars for the run record / machine block (this is the one place
+    # the full plan is resolved and printed).
+    set -g _RL_PLAN_LANES $lanes
+    set -g _RL_PLAN_NORMAL_JOBS $lane_jobs
+    set -g _RL_PLAN_CORE_JOBS $core_jobs
 
     set -l succeeded
     set -l failed
-    set -l failed_rc
-    set -l failed_dur
     set -l stop_starting 0
     set -l blocked 0
     set -l deferred
@@ -4092,6 +4095,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 set -a _lane_done $p
                 if test $rc -eq 0
                     set -a succeeded $p
+                    run_record_row "$p" succeeded 0 $dur ok
                     set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_OK completed $p"
                     # Mid-run ABI-skew probe (2026-09-25 incident): the
                     # preflight passed at run START, and this run's own
@@ -4125,12 +4129,18 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     # succeeded+failed so it lands in the resume command.
                     set -a deferred $p
                     set -a _lane_deferred $p
+                    run_record_row "$p" deferred $rc $dur anchoring-refused
                     set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_WARN deferred $p"
                 else
                     set -a failed $p
-                    set -a failed_rc $rc
-                    set -a failed_dur $dur
                     set stop_starting 1
+                    # A reaped row exists for an honest lane result; a reap
+                    # anomaly (rc=125, no valid result) is the lane being lost.
+                    if test "$result_ready" = "1"
+                        run_record_row "$p" failed $rc $dur build-failed
+                    else
+                        run_record_row "$p" failed $rc $dur lane-lost
+                    end
                     if test "$result_ready" = "1"
                         set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR failed $p"
                     end
@@ -4248,8 +4258,7 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 if not ensure_log_writable "$child_log"
                     ui_error "cannot prepare build log for $next — stopped dispatching"
                     set -a failed $next
-                    set -a failed_rc 1
-                    set -a failed_dur 0
+                    run_record_row "$next" failed 1 0 log-unwritable
                     set stop_starting 1
                     continue
                 end
@@ -4320,8 +4329,10 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     for pkg in $_lane_sorted
                         if not contains "$pkg" $_lane_started
                             if waits_on_deferred $pkg
+                                run_record_row "$pkg" blocked - - waits-on-deferred
                                 echo "    ⏸ $pkg — waits on a deferred package"
                             else
+                                run_record_row "$pkg" blocked - - never-ready
                                 echo "    ? $pkg"
                             end
                         end
@@ -4376,8 +4387,8 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     if test "$_OUTPUT_INTERACTIVE" = "1"; and test (count $failed) -gt 0
         for i in (seq (count $failed))
             set -l p $failed[$i]
-            set -l rc $failed_rc[$i]
-            set -l dur $failed_dur[$i]
+            set -l rc (run_record_field $p rc)
+            set -l dur (run_record_field $p dur)
             set -l log_file (package_log_file "$p")
             printf "  %s %s: BUILD FAILED (rc=%s, %s) — log: %s\n" \
                 "$_UI_ICON_ERROR" $p $rc (fmt_dur $dur) "$log_file"
@@ -4395,12 +4406,9 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
         end
     end
 
-    # Expose results to main (lane jobs are forked processes — the dispatcher
-    # is the only writer of these globals).
-    set -g _RL_SUCCEEDED $succeeded
-    set -g _RL_FAILED $failed
-    set -g _RL_BLOCKED $blocked
-    set -g _RL_DEFERRED $deferred
+    # The run record is completed by run_record_finalize (called once by main
+    # after run_lanes returns, on every terminal path) — it derives the
+    # exported _RL_* results from the rows instead of maintaining them here.
     # A dispatch stopped by a lost sudo credential left packages unbuilt: that
     # must never be reported as "All builds succeeded!" (2026-09-17). Nor may
     # a run that parked a recipe — parked work needs the owner (2026-09-24).
@@ -4411,6 +4419,350 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
         return 1
     end
     return 0
+end
+
+# ─── Run record & continuation ──────────────────────────────────────────────
+# ONE "run plan & outcome" record per run. run_lanes' classification is the
+# single writer (run_record_row at every outcome), run_record_plan registers
+# the plan once before dispatch, run_record_finalize completes the record once
+# on every terminal path (called by main right after run_lanes returns), and
+# exactly three renderings consume it: the streaming dashboard (live, from the
+# same classification), the prose summary (print_run_summary) and the machine
+# block (print_run_record).
+#
+# The dispatcher→main handoff is internal plumbing of this cluster now. The
+# exported names (_RL_SUCCEEDED / _RL_FAILED / _RL_BLOCKED / _RL_DEFERRED /
+# _RL_SUDO_NOTE) keep working, but they are DERIVED from the rows instead of
+# being maintained in parallel with them.
+#
+# Row grammar (internal): pkg|status|rc|dur|reason — exactly one row per
+# package, in topological order after finalize. status ∈ {succeeded, failed,
+# deferred, blocked, never-started, interrupted} ("deferred" NAMES the lane
+# rc-99 _ANCHOR_DEFER_RC amendment: anchoring refused parks the recipe, it is
+# not a failed build). rc and dur are integers (dur in seconds) or '-' when
+# the package never produced one. reason is a kebab-case token:
+#   ok                   succeeded
+#   build-failed         lane ran, makepkg/exits non-zero (rc is in the row)
+#   lane-lost            reap anomaly: no valid lane result (rc=125)
+#   log-unwritable       dispatch refused: the package log could not be opened
+#   anchoring-refused    deferred (rc=99)
+#   waits-on-deferred    blocked on a parked recipe
+#   never-ready          blocked: dependency cycle or missing dep
+#   dispatch-stopped     never started: dispatch stopped, lanes drained
+#   preflight-refused    never started: the run refused before dispatching
+#   interrupted-before-start  never started: the run was interrupted first
+#   interrupted-mid-build     started, in flight when the run was interrupted
+
+function run_record_row -a r_pkg r_status r_rc r_dur r_reason
+    # NB: no parameter may be named `status`/`pipestatus`/etc. — fish reserves
+    # those, and a definition using them fails with "variable is read-only",
+    # leaving the function silently undefined (cost an hour, 2026-09-26).
+    set -a _RL_ROWS "$r_pkg|$r_status|$r_rc|$r_dur|$r_reason"
+end
+
+# One field of one package's row (status/rc/dur/reason); empty when the
+# package has no row yet.
+function run_record_field -a pkg field
+    for row in $_RL_ROWS
+        set -l f (string split '|' -- "$row")
+        if test "$f[1]" = "$pkg"
+            switch $field
+                case status
+                    echo "$f[2]"
+                case rc
+                    echo "$f[3]"
+                case dur
+                    echo "$f[4]"
+                case reason
+                    echo "$f[5]"
+            end
+            return 0
+        end
+    end
+    return 1
+end
+
+# Register the run's plan once, before dispatch. The 9 fixed arguments are the
+# continuation state (mirrored by continuation_args) plus the selection-source
+# scalar; the payload is the topological order of the selection.
+function run_record_plan -a lanes jobs intensity install force no_deps no_sync allow_broken source
+    set -g _RL_ROWS
+    set -g _RL_REMAINING
+    set -g _RL_SUCCEEDED
+    set -g _RL_FAILED
+    set -g _RL_DEFERRED
+    set -g _RL_BLOCKED 0
+    set -g _RL_SUDO_NOTE ""
+    set -g _RL_INTERRUPTED 0
+    set -g _RR_SOURCE "$source"
+    set -g _RR_ORDER $argv[10..-1]
+    set -g _RR_CONT_LANES "$lanes"
+    set -g _RR_CONT_JOBS "$jobs"
+    set -g _RR_CONT_INTENSITY "$intensity"
+    set -g _RR_CONT_INSTALL "$install"
+    set -g _RR_CONT_FORCE "$force"
+    set -g _RR_CONT_NO_DEPS "$no_deps"
+    set -g _RR_CONT_NO_SYNC "$no_sync"
+    set -g _RR_CONT_ALLOW_BROKEN "$allow_broken"
+    # Resolved by run_lanes once the plan is computed (the `parallelism:` line
+    # knows them); '-' until then — a run that refused before planning has no
+    # resolved values to report.
+    set -g _RL_PLAN_LANES -
+    set -g _RL_PLAN_NORMAL_JOBS -
+    set -g _RL_PLAN_CORE_JOBS -
+end
+
+# Complete the record once, after run_lanes returned on any path. Packages the
+# dispatcher never classified get their honest terminal row: started but
+# unrowed can only mean the interrupt drained them mid-build; the rest were
+# never dispatched (why is data: interrupted / dispatch-stopped /
+# preflight-refused). Then the rows are put in topological order and the
+# exported results and the Remaining set (failed + unattempted, topological
+# order — a failed package must rebuild BEFORE its dependents, so it stays in
+# Remaining and in the resume suggestion) are derived from them.
+function run_record_finalize
+    set -l rowed
+    for row in $_RL_ROWS
+        set -a rowed (string split -f 1 '|' -- "$row")
+    end
+    # One reason for ALL never-started rows, decided from the state as
+    # finalize found it — not per row, which would let the first row added by
+    # this very loop flip the rest from preflight-refused to dispatch-stopped.
+    set -l ns_reason dispatch-stopped
+    if test "$_RL_INTERRUPTED" = "1"
+        set ns_reason interrupted-before-start
+    else if test (count $_lane_started) -eq 0; and test (count $_RL_ROWS) -eq 0
+        set ns_reason preflight-refused
+    end
+    for pkg in $_RR_ORDER
+        if contains "$pkg" $rowed
+            continue
+        end
+        if test (count $_lane_started) -gt 0; and contains "$pkg" $_lane_started
+            run_record_row "$pkg" interrupted - - interrupted-mid-build
+        else
+            run_record_row "$pkg" never-started - - $ns_reason
+        end
+    end
+    set -l ordered
+    for pkg in $_RR_ORDER
+        for row in $_RL_ROWS
+            if test (string split -f 1 '|' -- "$row") = "$pkg"
+                set -a ordered $row
+                break
+            end
+        end
+    end
+    set _RL_ROWS $ordered
+
+    set -g _RL_SUCCEEDED
+    set -g _RL_FAILED
+    set -g _RL_DEFERRED
+    set -g _RL_REMAINING
+    set -l blocked_rows 0
+    for row in $_RL_ROWS
+        set -l f (string split '|' -- "$row")
+        switch $f[2]
+            case succeeded
+                set -a _RL_SUCCEEDED $f[1]
+            case failed
+                set -a _RL_FAILED $f[1]
+            case deferred
+                set -a _RL_DEFERRED $f[1]
+            case blocked
+                set blocked_rows (math $blocked_rows + 1)
+        end
+        if test "$f[2]" != succeeded
+            set -a _RL_REMAINING $f[1]
+        end
+    end
+    set -g _RL_BLOCKED $blocked_rows
+end
+
+# ─── continuation_args: ONE implementation of both continuation mirrors ──────
+# The canonical flag → continuation-rule table. continuation_args iterates it
+# (the list order below IS the emission order) and every continuation command
+# the builder prints is rendered from it. The two mirrors are the SAME
+# function; they differ only in mode:
+#
+#   replay — the sudo rerun hint: canonical plan-triple + install flavour, then
+#            the raw argv replay (so semantics/replaced/ignored flags ride
+#            along in their original spelling). Prefix:
+#            `sudo fish $SCRIPT_DIR/build-all.fish`.
+#   resume — the resume suggestion: canonical plan-triple + install flavour +
+#            semantics flags + the $remaining package list (selection
+#            replaced). Prefix: bare `build-all.fish`.
+#
+#   rule        flag(s)                              continuation treatment
+#   value       --lanes --jobs --intensity           mirrored with their value
+#   flavour     -i --install -fi --forceinstall      -i → --install; -fi →
+#                                                   --forceinstall (implies -i)
+#   semantics   --no-deps --no-sync                  mirrored on resume only
+#               --allow-broken-rustc                 (replay carries argv)
+#   replaced    -g/--group, N..M ranges,             replaced by the package
+#               package references                  list ($remaining/argv)
+#   not-mirrored -c/--clean, -s/--skip               deliberately NOT mirrored:
+#                                                   -c would wipe the archives
+#                                                   a resume needs, and -s is
+#                                                   the user's call (the tip
+#                                                   says to add it)
+#   not-mirrored -n -l -ia -cc -ccc -ln              one-shot actions and
+#               --audit -h --help                    read-only modes
+set -g _CONTINUATION_RULES \
+    '--lanes|value' \
+    '--jobs|value' \
+    '--intensity|value' \
+    '-i --install -fi --forceinstall|flavour' \
+    '--no-deps|semantics' \
+    '--no-sync|semantics' \
+    '--allow-broken-rustc|semantics' \
+    '-g --group, N..M ranges, package references|replaced' \
+    '-c --clean|not-mirrored' \
+    '-s --skip|not-mirrored' \
+    '-n --dry-run -l --list -ia --installall -cc --cleanup -ccc --nuclear -ln --link-sources --audit -h --help|not-mirrored'
+
+# continuation_args MODE [PAYLOAD...] → one line of continuation arguments.
+# Run-shape state comes from the run record (run_record_plan).
+function continuation_args -a mode
+    set -l payload $argv[2..-1]
+    set -l out
+    for entry in $_CONTINUATION_RULES
+        set -l fields (string split '|' -- $entry)
+        set -l flag $fields[1]
+        switch $fields[2]
+            case value
+                switch $flag
+                    case --lanes
+                        set -a out --lanes "$_RR_CONT_LANES"
+                    case --jobs
+                        set -a out --jobs "$_RR_CONT_JOBS"
+                    case --intensity
+                        set -a out --intensity "$_RR_CONT_INTENSITY"
+                end
+            case flavour
+                # -fi implies -i, so one flag preserves both halves of the
+                # semantics; a plain -i keeps its same-version check.
+                if test "$_RR_CONT_FORCE" = "1"
+                    set -a out --forceinstall
+                else if test "$_RR_CONT_INSTALL" = "1"
+                    set -a out --install
+                end
+            case semantics
+                # Resume only: replay carries these inside the argv replay.
+                if test "$mode" = resume
+                    switch $flag
+                        case --no-deps
+                            if test "$_RR_CONT_NO_DEPS" = "1"
+                                set -a out --no-deps
+                            end
+                        case --no-sync
+                            if test "$_RR_CONT_NO_SYNC" = "1"
+                                set -a out --no-sync
+                            end
+                        case --allow-broken-rustc
+                            if test "$_RR_CONT_ALLOW_BROKEN" = "1"
+                                set -a out --allow-broken-rustc
+                            end
+                    end
+                end
+        end
+    end
+    string join ' ' -- $out $payload
+end
+
+# The prose summary. Success and failure renderings are byte-stable prose; an
+# interrupted run reuses the failure body under its own "Build interrupted"
+# heading (printed by the interrupt path itself).
+function print_run_summary -a outcome
+    set -l succeeded $_RL_SUCCEEDED
+    set -l failed $_RL_FAILED
+    set -l deferred $_RL_DEFERRED
+    set -l remaining $_RL_REMAINING
+    set -l blocked $_RL_BLOCKED
+    set -l sudo_note "$_RL_SUDO_NOTE"
+
+    if test "$outcome" = success
+        ui_heading "All builds succeeded!"
+        echo "Built: "(count $succeeded)" packages"
+    else
+        if test "$outcome" = failed
+            # Failure summary — dispatch stopped on first failure and in-flight
+            # lanes were drained, so anything unstarted is genuinely pending.
+            # With -i everything built so far is ALREADY installed (resume with
+            # -s -i). A DEFERRAL is the deliberate exception (2026-09-24): an
+            # unanchorable recipe parks itself and the dispatch CONTINUES, so
+            # this summary must not claim a stop that never happened — it names
+            # the parked recipes instead.
+            if test (count $failed) -gt 0
+                ui_error "Build failed — stopped dispatching, drained in-flight lanes."
+            else if test "$blocked" -eq 0; and test (count $deferred) -eq 0; and test -n "$sudo_note"
+                ui_warning "Stopped early — $sudo_note."
+            else if test (count $deferred) -gt 0
+                ui_warning "(count $deferred) recipe(s) deferred — the rest of the dispatch continued; the parked recipes below were not built."
+                if test -n "$sudo_note"
+                    ui_warning "Stopped early — $sudo_note."
+                end
+            else
+                ui_error "Build failed — stopped dispatching, drained in-flight lanes."
+            end
+        end
+        echo ""
+        echo "Successful builds: "(count $succeeded)
+        echo "Failed builds:     "(count $failed)
+        echo "Blocked:           $blocked"
+        echo "Deferred:          "(count $deferred)
+        echo "Remaining:         "(count $remaining)
+        if test (count $failed) -gt 0
+            echo "note: "(count $failed)" failed package(s) included — they must rebuild before their dependents"
+        end
+        if test (count $deferred) -gt 0
+            echo ""
+            echo "Deferred recipes (not built — the log tail says why):"
+            for p in $deferred
+                echo "  $p"
+                print_log_tail (package_log_file "$p")
+            end
+        end
+        if test (count $remaining) -gt 0
+            echo ""
+            echo "To resume, run:"
+            echo "  build-all.fish "(continuation_args resume $remaining)""
+            echo "(Tip: add -s so already-built pkgs are skipped.)"
+        end
+    end
+
+    # Ambient-knob gap (2026-09-26): GSA_TARGET_CPU and GSA_STATE_DIR are
+    # ENVIRONMENT inputs — never baked into a continuation command — so a
+    # continuation must run with the same ambient values as this run.
+    set -l ambient
+    set -q GSA_TARGET_CPU; and set -a ambient GSA_TARGET_CPU
+    set -q GSA_STATE_DIR; and set -a ambient GSA_STATE_DIR
+    if test (count $ambient) -gt 0
+        ui_warning "ambient environment: "(string join ' ' $ambient)" — the continuation must run in the same env (never baked into the command)"
+    end
+end
+
+# The machine block (C8): one bounded end-of-run record on stdout, default-on.
+# Stable markers; `key: value` plan scalars; one row per package
+# (`pkg status rc dur reason`, space-separated, reason is the remainder of the
+# line). Full rows, never exceptions-only. Printed only after the dashboard is
+# finished (finish_dashboard / abort_dashboard) so its ANSI renderer can never
+# garble the block — and on the interrupt and sudo-preflight paths too.
+function print_run_record -a outcome run_rc
+    echo "--- run record begin ---"
+    echo "format: 1"
+    echo "selection-source: $_RR_SOURCE"
+    echo "order: "(string join ' ' -- $_RR_ORDER)
+    echo "lanes: $_RL_PLAN_LANES"
+    echo "normal-jobs: $_RL_PLAN_NORMAL_JOBS"
+    echo "core-jobs: $_RL_PLAN_CORE_JOBS"
+    echo "intensity: $_RR_CONT_INTENSITY"
+    echo "outcome: $outcome"
+    echo "rc: $run_rc"
+    for row in $_RL_ROWS
+        echo (string join ' ' -- (string split '|' -- "$row"))
+    end
+    echo "--- run record end ---"
 end
 
 # ─── Usage ───────────────────────────────────────────────────────────────────
@@ -5143,21 +5495,33 @@ function main
     echo "State:    $_STATE_DIR"
     echo ""
 
+    # Register the run record's plan once for this run (the cluster's input
+    # contract — see the run-record cluster below run_lanes). selection-source
+    # renders as groups=… packages=… ranges=… with '-' for an absent part.
+    set -l src_groups -
+    set -l src_packages -
+    set -l src_ranges -
+    if test (count $groups) -gt 0
+        set src_groups (string join ',' $groups)
+    end
+    if test (count $packages) -gt 0
+        set src_packages (string join ',' $packages)
+    end
+    if test (count $ranges) -gt 0
+        set src_ranges (string join ',' $ranges)
+    end
+    run_record_plan "$lane_count" "$jobs_override" "$intensity_level" \
+        "$install_flag" "$force_install_flag" "$no_deps_flag" "$no_sync_flag" \
+        "$allow_broken_rustc" \
+        "groups=$src_groups packages=$src_packages ranges=$src_ranges" $sorted
+
     if test "$_ROOT_MODE" != "1"; and test "$install_flag" = "1"
-        # -- separator: args start with flags (-g …), which string join would
-        # otherwise parse as its own options
-        set -l rerun_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level"
-        # Mirror the install flavour: a rerun of a -fi run must stay forced.
-        if test "$force_install_flag" = "1"
-            set -a rerun_args --forceinstall
-        else
-            set -a rerun_args --install
-        end
-        set -a rerun_args $argv
+        # The sudo hint is the ARGV-REPLAY mirror of continuation_args (see
+        # the canonical flag → continuation-rule table with the cluster).
         set -l rerun_prefix (set_color yellow)
         set -l rerun_suffix (set_color normal)
         echo "$rerun_prefix$_UI_ICON_INFO unprivileged run: for -i runs that will take longer than ~15 min, prefer:$rerun_suffix"
-        echo "  sudo fish $SCRIPT_DIR/build-all.fish "(string join ' ' -- $rerun_args)""
+        echo "  sudo fish $SCRIPT_DIR/build-all.fish "(continuation_args replay $argv)""
         echo "  (makepkg still builds as YOU — only the installs gain root; no password expiry)"(set_color normal)
         echo ""
     end
@@ -5177,6 +5541,13 @@ function main
         printf '\n'
         ui_warning "Build interrupted"
         dispatcher_log "Build interrupted (last signal: $_LAST_SIGNAL, before dispatch)"
+        # An interrupted run prints the summary + machine block + continuation
+        # and still exits 130 (2026-09-26 interrupt gap). Nothing dispatched
+        # yet, so every row is never-started / interrupted-before-start.
+        set -g _RL_INTERRUPTED 1
+        run_record_finalize
+        print_run_summary interrupted
+        print_run_record interrupted 130
         return 130
     end
 
@@ -5186,107 +5557,33 @@ function main
     run_lanes $lane_count $jobs_override $intensity_level $install_flag $clean_flag \
         $skip_flag $no_sync_flag $force_install_flag $sorted
     set -l run_rc $status
-    set -l succeeded $_RL_SUCCEEDED
-    set -l failed $_RL_FAILED
-    set -l blocked $_RL_BLOCKED
-    set -l sudo_note "$_RL_SUDO_NOTE"
 
-    if test "$_RL_INTERRUPTED" = "1"
-        return 130
-    end
+    # The run record is completed ONCE here — on every terminal path
+    # (success, failure, sudo-preflight refusal, interrupt) — and the
+    # renderings below consume it.
+    run_record_finalize
 
     echo ""
     print_synced_notes
-    if test $run_rc -eq 0
-        ui_heading "All builds succeeded!"
-        echo "Built: "(count $succeeded)" packages"
 
-        # With -i every package was installed right after its build, so there
-        # is no collective end-install step anymore.
-        return 0
+    set -l outcome failed
+    if test "$_RL_INTERRUPTED" = "1"
+        set outcome interrupted
+    else if test $run_rc -eq 0
+        set outcome success
     end
+    print_run_summary "$outcome"
+    # The machine block is printed only here — after the dashboard is
+    # finished (finish_dashboard / abort_dashboard already ran).
+    print_run_record "$outcome" $run_rc
 
-    # The resume set is selection minus SUCCEEDED, not minus succeeded+failed
-    # (2026-09-26, confirmed on cycle-1 libreoffice and cycle-10 qt5-base-git):
-    # dropping the FAILED package from this set meant the suggested resume
-    # command rebuilt only the not-yet-attempted packages and silently left the
-    # failed one stale — its dependents then compiled against the stale
-    # installed copy. A failed package must rebuild BEFORE its dependents, so
-    # it stays in both the "Remaining" count and the resume command (the note
-    # under the count says so).
-    set -l remaining
-    for pkg in $sorted
-        if not contains "$pkg" $succeeded
-            set -a remaining $pkg
-        end
-    end
-    set -l deferred $_RL_DEFERRED
-    # Failure summary — dispatch stopped on first failure and in-flight lanes
-    # were drained, so anything unstarted is genuinely pending. With -i
-    # everything built so far is ALREADY installed (resume with -s -i).
-    # A DEFERRAL is the deliberate exception (2026-09-24): an unanchorable
-    # recipe parks itself and the dispatch CONTINUES, so this summary must not
-    # claim a stop that never happened — it names the parked recipes instead.
-    if test (count $failed) -gt 0
-        ui_error "Build failed — stopped dispatching, drained in-flight lanes."
-    else if test "$blocked" -eq 0; and test (count $deferred) -eq 0; and test -n "$sudo_note"
-        ui_warning "Stopped early — $sudo_note."
-    else if test (count $deferred) -gt 0
-        ui_warning "(count $deferred) recipe(s) deferred — the rest of the dispatch continued; the parked recipes below were not built."
-        if test -n "$sudo_note"
-            ui_warning "Stopped early — $sudo_note."
-        end
-    else
-        ui_error "Build failed — stopped dispatching, drained in-flight lanes."
-    end
-    echo ""
-    echo "Successful builds: "(count $succeeded)
-    echo "Failed builds:     "(count $failed)
-    echo "Blocked:           $blocked"
-    echo "Deferred:          "(count $deferred)
-    echo "Remaining:         "(count $remaining)
-    if test (count $failed) -gt 0
-        echo "note: "(count $failed)" failed package(s) included — they must rebuild before their dependents"
-    end
-    if test (count $deferred) -gt 0
-        echo ""
-        echo "Deferred recipes (not built — the log tail says why):"
-        for p in $deferred
-            echo "  $p"
-            print_log_tail (package_log_file "$p")
-        end
-    end
-    if test (count $remaining) -gt 0
-        # Mirror every flag that changes what a resume MEANS. Dropping -i was
-        # the worst omission: the interrupted run was installing each package as
-        # it built, and a resume without it rebuilds the rest while later
-        # packages compile against the old ABIs — the rule-11 hazard the -i
-        # ordering exists to prevent. --no-deps and --no-sync change the
-        # selection and the build inputs; --allow-broken-rustc is required
-        # outright when the probe was bypassed. The tip below already told the
-        # user to add "-s -i", so the command printed above it contradicted the
-        # advice right next to it.
-        set -l resume_args --lanes "$lane_count" --jobs "$jobs_override" --intensity "$intensity_level"
-        # -fi implies -i, so one flag preserves both halves of the semantics;
-        # a plain -i resume keeps its same-version check.
-        if test "$force_install_flag" = "1"
-            set -a resume_args --forceinstall
-        else if test "$install_flag" = "1"
-            set -a resume_args --install
-        end
-        if test "$no_deps_flag" -eq 1
-            set -a resume_args --no-deps
-        end
-        if test "$no_sync_flag" = "1"
-            set -a resume_args --no-sync
-        end
-        if test $allow_broken_rustc -eq 1
-            set -a resume_args --allow-broken-rustc
-        end
-        echo ""
-        echo "To resume, run:"
-        echo "  build-all.fish "(string join ' ' -- $resume_args)" "(string join ' ' -- $remaining)""
-        echo "(Tip: add -s so already-built pkgs are skipped.)"
+    switch $outcome
+        case success
+            # With -i every package was installed right after its build, so there
+            # is no collective end-install step anymore.
+            return 0
+        case interrupted
+            return 130
     end
     return 1
 end
