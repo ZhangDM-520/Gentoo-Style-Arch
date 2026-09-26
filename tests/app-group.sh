@@ -91,6 +91,13 @@ order_seq() {
         | grep -E '^ +[0-9]+\. ' | awk '{print $2}' | tr -d '\r'
 }
 
+# Same numbered rows as a `-l` listing prints (the listing has no run record:
+# listing/dry-run runs never start a build, so the rows ARE the data channel).
+listed_seq() {
+    sed -n '/Selected packages in dependency order/,$p' "$1" \
+        | grep -E '^ +[0-9]+\. ' | awk '{print $2}' | tr -d '\r'
+}
+
 # ── 1. Loader: missing app.list is an error ─────────────────────────────────
 mv "$fixture/config/groups/app.list" "$fixture/app.list.bak"
 if run_quiet "$fixture/o1" --list; then
@@ -131,14 +138,17 @@ expected3=$(printf 'app1\napp2\napp3')
     || fail "non-TTY order wrong: got [$(echo "$seq3" | tr '\n' ' ')], want [app1 app2 app3]" "$fixture/o3"
 grep -q 'extdep' <(order_seq "$fixture/o3") \
     && fail "app group pulled its non-app dependency extdep into the run" "$fixture/o3"
-grep -q 'Total: 3 packages' "$fixture/o3" \
+# The count is DATA (the listed rows); the "Total: N packages" sentence is
+# rendering, pinned once in tests/dashboard.sh's prose section.
+[ "$(order_seq "$fixture/o3" | grep -c .)" = 3 ] \
     || fail "non-TTY -n -g app did not preview exactly 3 packages" "$fixture/o3"
 
 # ── 4. -l: whole group, no prompt (non-TTY and on a PTY) ────────────────────
 run_quiet "$fixture/o4" -l -g app \
     || fail "-l -g app failed" "$fixture/o4"
-grep -q 'Selected packages in dependency order (3)' "$fixture/o4" \
-    || fail "-l -g app did not list all three members" "$fixture/o4"
+# The listed rows carry the membership (the header count is rendering).
+[ "$(listed_seq "$fixture/o4")" = "$expected3" ] \
+    || fail "-l -g app did not list all three members: got [$(listed_seq "$fixture/o4" | tr '\n' ' ')]" "$fixture/o4"
 grep -q 'choose what to build' "$fixture/o4" \
     && fail "-l prompted on a pipe" "$fixture/o4"
 # On a PTY with no input available: a prompting -l would block (timeout) or
@@ -146,8 +156,8 @@ grep -q 'choose what to build' "$fixture/o4" \
 if ! run_pty '' "$fixture/o4p" "$fixture/state-l" -l -g app; then
     fail "-l -g app on a PTY exited non-zero (it must never prompt)" "$fixture/o4p"
 fi
-grep -q 'Selected packages in dependency order (3)' "$fixture/o4p" \
-    || fail "-l -g app on a PTY did not list all three members" "$fixture/o4p"
+[ "$(listed_seq "$fixture/o4p")" = "$expected3" ] \
+    || fail "-l -g app on a PTY did not list all three members: got [$(listed_seq "$fixture/o4p" | tr '\n' ' ')]" "$fixture/o4p"
 
 # ── 5. PTY + Enter: menu renders, whole group builds ────────────────────────
 run_pty '\n' "$fixture/o5" "$fixture/state-5" -n -g app \
@@ -159,8 +169,6 @@ grep -qF '[ ]' "$fixture/o5" \
 seq5=$(order_seq "$fixture/o5")
 [ "$seq5" = "$expected3" ] \
     || fail "Enter should build the whole group, got [$(echo "$seq5" | tr '\n' ' ')]" "$fixture/o5"
-grep -q 'Total: 3 packages' "$fixture/o5" \
-    || fail "Enter did not preview exactly 3 packages" "$fixture/o5"
 
 # ── 6. PTY + toggle: only the checked subset ────────────────────────────────
 run_pty '2\n\n' "$fixture/o6" "$fixture/state-6" -n -g app \
@@ -170,8 +178,6 @@ grep -qF '[x]' "$fixture/o6" \
 seq6=$(order_seq "$fixture/o6")
 [ "$seq6" = "app2" ] \
     || fail "checked-only preview wrong: got [$(echo "$seq6" | tr '\n' ' ')], want [app2]" "$fixture/o6"
-grep -q 'Total: 1 packages' "$fixture/o6" \
-    || fail "checked-only preview did not report 1 package" "$fixture/o6"
 
 # ── 7. PTY + q: abort with non-zero ─────────────────────────────────────────
 if run_pty 'q\n' "$fixture/o7" "$fixture/state-7" -n -g app; then
@@ -194,6 +200,19 @@ run_pty '2\n\n' "$fixture/o9" "$fixture/state-9" \
     || fail "PTY build -g app with toggle input failed" "$fixture/o9"
 grep -q 'choose what to build' "$fixture/o9" \
     || fail "real build did not prompt" "$fixture/o9"
+# The real build emits a run record (PTY capture — the parsers strip the
+# slave's \r): the prompt's answer decided the SELECTION, and the record says
+# what that selection was and what happened to it.
+[ "$(rr_scalar order <"$fixture/o9")" = "app2" ] \
+    || fail "recorded selection is not exactly app2: $(rr_scalar order <"$fixture/o9")" "$fixture/o9"
+[ "$(rr_scalar outcome <"$fixture/o9")" = "success" ] \
+    || fail "recorded outcome is not success: $(rr_scalar outcome <"$fixture/o9")" "$fixture/o9"
+[ "$(rr_row app2 status <"$fixture/o9")" = "succeeded" ] \
+    || fail "app2 row is not succeeded: $(rr_row app2 <"$fixture/o9")" "$fixture/o9"
+[ "$(rr_row app2 rc <"$fixture/o9")" = "0" ] \
+    || fail "app2 row rc is not 0: $(rr_row app2 <"$fixture/o9")" "$fixture/o9"
+[ "$(rr_row app2 reason <"$fixture/o9")" = "ok" ] \
+    || fail "app2 row reason is not ok: $(rr_row app2 <"$fixture/o9")" "$fixture/o9"
 [ -f "$fixture/state-9/logs/app2.log" ] \
     || fail "checked package app2 was not built" "$fixture/o9"
 for unbuilt in app1 app3 extdep gitp1; do

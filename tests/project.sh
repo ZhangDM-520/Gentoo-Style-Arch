@@ -141,14 +141,15 @@ require_fail 'the unrelated name zzzz'
 require_not_in 'the unrelated name zzzz' 'Did you mean'
 
 # --- exact extra forms resolve, and say so ---------------------------------
+# The substitution announcements themselves are rendering — their wordings
+# ('matched recipe … case-sensitive') are pinned once in tests/dashboard.sh's
+# prose section; what is pinned here is the RESOLUTION, as rows.
 run -n --no-deps MESA-GIT
 require_ok 'the case-variant ID MESA-GIT'
-require_in 'the case-variant ID MESA-GIT' 'case-sensitive'
 [[ $(rows) == 'mesa-git' ]] || fail "MESA-GIT resolved to '$(rows)', not mesa-git"
 
 run -n --no-deps zen-browser
 require_ok 'the pacman name zen-browser'
-require_in 'the pacman name zen-browser' 'zen-browser-pgo'
 [[ $(rows) == 'zen-browser-pgo' ]] ||
     fail "zen-browser resolved to '$(rows)', not zen-browser-pgo"
 
@@ -157,6 +158,8 @@ require_in 'the pacman name zen-browser' 'zen-browser-pgo'
 run -n --no-deps libstdc++-snapshot
 require_ok 'the split output libstdc++-snapshot'
 require_in 'the split output libstdc++-snapshot' 'gcc-snapshot'
+[[ $(rows) == 'gcc-snapshot' ]] ||
+    fail "libstdc++-snapshot resolved to '$(rows)', not gcc-snapshot"
 
 # --- the two original forms still resolve, and stay silent -----------------
 run -n --no-deps mesa-git
@@ -210,9 +213,10 @@ require_ok 'the git listing'
 git_rows=$(rows | wc -l)
 [[ $git_rows -lt $all_rows ]] ||
     fail "-l -g git listed $git_rows packages - the selection was ignored"
-[[ $out == *"Ranges index this list"* ]] ||
-    fail "the selection listing does not say what its indices are for: $out"
+# The listing's own rows are the index map (the "Ranges index this list" note
+# is rendering, pinned once in tests/dashboard.sh's prose section).
 listed_22=$(rows | sed -n '22p')
+[[ -n $listed_22 ]] || fail "-l -g git lists $git_rows packages - row 22 is empty"
 
 run -n -g git 22..22
 require_ok 'the range -g git 22..22'
@@ -227,7 +231,8 @@ require_in 'the out-of-bounds range 900..950' "build-all.fish -l -g git"
 
 run -n -g git 1..999
 require_ok 'the over-long range 1..999'
-require_in 'the over-long range 1..999' 'clamped'
+# Clamping is DATA: 1..999 covers the whole selection — exactly $git_rows rows,
+# no more (the "clamped" note is rendering, pinned in the prose section).
 [[ $(rows | wc -l) -eq $git_rows ]] ||
     fail "1..999 built $(rows | wc -l) packages, not the whole $git_rows-package selection"
 
@@ -240,13 +245,18 @@ require_fail 'the reversed range 38..22'
 require_in 'the reversed range 38..22' 'empty'
 
 # --- a bare name that grows into a dependency chain says so ----------------
+# Growth is DATA (more rows than the named recipe), and --no-deps is exactly
+# one row (the note wording lives in the prose section).
 run -n niri-spicy-git
 require_ok 'the bare name niri-spicy-git'
-require_in 'the bare name niri-spicy-git' 'dependency expansion added'
+niri_rows=$(rows | wc -l)
+[[ $niri_rows -gt 1 ]] ||
+    fail "a bare niri-spicy-git listed $niri_rows row(s) - the dependency chain did not expand"
 
 run -n --no-deps niri-spicy-git
 require_ok 'the bare name with --no-deps'
-require_not_in 'the bare name with --no-deps' 'dependency expansion'
+[[ $(rows) == 'niri-spicy-git' ]] ||
+    fail "--no-deps niri-spicy-git listed [$(rows | tr '\n' ' ')], not exactly niri-spicy-git"
 
 printf 'cli hints fixture: PASS (%s recipes, %s-row selection indexed, extra forms announced)\n' \
     "$recipes" "$git_rows"

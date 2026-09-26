@@ -21,8 +21,10 @@ set -euo pipefail
 #   3. expires   — the credential dies mid-run: say so ONCE (the per-poll
 #                  re-print spammed the terminal), keep draining, and do not
 #                  report success while packages are left unbuilt.
-#   4. promptable— nothing works non-interactively, but the dispatcher owns a
-#                  terminal, so it must re-elevate itself (pty sub-case).
+#   4. cold+TTY  — a terminal is attached but the policy is ALL `sudo -n`, so
+#                  there is nothing to prompt for: the run must REFUSE at
+#                  preflight with the same named message as 2 and never ask
+#                  for a credential (pty sub-case; zero bare `sudo -v`).
 #
 # The builder's keepalive interval is 150 s of real time; the fake `date` in
 # the fixture bin advances a virtual clock 300 s per call, so that interval
@@ -81,10 +83,6 @@ EOF
 cat >"$fixture/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GSA_FAKE_SUDO_LOG"
-interactive=1
-for arg in "$@"; do
-    [[ $arg == -n ]] && interactive=0
-done
 case "$GSA_FAKE_SUDO_MODE" in
     nopasswd)
         [[ " $* " == *' pacman '* ]] && exit 0
@@ -100,16 +98,6 @@ case "$GSA_FAKE_SUDO_MODE" in
             validations=$((validations + 1))
             printf '%s\n' "$validations" >"$GSA_FAKE_SUDO_STATE/validations"
             ((validations <= 2)) && exit 0
-        fi
-        exit 1
-        ;;
-    promptable)
-        # Nothing works non-interactively until a human validates the
-        # credential — after which `sudo -n` behaves like any warmed-up host.
-        [[ -e $GSA_FAKE_SUDO_STATE/elevated ]] && exit 0
-        if ((interactive)) && [[ " $* " == *' -v '* ]]; then
-            touch "$GSA_FAKE_SUDO_STATE/elevated"
-            exit 0
         fi
         exit 1
         ;;
@@ -175,6 +163,11 @@ fi
 if [[ $(built_count nopasswd) -ne 4 ]]; then
     fail "nopasswd run built $(built_count nopasswd)/4 packages" "$run_output"
 fi
+if [[ $(rr_scalar outcome <<<"$run_output") != success ]] \
+    || [[ $(rr_rows <<<"$run_output" | awk '$2 == "succeeded"' | wc -l) -ne 4 ]]; then
+    fail "nopasswd run's record is not 4 succeeded rows (outcome $(rr_scalar outcome <<<"$run_output")):" \
+        "$(rr_rows <<<"$run_output")"
+fi
 if grep -q -E -- '^-v$' "$fixture/state-nopasswd/sudo.log"; then
     fail "nopasswd run validated a credential it never uses: $(cat "$fixture/state-nopasswd/sudo.log")"
 fi
@@ -190,6 +183,15 @@ fi
 if [[ $(built_count cold) -ne 0 ]]; then
     fail "cold run built $(built_count cold) package(s) before noticing sudo was unusable"
 fi
+# The record says NOTHING started: the refusal is an outcome, not a message.
+want_all=$(printf '%s\n' "${ids[@]}")
+if [[ $(rr_remaining <<<"$run_output") != "$want_all" ]]; then
+    fail "cold run's resume set is not every package:" "$(rr_rows <<<"$run_output")"
+fi
+for id in "${ids[@]}"; do
+    [[ $(rr_row "$id" <<<"$run_output") == "$id never-started - - preflight-refused" ]] \
+        || fail "cold run's $id row is wrong: $(rr_row "$id" <<<"$run_output")"
+done
 
 # 3. Credential dies mid-run: one message, non-zero exit, packages reported
 #    as remaining instead of a silent "All builds succeeded!".
@@ -203,8 +205,20 @@ if [[ $(count_occurrences "$run_output" "$STOPPED") -ne 1 ]]; then
     fail "expired-credential run printed the stop message $(count_occurrences "$run_output" "$STOPPED")x (want 1)" \
         "$run_output"
 fi
-if ! printf '%s\n' "$run_output" | grep -F -- 'Remaining:' >/dev/null; then
-    fail "expired-credential run did not report remaining packages" "$run_output"
+# "Reported as remaining" is DATA: one row per package and the resume set is
+# exactly the non-succeeded rows (which siblings finished before the stop is
+# timing; that they are all accounted for is not).
+if [[ $(rr_rows <<<"$run_output" | wc -l) -ne ${#ids[@]} ]]; then
+    fail "expired-credential run did not record one row per package:" "$(rr_rows <<<"$run_output")"
+fi
+if [[ -z $(rr_remaining <<<"$run_output") ]]; then
+    fail "expired-credential run's resume set is empty although packages never built:" \
+        "$(rr_rows <<<"$run_output")"
+fi
+succeeded=$(rr_rows <<<"$run_output" | awk '$2 == "succeeded"' | wc -l)
+if [[ $(rr_remaining <<<"$run_output" | wc -l) -ne $((${#ids[@]} - succeeded)) ]]; then
+    fail "expired-credential run's resume set does not cover every non-succeeded row:" \
+        "$(rr_rows <<<"$run_output")"
 fi
 if grep -q -E -- '^-v$' "$fixture/state-expires/sudo.log"; then
     fail "expired-credential run prompted a password with no terminal attached:" \
@@ -214,33 +228,51 @@ if find "$fixture/state-expires/logs" -maxdepth 1 -name '.lane*.result*' -print 
     fail "lane result artifact remained after the sudo stop"
 fi
 
-# 4. Same shape as 3, but attached to a terminal: the dispatcher must ask for
-#    the password itself and carry on.
+# 4. Same shape as 2, but attached to a terminal: the privilege policy is ALL
+#    `sudo -n` (the builder never prompts — the old interactive re-elevation is
+#    gone), so a TTY must change NOTHING: refuse at preflight with the named
+#    message, build nothing, and never ask for a credential (zero bare `sudo
+#    -v` in the log — a prompt attempt is the regression this pins).
 if command -v script >/dev/null 2>&1; then
-    mkdir -p "$fixture/state-prompt"
+    mkdir -p "$fixture/state-tty-cold"
     pty_rc=0
     pty_output=$(
-        script -qec "PATH=\"$fixture/bin:\$PATH\" GSA_STATE_DIR='$fixture/state-prompt' \
-GSA_FAKE_SUDO_MODE=promptable GSA_FAKE_SUDO_LOG='$fixture/state-prompt/sudo.log' \
-GSA_FAKE_SUDO_STATE='$fixture/state-prompt' GSA_FAKE_DATE_COUNTER='$fixture/state-prompt/clock' \
-GSA_FAKE_MARKER_DIR='$fixture/state-prompt/built' GSA_FAKE_BUILD_SECONDS=1.2 \
+        script -qec "PATH=\"$fixture/bin:\$PATH\" GSA_STATE_DIR='$fixture/state-tty-cold' \
+GSA_FAKE_SUDO_MODE=cold GSA_FAKE_SUDO_LOG='$fixture/state-tty-cold/sudo.log' \
+GSA_FAKE_SUDO_STATE='$fixture/state-tty-cold' GSA_FAKE_DATE_COUNTER='$fixture/state-tty-cold/clock' \
+GSA_FAKE_MARKER_DIR='$fixture/state-tty-cold/built' GSA_FAKE_BUILD_SECONDS=1.2 \
 fish '$fixture/build-all.fish' --allow-broken-rustc --no-deps --no-sync \
 --lanes 2 --jobs 2 --install ${ids[*]}" /dev/null 2>&1
     ) || pty_rc=$?
-    if [[ $pty_rc -ne 0 ]]; then
-        fail "interactive run failed (rc=$pty_rc) instead of re-elevating itself" "$pty_output"
+    if [[ $pty_rc -eq 0 ]]; then
+        fail "cold-credential TTY run succeeded although nothing can install" "$pty_output"
+    fi
+    if [[ $(count_occurrences "$pty_output" "$REFUSED") -ne 1 ]]; then
+        fail "cold-credential TTY run did not refuse exactly once:" "$pty_output"
+    fi
+    if [[ $pty_output != *'sudo cannot install non-interactively'* ]]; then
+        fail "cold-credential TTY run lacks the named refusal text:" "$pty_output"
     fi
     if [[ $(count_occurrences "$pty_output" "$STOPPED") -ne 0 ]]; then
-        fail "interactive run stopped dispatch instead of asking for a password" "$pty_output"
+        fail "cold-credential TTY run stopped dispatch instead of refusing up front" "$pty_output"
     fi
-    prompts=$(grep -c -E -- '^-v$' "$fixture/state-prompt/sudo.log" || true)
-    if [[ $prompts -ne 1 ]]; then
-        fail "interactive run prompted $prompts time(s) (want 1):" \
-            "$(cat "$fixture/state-prompt/sudo.log")"
+    if grep -q -E -- '^-v$' "$fixture/state-tty-cold/sudo.log"; then
+        fail "cold-credential TTY run asked for a credential (policy is all sudo -n):" \
+            "$(cat "$fixture/state-tty-cold/sudo.log")"
     fi
-    if [[ $(built_count prompt) -ne 4 ]]; then
-        fail "interactive run built $(built_count prompt)/4 packages" "$pty_output"
+    if [[ $(built_count tty-cold) -ne 0 ]]; then
+        fail "cold-credential TTY run built $(built_count tty-cold) package(s) before refusing"
     fi
+    # The record carries the refusal as data: nothing started, everything
+    # remains (PTY capture — the parsers strip the slave's \r).
+    want_all=$(printf '%s\n' "${ids[@]}")
+    if [[ $(rr_remaining <<<"$pty_output") != "$want_all" ]]; then
+        fail "cold-credential TTY run's resume set is not every package:" "$(rr_rows <<<"$pty_output")"
+    fi
+    for id in "${ids[@]}"; do
+        [[ $(rr_row "$id" <<<"$pty_output") == "$id never-started - - preflight-refused" ]] \
+            || fail "cold-credential TTY run's $id row is wrong: $(rr_row "$id" <<<"$pty_output")"
+    done
 fi
 
 if ps -eo args= | grep -F "$fixture" | grep -v grep >/dev/null; then

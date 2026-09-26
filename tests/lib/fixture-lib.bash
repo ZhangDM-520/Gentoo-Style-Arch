@@ -225,3 +225,109 @@ run_builder() {
 makepkg_printsrcinfo() {
     GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$1"
 }
+
+# ─── Run-record parsing — the machine-block interface ────────────────────────
+# print_run_record emits one bounded block at the end of every started run:
+#
+#   --- run record begin ---
+#   format: 1
+#   selection-source: groups=… packages=… ranges=…
+#   order: p1 p2 p3
+#   lanes: N
+#   normal-jobs: N
+#   core-jobs: N
+#   intensity: LEVEL
+#   outcome: success|failed|interrupted
+#   rc: N
+#   pkg status rc dur reason      ← one row per package, topological order
+#   --- run record end ---
+#
+# These helpers parse that block out of a captured builder run (the combined
+# stdout+stderr run_builder produces, or a fixture's own capture file). All
+# of them read stdin, so both `<<<"$output"` and `<"$dir/out.txt"` work;
+# trailing CR is stripped first, so PTY captures parse like pipe output. Each
+# helper fails loudly when the block is missing or duplicated instead of
+# letting a fixture fall back to asserting on prose outside it. Everything
+# derived stays in the fixture: these four parse, they do not interpret.
+
+# rr_extract — the block BODY (between the two markers, exclusive). Fails
+# unless exactly one block is present.
+rr_extract() {
+    awk '
+        { sub(/\r$/, "") }
+        /^--- run record begin ---$/ { blocks++; inb = 1; next }
+        /^--- run record end ---$/ { inb = 0; next }
+        inb { print }
+        END {
+            if (blocks != 1) {
+                printf("rr_extract: expected exactly one run-record block, saw %d\n", blocks) > "/dev/stderr"
+                exit 1
+            }
+        }
+    '
+}
+
+# rr_scalar KEY — the value of one `key: value` plan scalar (format,
+# selection-source, order, lanes, normal-jobs, core-jobs, intensity, outcome,
+# rc). Fails when the key is absent.
+rr_scalar() {
+    rr_extract | awk -v key="$1" '
+        index($0, key ": ") == 1 && !found {
+            print substr($0, length(key) + 3)
+            found = 1
+        }
+        END {
+            if (!found) {
+                printf("rr_scalar: no %s scalar in the run record\n", key) > "/dev/stderr"
+                exit 1
+            }
+        }
+    '
+}
+
+# rr_rows — the package rows only (`pkg status rc dur reason`, one per line,
+# topological order). Anything non-empty that is not a `key: value` scalar is
+# a row, so a malformed row stays visible to the fixture's grammar check
+# instead of being filtered away here.
+rr_rows() {
+    rr_extract | awk 'NF > 0 && $0 !~ /^[a-z0-9-]+: / { print }'
+}
+
+# rr_row PKG [status|rc|dur|reason] — one package's row, or one of its
+# fields (field names mirror the builder's own run_record_field). The reason
+# is the remainder of the line. Fails when the package has no row.
+rr_row() {
+    rr_rows | awk -v pkg="$1" -v field="${2:-}" '
+        $1 == pkg && !found {
+            found = 1
+            if (field == "") { print; next }
+            if (field == "status") { print $2; next }
+            if (field == "rc") { print $3; next }
+            if (field == "dur") { print $4; next }
+            if (field == "reason") {
+                for (i = 5; i <= NF; i++) printf("%s%s", (i > 5 ? " " : ""), $i)
+                print ""
+                next
+            }
+            bad = 1
+        }
+        END {
+            if (!found) {
+                printf("rr_row: package %s has no run-record row\n", pkg) > "/dev/stderr"
+                exit 1
+            }
+            if (bad) {
+                printf("rr_row: unknown field %s (want status|rc|dur|reason)\n", field) > "/dev/stderr"
+                exit 1
+            }
+        }
+    '
+}
+
+# rr_remaining — the resume set: every row whose status is not `succeeded`,
+# in row (= topological) order. This is exactly what the builder's
+# continuation suggestion lists — a failed package must rebuild BEFORE its
+# dependents, so it stays in (2026-09-26).
+rr_remaining() {
+    rr_rows | awk '$2 != "succeeded" { print $1 }'
+}

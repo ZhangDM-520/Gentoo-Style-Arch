@@ -54,6 +54,21 @@ run_expecting_failure() {
         exit 1
     fi
     RESUME_CMD=$(grep '^  build-all.fish ' <<<"$RESUME_OUTPUT" | head -1)
+    # The machine block is the outcome interface: every failing run records
+    # `outcome: failed`, and the suggestion must list exactly the record's
+    # non-succeeded rows, in row order — one owner for what remains.
+    if [[ $(rr_scalar outcome <<<"$RESUME_OUTPUT") != failed ]]; then
+        printf '%s: run record outcome is %s, want failed:\n%s\n' \
+            "$label" "$(rr_scalar outcome <<<"$RESUME_OUTPUT")" "$RESUME_OUTPUT" >&2
+        exit 1
+    fi
+    RESUME_SET=$(rr_remaining <<<"$RESUME_OUTPUT" | tr '\n' ' ')
+    RESUME_SET=${RESUME_SET% }
+    if [[ "$RESUME_CMD" != *" $RESUME_SET" ]]; then
+        printf '%s: resume command does not end with the run-record resume set [%s]:\n  %s\n' \
+            "$label" "$RESUME_SET" "$RESUME_CMD" >&2
+        exit 1
+    fi
 }
 
 # ─── A -i run must resume with --install, or it silently stops installing ────
@@ -114,8 +129,10 @@ fi
 # succeeded+failed, which DROPPED the failed package: a user copying the
 # suggested command rebuilt only the not-yet-attempted packages and silently
 # left the failed one stale, so its dependents then built against the stale
-# installed copy. Both the resume command and the "Remaining" count must
-# include the failed package, with a note saying it has to rebuild first.
+# installed copy. The resume set is DATA now — the record's non-succeeded rows
+# in row order, p2 (failed, must rebuild first) before p3 (never started) —
+# and both the resume command and the summary follow it. The prose note that
+# says so is rendering, pinned once in tests/dashboard.sh's prose section.
 dir="$fixture/failed-included"
 make_case_workspace "$dir"
 run_expecting_failure "$dir" 'failed included' --no-deps --allow-broken-rustc --no-sync
@@ -129,23 +146,24 @@ if ! grep -qw 'p3' <<<"$RESUME_CMD"; then
         "$RESUME_CMD" >&2
     exit 1
 fi
-pre_p2=${RESUME_CMD%%p2*}
-pre_p3=${RESUME_CMD%%p3*}
-if ((${#pre_p2} > ${#pre_p3})); then
-    printf 'failed included: resume command lists the failed package after the unbuilt one:\n  %s\n' \
-        "$RESUME_CMD" >&2
+if [[ $(rr_row p2 status <<<"$RESUME_OUTPUT") != failed ]]; then
+    printf 'failed included: p2 row is %s, want failed\n' \
+        "$(rr_row p2 <<<"$RESUME_OUTPUT")" >&2
     exit 1
 fi
-remaining_line=$(printf '%s\n' "$RESUME_OUTPUT" | grep '^Remaining:' | tail -1)
-remaining_count=$(printf '%s\n' "$remaining_line" | tr -dc '0-9')
-if [[ "$remaining_count" != 2 ]]; then
-    printf 'failed included: Remaining must count p2 (failed) + p3 (unbuilt) = 2, got: %s\n%s\n' \
-        "${remaining_count:-<none>}" "$RESUME_OUTPUT" >&2
+if [[ $(rr_row p2 reason <<<"$RESUME_OUTPUT") != build-failed ]]; then
+    printf 'failed included: p2 reason is %s, want build-failed\n' \
+        "$(rr_row p2 reason <<<"$RESUME_OUTPUT")" >&2
     exit 1
 fi
-if ! printf '%s\n' "$RESUME_OUTPUT" | grep -q 'failed package(s) included'; then
-    printf 'failed included: no note saying the failed package must rebuild:\n%s\n' \
-        "$RESUME_OUTPUT" >&2
+if [[ $(rr_row p3 status <<<"$RESUME_OUTPUT") != never-started ]]; then
+    printf 'failed included: p3 row is %s, want never-started\n' \
+        "$(rr_row p3 <<<"$RESUME_OUTPUT")" >&2
+    exit 1
+fi
+if [[ $(rr_remaining <<<"$RESUME_OUTPUT" | tr '\n' ' ') != 'p2 p3 ' ]]; then
+    printf 'failed included: resume set must be p2 (failed) then p3 (unbuilt), got: %s\n' \
+        "$(rr_remaining <<<"$RESUME_OUTPUT" | tr '\n' ' ')" >&2
     exit 1
 fi
 

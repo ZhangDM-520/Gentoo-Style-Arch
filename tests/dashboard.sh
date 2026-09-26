@@ -29,6 +29,11 @@ set -euo pipefail
 # old 50ms TERM blitz from re-interrupting a running pacman's unlock) and far
 # below the stub lanes' natural ~10s runtime, so a pass proves the escalation
 # killed the lanes rather than their own loop ending.
+#
+# The file's last section is the battery's ONE prose-rendering test (wrapped in
+# a subshell like the other absorbed subjects): the run record is the
+# interface and tests/run-record.sh is its test surface — this section alone
+# keeps the human summary, outcome lines and notes honest.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-dashboard.XXXXXX")
@@ -287,3 +292,112 @@ fi
 
 rm -f "$dir/rows.txt"
 printf 'dashboard fixture: PASS\n'
+
+# ==== prose rendering ====
+# The ONE place the battery asserts the human prose. Everything else asserts
+# the machine block (tests/run-record.sh pins its contract) or the numbered
+# listing rows; these wordings are the RENDERING adapter — the summary counts,
+# the per-package outcome lines, the dry-run/listing headers, and the
+# resolution/expansion notes whose behaviour the row fixtures already pin.
+# A wording change breaks exactly this section, and updating it here is the
+# adapter following the interface, not nine fixtures chasing prose.
+(
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
+    fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-prose-render.XXXXXX")
+    trap 'rm -rf -- "$fixture"' EXIT
+
+    fail() {
+        printf 'prose rendering fixture: %s\n' "$1" >&2
+        exit 1
+    }
+
+    # A chain p1 -> p2 -> p3 (so a bare name expands into a chain AND the
+    # failure case's counts are deterministic: p1 succeeds, p2 fails, p3 is
+    # never started). The trivial stubs from the helper: makepkg fails on
+    # GSA_FAKE_FAIL_PACKAGE and touches an archive otherwise.
+    ws=$fixture/ws
+    make_workspace "$ws" 1 2 low
+    for id in p1 p2 p3; do
+        add_package "$ws" "$id" "$gsa_meta_any"
+    done
+    printf 'p2:p1\np3:p2\n' >"$ws/config/dependencies.conf"
+    stub_makepkg "$ws"
+    stub_sudo "$ws"
+    stub_pacman "$ws"
+
+    prose() { # [args...] -> $out
+        out=$(
+            PATH="$ws/bin:$PATH" \
+                GSA_STATE_DIR="$ws/state" \
+                GSA_FAKE_PACMAN_LOG="$ws/pacman.log" \
+                GSA_CPU_THREADS=8 \
+                GSA_MEMORY_GIB=16 \
+                fish "$ws/build-all.fish" "$@" 2>&1
+        ) || true
+    }
+    has() { [[ $out == *"$1"* ]] || fail "output does not render '$1': $out"; }
+    hasnt() { [[ $out != *"$1"* ]] || fail "output unexpectedly renders '$1': $out"; }
+
+    # P1 — success summary + per-package outcome line + the plan sentence.
+    prose --allow-broken-rustc --no-deps --no-sync --intensity low p1 p2 p3
+    has 'All builds succeeded!'
+    has 'Built: 3 packages'
+    grep -qE '^  ✓ p1 \([0-9]m[0-9][0-9]s\)' <<<"$out" \
+        || fail "no per-package success line for p1: $out"
+    grep -qE 'parallelism: [0-9]+ CPU threads, [0-9]+ GiB available, intensity low, [0-9]+ lane\(s\), normal -j[0-9]+, core -j[0-9]+' <<<"$out" \
+        || fail "the parallelism sentence lost its shape: $out"
+
+    # P2 — failure summary: heading, the five counts labels with their values,
+    # the failed-package note, the resume block and its tip, and the plain-mode
+    # per-package failure line.
+    out=$(
+        PATH="$ws/bin:$PATH" \
+            GSA_STATE_DIR="$ws/state" \
+            GSA_FAKE_PACMAN_LOG="$ws/pacman.log" \
+            GSA_FAKE_FAIL_PACKAGE=p2 \
+            GSA_CPU_THREADS=8 \
+            GSA_MEMORY_GIB=16 \
+            fish "$ws/build-all.fish" --allow-broken-rustc --no-deps --no-sync \
+            --intensity low p1 p2 p3 2>&1
+    ) || true
+    has 'Build failed'
+    has 'Successful builds: 1'
+    has 'Failed builds:     1'
+    has 'Blocked:           0'
+    has 'Deferred:          0'
+    has 'Remaining:         2'
+    has 'note: 1 failed package(s) included'
+    has 'To resume, run:'
+    has '(Tip: add -s so already-built pkgs are skipped.)'
+    grep -qE '^  ✗ p2: BUILD FAILED \(rc=1, [0-9]m[0-9][0-9]s\)' <<<"$out" \
+        || fail "no per-package failure line for p2: $out"
+
+    # P3 — dry run preview.
+    prose --allow-broken-rustc --no-deps --no-sync -n p1 p2 p3
+    has 'Build order (dry run):'
+    has 'Total: 3 packages'
+
+    # P4 — the selection listing and its index note.
+    prose --allow-broken-rustc --no-deps --no-sync -l -g git
+    has 'Selected packages in dependency order (3)'
+    has 'Ranges index this list'
+
+    # P5 — an over-long range clamps and says so.
+    prose --allow-broken-rustc --no-deps --no-sync -n -g git 1..999
+    has 'end clamped to 3 (the selection size)'
+
+    # P6 — a case-variant reference resolves, and the substitution is
+    # announced with the case rule.
+    prose --allow-broken-rustc --no-deps --no-sync -n --no-deps P1
+    has 'matched recipe'
+    has 'case-sensitive'
+
+    # P7 — a bare name grows into its chain and says so; --no-deps stays
+    # silent and single.
+    prose --allow-broken-rustc --no-sync -n p2
+    has 'dependency expansion added 1 of the 2 selected packages'
+    prose --allow-broken-rustc --no-deps --no-sync -n --no-deps p2
+    hasnt 'dependency expansion added'
+
+    printf 'prose rendering fixture: PASS (summary counts, outcome lines, headers, notes)\n'
+)

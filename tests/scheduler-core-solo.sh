@@ -5,7 +5,8 @@ set -euo pipefail
 # (README, docs/architecture.md, docs/MEMORY.md): a core member builds alone
 # with its own, larger job budget, because its full -j is the memory peak the
 # guard exists for. Nothing asserted it. `tests/scheduler-intensity.sh` pins
-# the *plan numbers* (the parallelism: line) but not that the dispatcher
+# the *plan numbers* (the run record's plan scalars) but not that the
+# dispatcher
 # actually withholds other work while a core member runs, and
 # `GSA_CPU_THREADS`/`GSA_MEMORY_GIB` only pin the formula that prints them.
 #
@@ -144,12 +145,15 @@ output=$(
     exit 1
 }
 
-plan=$(printf '%s\n' "$output" | grep 'parallelism:' | head -1)
-normal_jobs=$(printf '%s\n' "$plan" | sed -E 's/.*normal -j([0-9]+).*/\1/')
-core_jobs=$(printf '%s\n' "$plan" | sed -E 's/.*core -j([0-9]+).*/\1/')
-if [[ -z $normal_jobs || -z $core_jobs || $normal_jobs == "$core_jobs" ]]; then
-    printf 'the xhigh plan does not separate the two budgets, so the budget\n' >&2
-    printf 'assertion below could not tell them apart: %s\n' "$plan" >&2
+# The plan numbers are DATA: the run record's normal-jobs / core-jobs scalars,
+# not the 'parallelism:' sentence (rendering, pinned once in dashboard.sh's
+# prose section).
+normal_jobs=$(rr_scalar normal-jobs <<<"$output")
+core_jobs=$(rr_scalar core-jobs <<<"$output")
+if [[ $normal_jobs == "$core_jobs" ]]; then
+    printf 'the xhigh plan does not separate the two budgets (normal-jobs=%s, core-jobs=%s),\n' \
+        "$normal_jobs" "$core_jobs" >&2
+    printf 'so the budget assertion below could not tell them apart\n' >&2
     exit 1
 fi
 

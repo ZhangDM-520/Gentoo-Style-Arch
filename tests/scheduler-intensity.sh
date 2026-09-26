@@ -30,11 +30,14 @@ EOF
 chmod +x "$fixture/bin/makepkg"
 
 declare -A expected
-expected[low]='1 lane(s), normal -j3, core -j3'
-expected[medium]='2 lane(s), normal -j3, core -j4'
-expected[high]='3 lane(s), normal -j3, core -j6'
-expected[xhigh]='4 lane(s), normal -j3, core -j7'
-expected[max]='6 lane(s), normal -j3, core -j9'
+# lanes / normal-jobs / core-jobs as the run record reports them (the
+# 'parallelism:' sentence is rendering; its wording is pinned once in
+# tests/dashboard.sh's prose section).
+expected[low]='1 3 3'
+expected[medium]='2 3 4'
+expected[high]='3 3 6'
+expected[xhigh]='4 3 7'
+expected[max]='6 3 9'
 
 for level in low medium high xhigh max; do
     output=$(
@@ -46,12 +49,20 @@ for level in low medium high xhigh max; do
             --allow-broken-rustc --no-deps --no-sync \
             --intensity "$level" "${ids[@]}" 2>&1
     )
-    plan=$(printf '%s\n' "$output" | grep 'parallelism:' | head -1)
-    if [[ "$plan" != *"intensity $level, ${expected[$level]}"* ]]; then
-        printf 'unexpected %s plan: %s\n' "$level" "$plan" >&2
+    read -r want_lanes want_normal want_core <<<"${expected[$level]}"
+    got="$(rr_scalar lanes <<<"$output") $(rr_scalar normal-jobs <<<"$output") $(rr_scalar core-jobs <<<"$output")"
+    want="$want_lanes $want_normal $want_core"
+    if [[ $got != "$want" ]]; then
+        printf 'unexpected %s plan (lanes normal-jobs core-jobs): got %s want %s\n' \
+            "$level" "$got" "$want" >&2
         exit 1
     fi
-    plan_jobs=$(printf '%s\n' "$plan" | sed -E 's/.*normal -j([0-9]+).*/\1/')
+    if [[ $(rr_scalar intensity <<<"$output") != "$level" ]]; then
+        printf 'the %s run recorded intensity %s\n' \
+            "$level" "$(rr_scalar intensity <<<"$output")" >&2
+        exit 1
+    fi
+    plan_jobs=$(rr_scalar normal-jobs <<<"$output")
     for id in "${ids[@]}"; do
         grep -F "fake makepkg $fixture/packages/$id" \
             "$fixture/state-$level/logs/$id.log" >/dev/null
@@ -83,7 +94,36 @@ if failing_output=$(
     printf 'failure fixture unexpectedly succeeded\n' >&2
     exit 1
 fi
-if ! printf '%s\n' "$failing_output" | grep -F -- '--intensity xhigh' >/dev/null; then
+if ! rr_scalar outcome <<<"$failing_output" | grep -qx failed; then
+    printf 'failure run recorded outcome %s:\n%s\n' \
+        "$(rr_scalar outcome <<<"$failing_output")" "$failing_output" >&2
+    exit 1
+fi
+if [[ $(rr_row p1 status <<<"$failing_output") != failed ]]; then
+    printf 'p1 row wrong in the failure run: %s\n' \
+        "$(rr_row p1 <<<"$failing_output")" >&2
+    exit 1
+fi
+# The resume set is exactly the non-succeeded rows in row order: p1 (failed —
+# it must rebuild before its dependents) first, and the lanes that were
+# already in flight drain to their own row outcomes, so the set's size is
+# deterministic even though which siblings finished is not.
+mapfile -t remaining < <(rr_remaining <<<"$failing_output")
+if [[ ${remaining[0]:-} != p1 ]]; then
+    printf 'the failed package is not first in the resume set: %s\n' \
+        "$(rr_remaining <<<"$failing_output" | tr '\n' ' ')" >&2
+    exit 1
+fi
+succeeded=$(rr_rows <<<"$failing_output" | awk '$2 == "succeeded"' | wc -l)
+if [[ ${#remaining[@]} -ne $((${#ids[@]} - succeeded)) ]]; then
+    printf 'resume set does not cover every non-succeeded row: %s\n' \
+        "$(rr_remaining <<<"$failing_output" | tr '\n' ' ')" >&2
+    exit 1
+fi
+# The continuation suggestion must preserve the plan flavour (continuation
+# rule: --intensity is mirrored as a value flag).
+suggest=$(printf '%s\n' "$failing_output" | grep '^  build-all\.fish ' | head -1)
+if [[ $suggest != *'--intensity xhigh'* ]]; then
     printf 'resume command did not preserve intensity:\n%s\n' "$failing_output" >&2
     exit 1
 fi

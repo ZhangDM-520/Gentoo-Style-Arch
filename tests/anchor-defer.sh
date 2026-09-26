@@ -126,6 +126,19 @@ printf '%s' "$output" >"$dir/out.txt"
 $output"
 
 # 2. a-stable is parked with a NAMED marker, not reported as a build failure.
+#    The record row is the outcome DATA (deferred = the lane rc-99 anchoring
+#    amendment, rc visible in the row); the DEFERRED marker itself is the
+#    human label, pinned here because only this scenario renders it.
+[[ $(rr_row a-stable status <<<"$output") == deferred ]] \
+    || fail "a-stable row is not deferred:
+$(rr_row a-stable <<<"$output")
+$output"
+[[ $(rr_row a-stable rc <<<"$output") == 99 ]] \
+    || fail "a-stable row does not carry the rc-99 defer code:
+$(rr_row a-stable <<<"$output")"
+[[ $(rr_row a-stable reason <<<"$output") == anchoring-refused ]] \
+    || fail "a-stable row reason is not anchoring-refused:
+$(rr_row a-stable <<<"$output")"
 grep -q 'DEFERRED' "$dir/out.txt" || fail "no DEFERRED marker for a-stable:
 $output"
 grep -q 'a-stable' "$dir/out.txt" || fail 'the DEFERRED marker does not name a-stable'
@@ -164,24 +177,40 @@ grep -qx 'c-plain' "$dir/fake/makepkg_calls" 2>/dev/null \
 $output"
 [[ -f $dir/packages/c-plain/c-plain-1.0.0-1-any.pkg.tar.zst ]] \
     || fail 'c-plain reports built but produced no archive'
+[[ $(rr_row c-plain status <<<"$output") == succeeded ]] \
+    || fail "c-plain row is not succeeded:
+$(rr_row c-plain <<<"$output")"
 
 # 6. b-dep depends on the parked recipe: never dispatched, honestly labelled —
 #    waiting on a deferral is not a dependency cycle.
 if grep -qx 'b-dep' "$dir/fake/makepkg_calls" 2>/dev/null; then
     fail 'b-dep built although its dependency a-stable was never built'
 fi
+[[ $(rr_row b-dep status <<<"$output") == blocked ]] \
+    || fail "b-dep row is not blocked:
+$(rr_row b-dep <<<"$output")"
+[[ $(rr_row b-dep reason <<<"$output") == waits-on-deferred ]] \
+    || fail "b-dep row reason is not waits-on-deferred:
+$(rr_row b-dep <<<"$output")"
+# The human label is scenario-bound rendering (the record says
+# 'waits-on-deferred'; only this fixture renders the sentence).
 grep -q 'waits on a deferred package' "$dir/out.txt" \
     || fail "b-dep's non-dispatch is not labelled as waiting on a deferred package:
 $output"
 
-# 7. The resume command names BOTH unbuilt packages — and only those: a resume
-#    must retry the parked recipe and its blocked dependent, not re-run c-plain.
+# 7. The resume set is DATA: the record's non-succeeded rows, in row order —
+#    the parked recipe and its blocked dependent, and ONLY those: a resume
+#    must retry a-stable and b-dep, not re-run c-plain. The suggestion line
+#    must carry that same set (one owner for what remains).
+[[ $(rr_remaining <<<"$output" | tr '\n' ' ') == 'a-stable b-dep ' ]] \
+    || fail "resume set must be exactly a-stable b-dep in row order, got:
+$(rr_remaining <<<"$output" | tr '\n' ' ')
+$output"
 resume=$(grep '^  build-all.fish ' "$dir/out.txt" | head -1) || true
 [[ -n $resume ]] || fail "no resume command in the failure summary:
 $output"
-[[ $resume == *a-stable* ]] || fail "resume command omits the parked a-stable: $resume"
-[[ $resume == *b-dep* ]] || fail "resume command omits the blocked b-dep: $resume"
-[[ $resume != *c-plain* ]] || fail "resume command would rebuild the finished c-plain: $resume"
+[[ $resume == *' a-stable b-dep' ]] \
+    || fail "resume command does not carry the run-record resume set [a-stable b-dep]: $resume"
 [[ $resume == *--intensity* ]] || fail "resume command lost its flags: $resume"
 
 printf 'anchor defer fixture: PASS (parked a-stable, waited b-dep, built c-plain)\n'
