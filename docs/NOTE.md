@@ -35,6 +35,56 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-26 (architecture-deepening wave-2) — install plan/executor split, lane outcome vocabulary, run-record fixtures
+
+Feature record, wave 2 of the same refactor (two commits):
+`751b514` (C4+C5, builder) and `e73a350` (C3+C8, tests). Symptom it
+removes — the install decision was made in five places across
+quiet/loud × checked/force output quadrants (four fixes in six days kept
+re-deciding it), lane exit codes crossed the process boundary as bare
+numbers with no named meaning (the `unknown` result-pkg row was one
+symptom), and the wave-1 run record had no fixture pinning it while
+seven fixtures still scraped prose.
+
+Root cause: decide/execute conflated in one code path, and an unnamed
+protocol used as an interface. Fix: `install_plan` computes silent plan
+rows (`install`/`skip`/`refuse`/`noop`) once and only `install_execute`
+renders and transacts (`-ia` shares the pipeline in force mode — no
+same-version skip; `_INSTALL_FORCE` deleted, mode/sink ride as
+arguments); `verify_pgo_payload` became the silent-plan step
+`pgo_payload_refusals`; `check_pacman_db_health` consolidated behind
+`install_preflight` (wire count 4→3, fixture count edited in the same
+change set); all privilege escalation unified to `sudo -n` with the
+interactive prompter deleted — under Q10 a cold credential fails fast
+(`sudo cannot install non-interactively` at preflight,
+`sudo credential expired and cannot be refreshed` mid-run) and a TTY
+changes nothing. The lane protocol got a named vocabulary
+(`lane_outcome_{ok,failed,defer,lost,hup,int,term}` +
+`lane_outcome_name`) and one codec pair
+(`lane_result_encode`/`decode`, `lane_argv`/`lane_argv_check`); the
+signal handler now writes nothing when the pkg identity is unknown
+instead of an unattributable row. Tests: new `tests/run-record.sh` pins
+the machine block end to end (markers, plan scalars, row grammar,
+status enum as data — deferred = rc 99, the interrupt continuation),
+seven fixtures migrated from prose-scraping to `rr_*` row assertions,
+`tests/dashboard.sh` became the ONE prose-rendering section, and
+sudo-keepalive scenario 4 was inverted to the Q10 policy (cold
+credential + PTY → refuse, zero `sudo -v` attempts).
+
+Validation: `fish -n build-all.fish`; the three builder fixtures PASS
+(new: `--install-decide` cases I1–I7, three-call-site count, empty-pkg
+lane → rc 125 + loud write failure); all ten test-stream files `bash -n`
+clean; full battery `fish_function_path=/nonexistent-fp bash
+tests/run-all.sh` → PASS (38 fixture(s)) on the merged tree.
+
+Durable rules: install decisions are computed once as rows and only the
+executor renders; lane rc values come only from `lane_outcome_*` and
+cross the boundary only through the codec pair; the machine block is the
+assertion surface (the `rr_*` parser is the interface under test) and
+prose wording is pinned in exactly one rendering adapter; the builder
+NEVER prompts for a password — sudo-keepalive scenario 4 is the tripwire
+for that policy.
+
 ## 2026-09-26 (architecture-deepening wave-1) — run record, shared PGO gate, one fixture helper, and the ADR set
 
 Feature record rather than an incident: the first wave of the

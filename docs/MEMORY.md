@@ -297,14 +297,28 @@ external Fish child with isolated output, atomic
 validated results, and a log tail owned by the parent dashboard. Plain output
 is append-only; interactive output is width-safe and sanitized. `-i` installs
 each package before its dependents compile, under a builder-owned pacman
-mutex. Those installs are non-interactive (`sudo -n`) because lane children
-have no terminal, so the dispatcher probes whether an install can actually
-run, refreshes the credential, asks for the password itself when a human is
-attached, and stops dispatch exactly once — with a non-zero exit — when
-nothing can restore it. A system pacman database lock is never deleted
-automatically. The dispatch invariant is failure-shaped with one amendment
+mutex. Install decisions are computed ONCE, silently, as plan rows
+(`install`/`skip`/`refuse`/`noop`) by `install_plan`, and only the executor
+(`install_execute`) renders and runs the single `pacman -U` transaction —
+`-ia` shares that pipeline in force mode (no same-version skip; force
+bypasses `install_skip_reason` entirely), and the hidden
+`--install-decide <checked|force>` seam prints the plan rows for fixtures
+without touching pacman transactions, sudo, flock or makepkg (rc 0 plan / 1
+refusal / 2 bad usage). ALL privilege escalation is `sudo -n` and the builder
+NEVER prompts (2026-09-26): the preflight probe refuses to start an `-i` run
+when installs cannot succeed (`sudo cannot install non-interactively`), and a
+credential lost mid-run stops dispatch exactly once (`sudo credential expired
+and cannot be refreshed`) with a non-zero exit — a TTY changes nothing, and
+`-ia` under a cold credential fails fast too. A system pacman database lock
+is never deleted automatically. Lane results carry a named vocabulary:
+`lane_outcome_{ok 0, failed 1, defer 99, lost 125, hup 129, int 130, term
+143}` classified by `lane_outcome_name`, crossing the process boundary only
+through the `lane_result_encode`/`decode` codec pair (lane argv stays
+positional behind `lane_argv`/`lane_argv_check`). The dispatch invariant is
+failure-shaped with one amendment
 (2026-09-24): a failure stops new dispatches and drains in-flight lanes,
-while a *deferral* (lane exit 99, `_ANCHOR_DEFER_RC`) is not a failure — the
+while a *deferral* (lane exit 99, `lane_outcome_defer`, aliased as
+`_ANCHOR_DEFER_RC` for older docs) is not a failure — the
 reap parks the package instead of calling `stop_starting`, its dependents
 wait (`waits on a deferred package`), dispatch continues, and the run still
 exits non-zero.
@@ -385,6 +399,14 @@ OpenShadingLanguage -> blender.
   in depth against a future `tests/lib/anything.sh` becoming a phantom
   fixture. Sibling subjects merge into ONE file as `( subshell )` sections
   rather than growing another top-level script.
+- The run-record machine block is the assertion surface: the `rr_*` family in
+  `tests/lib/fixture-lib.bash` (`rr_extract`/`rr_scalar`/`rr_rows`/`rr_row`/
+  `rr_remaining`) parses it from stdin — exactly-one-block guard, `\r`
+  stripping for PTY captures, loud failure on a missing/duplicate block or an
+  unknown field. The parser is the interface under test. Prose output is
+  pinned in exactly ONE place, the rendering section of `tests/dashboard.sh`;
+  scenario-bound rendering pins (prompt layout, deferral label, sudo message
+  frequency) stay co-located with the scenario they describe.
 - `tests/project.sh` pins its own topology-command inventory:
   `expected_invocations=20` is the count of column-0 `run`/`run_split` calls
   the fixture scrapes out of itself and pre-executes (the call syntax is
@@ -615,6 +637,13 @@ zero baked `.gcda` destinations — `ctest`'s single hit is the `/*.gcda` glob
 constant, not a baked path).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
+
+- **A quoted fish array slice collapses to ONE argument** (2026-09-26,
+  install/lane refactor): `"$argv[2..-1]"` joins the slice into a single
+  string; a lane handler built its argv that way and every lane died with
+  `--lane-job expects …` / rc 125. Use the unquoted slice `$argv[2..-1]` —
+  fish preserves elements and performs no word splitting. Quote scalars, not
+  slices.
 
 - **The resume suggestion must include the failed package** (2026-09-26,
   full-rebuild campaign): the failure summary's "To resume, run:" line AND

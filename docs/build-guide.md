@@ -188,27 +188,29 @@ wherever the recipe has a `validpgpkeys` source, and 13 of the 28
 ### sudo during `--install`
 
 Unprivileged `--install` installs happen inside lane children, which have no
-terminal, so every transaction is `sudo -n`. The dispatcher keeps that
-possible, and never confuses "I cannot refresh a credential" with "installs
-are impossible":
+terminal, so every transaction is `sudo -n` — and as of 2026-09-26 **every**
+privilege escalation in the builder is `sudo -n`. The builder never prompts
+for a password (`sudo_elevate_interactively` is gone). It keeps "I cannot
+refresh a credential" distinct from "installs are impossible":
 
 - Before dispatch it probes what sudo can actually do, and **refuses to
-  start** when installs could not succeed — rather than building for an hour
-  first.
-- While running it refreshes the credential at `_SUDO_KEEPALIVE_S` (150 s,
-  well inside the sudo timeout). If `sudo -v` is refused but a plain install
-  command works — a sudoers `NOPASSWD` entry covers the installs — there is
-  no credential to keep warm and it stops probing instead of stopping the
-  run.
-- If the credential is genuinely lost, the dispatcher asks for the password
-  itself: it still owns the terminal even though its lanes never do. The
-  prompt is bound by `_SUDO_PROMPT_S` (120 s) so an unattended run cannot
-  hang.
-- When the password cannot be entered, dispatch stops once (one message, not
-  one per poll), in-flight lanes drain, and the run lists the unstarted
-  packages as remaining and exits non-zero. A stopped dispatch is never
-  reported as a successful build.
+  start** (`sudo cannot install non-interactively`) when installs could not
+  succeed — rather than building for an hour first. A TTY changes nothing:
+  with a cold credential and a terminal attached the run still refuses
+  (`tests/sudo-keepalive.sh` scenario 4 pins this).
+- While running it keeps the timestamp warm with a non-interactive
+  `sudo -n -v` refresh at `_SUDO_KEEPALIVE_S` (150 s, well inside the sudo
+  timeout). If that refresh is refused but a plain install command works — a
+  sudoers `NOPASSWD` entry covers the installs — there is no credential to
+  keep warm and it stops probing instead of stopping the run.
+- If the credential is genuinely lost mid-run, dispatch stops once
+  (`sudo credential expired and cannot be refreshed`, one message, not one
+  per poll), in-flight lanes drain, and the run lists the unstarted packages
+  as remaining and exits non-zero. A stopped dispatch is never reported as a
+  successful build. There is no prompt to fall back to: rerun under `sudo
+  fish build-all.fish …` or prime `sudo -v` yourself first.
 
+`--installall` behaves the same way — it never prompts either.
 `sudo fish build-all.fish …` remains the option-free way to avoid credential
 expiry altogether: installs run as root and `makepkg` still builds as you.
 
