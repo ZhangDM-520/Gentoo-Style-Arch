@@ -28,33 +28,15 @@ set -euo pipefail
 # the fixture bin advances a virtual clock 300 s per call, so that interval
 # elapses in a run that lasts seconds and no test knob is added to the builder.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-sudo-fixture.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
-mkdir -p "$fixture/config/groups" "$fixture/packages" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$fixture/config/groups/$group.list"
-done
+make_workspace "$fixture" auto auto xhigh
 
 ids=(p1 p2 p3 p4)
 for id in "${ids[@]}"; do
-    mkdir -p "$fixture/packages/$id"
-    printf 'pkgname=%s\n' "$id" >"$fixture/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
-    printf '%s\n' "$id" >>"$fixture/config/groups/git.list"
+    add_package "$fixture" "$id"
 done
 
 cat >"$fixture/bin/makepkg" <<'EOF'
@@ -143,11 +125,12 @@ chmod +x "$fixture/bin/makepkg" "$fixture/bin/pacman" "$fixture/bin/date" "$fixt
 run_rc=0
 run_output=""
 
-run_builder() {
+# One scenario run through the helper's capture; the scenario knobs (state
+# name, sudo mode, build length) stay fixture-side.
+run_scenario() {
     local state=$1 mode=$2 build_s=${3:-1.2}
     mkdir -p "$fixture/state-$state"
-    run_rc=0
-    run_output=$(
+    run_builder env \
         PATH="$fixture/bin:$PATH" \
         GSA_STATE_DIR="$fixture/state-$state" \
         GSA_FAKE_SUDO_MODE="$mode" \
@@ -157,9 +140,10 @@ run_builder() {
         GSA_FAKE_MARKER_DIR="$fixture/state-$state/built" \
         GSA_FAKE_BUILD_SECONDS="$build_s" \
         fish "$fixture/build-all.fish" \
-            --allow-broken-rustc --no-deps --no-sync \
-            --lanes 2 --jobs 2 --install "${ids[@]}" 2>&1
-    ) || run_rc=$?
+        --allow-broken-rustc --no-deps --no-sync \
+        --lanes 2 --jobs 2 --install "${ids[@]}"
+    run_output=$FIXTURE_OUTPUT
+    run_rc=$FIXTURE_RC
 }
 
 fail() {
@@ -180,7 +164,7 @@ REFUSED='cannot install non-interactively'
 
 # 1. Password-free installs must not stop the run: `sudo -v` refuses, every
 #    install works.
-run_builder nopasswd nopasswd
+run_scenario nopasswd nopasswd
 if [[ $run_rc -ne 0 ]]; then
     fail "nopasswd run failed (rc=$run_rc) — password-free installs must not stop dispatch" \
         "$run_output"
@@ -196,7 +180,7 @@ if grep -q -E -- '^-v$' "$fixture/state-nopasswd/sudo.log"; then
 fi
 
 # 2. No usable sudo and no terminal: refuse before spending build time.
-run_builder cold cold
+run_scenario cold cold
 if [[ $run_rc -eq 0 ]]; then
     fail "cold run reported success without usable sudo" "$run_output"
 fi
@@ -211,7 +195,7 @@ fi
 #    as remaining instead of a silent "All builds succeeded!".
 # A long first wave keeps lanes busy while the dispatcher notices: the
 # pre-per-poll re-print was only visible because package builds outlive it.
-run_builder expires expires 3
+run_scenario expires expires 3
 if [[ $run_rc -eq 0 ]]; then
     fail "expired-credential run reported success with unbuilt packages" "$run_output"
 fi

@@ -30,7 +30,7 @@ set -uo pipefail
 # flap. The builder gains NO GSA_* test knob — it honours exactly the seven
 # variables --help lists; GSA_FAKE_* names are consumed by the stubs only.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-localdb-fixture.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -39,25 +39,8 @@ fail() {
     exit 1
 }
 
-mkdir -p "$fixture/config/groups" "$fixture/packages/p1" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$fixture/config/groups/$group.list"
-done
-printf 'pkgname=p1\n' >"$fixture/packages/p1/PKGBUILD"
-printf 'p1|packages/p1\n' >"$fixture/config/packages.map"
-printf 'p1\n' >"$fixture/config/groups/git.list"
+make_workspace "$fixture" auto auto xhigh
+add_package "$fixture" p1
 
 cat >"$fixture/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash

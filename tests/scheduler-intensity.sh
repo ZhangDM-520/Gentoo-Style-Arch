@@ -1,40 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-intensity-fixture.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
-mkdir -p "$fixture/config/groups" "$fixture/packages" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$fixture/config/groups/$group.list"
-done
+make_workspace "$fixture" auto auto xhigh
 
 ids=()
 for i in $(seq 1 8); do
     id="p$i"
     ids+=("$id")
-    mkdir -p "$fixture/packages/$id"
-    printf 'pkgname=%s\n' "$id" >"$fixture/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
-    printf '%s\n' "$id" >>"$fixture/config/groups/git.list"
+    add_package "$fixture" "$id"
 done
 
 cat >"$fixture/bin/makepkg" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${GSA_FAIL_PACKAGE:-}" == "$(basename "$PWD")" ]]; then
+if [[ "${GSA_FAKE_FAIL_PACKAGE:-}" == "$(basename "$PWD")" ]]; then
     exit 1
 fi
 printf 'fake makepkg %s\n' "$PWD"
@@ -92,7 +74,7 @@ if failing_output=$(
     GSA_STATE_DIR="$fixture/state-failure" \
     GSA_CPU_THREADS=24 \
     GSA_MEMORY_GIB=21 \
-    GSA_FAIL_PACKAGE=p1 \
+    GSA_FAKE_FAIL_PACKAGE=p1 \
     GSA_FAKE_BUILD_SECONDS=0.2 \
     fish "$fixture/build-all.fish" \
         --allow-broken-rustc --no-deps --no-sync \

@@ -164,7 +164,7 @@ mkdir -p "$shim"
 for exe in mv mkdir cp ln sed grep sort cut uniq xargs cat dirname head wc readlink; do
     cat >"$shim/$exe" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "$exe" >>"\$GSA_SPAWN_LOG"
+printf '%s\n' "$exe" >>"\$GSA_FAKE_SPAWN_LOG"
 exec /usr/bin/$exe "\$@"
 EOF
     chmod +x "$shim/$exe"
@@ -180,7 +180,7 @@ write_wrapper() { # write_wrapper <out-file> <section-file>
     # The section runs inside a function, as it does inside prepare(): its
     # refusal path is a `return 1`, which is only meaningful there.
     {
-        printf '%s\n' 'set +e' 'srcdir=$PWD' 'export srcdir GSA_SPAWN_LOG' \
+        printf '%s\n' 'set +e' 'srcdir=$PWD' 'export srcdir GSA_FAKE_SPAWN_LOG' \
             '_collections=(alpha beta gamma)' 'split_section() {'
         cat "$2"
         printf '%s\n' '}' 'split_section'
@@ -194,7 +194,7 @@ run_impl() { # run_impl <label> <section-file>
     write_wrapper "$tmp/wrapped-$label.sh" "$section"
     (
         cd "$work"
-        GSA_SPAWN_LOG="$tmp/spawns-$label" \
+        GSA_FAKE_SPAWN_LOG="$tmp/spawns-$label" \
             PATH="$shim:$PATH" bash "$tmp/wrapped-$label.sh" \
             >"$tmp/out-$label" 2>"$tmp/err-$label"
         echo $? >"$tmp/rc-$label"
@@ -279,7 +279,7 @@ rm -f "$depleted/texmf-dist/tex/alpha/one.sty"
 write_wrapper "$tmp/wrapped-depleted.sh" "$live_section"
 (
     cd "$depleted"
-    GSA_SPAWN_LOG="$tmp/spawns-depleted" \
+    GSA_FAKE_SPAWN_LOG="$tmp/spawns-depleted" \
         bash "$tmp/wrapped-depleted.sh" >"$tmp/out-depleted" 2>"$tmp/err-depleted"
     echo $? >"$tmp/rc-depleted"
 ) || true

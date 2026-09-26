@@ -19,7 +19,11 @@ set -uo pipefail
 # Order is alphabetical (stable and maintenance-free) and the report is printed
 # in that order too, regardless of completion order; discovery is recursive with
 # tests/assets/ excluded (frozen reference material there never runs standalone),
-# so a new fixture needs no edit here.
+# so a new fixture needs no edit here. Shared helper code lives in tests/lib/
+# under the same two conventions its own header documents: its extension is
+# .bash (not .sh) so discovery can never match it, and lib/ is additionally
+# excluded here as defence in depth so a future tests/lib/anything.sh cannot
+# become a phantom fixture either.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || exit 1
@@ -55,7 +59,7 @@ done
 
 mapfile -t fixtures < <(cd "$root/tests" &&
     find . -name '*.sh' ! -name 'run-all.sh' ! -path './assets/*' \
-        -printf '%P\n' | sort)
+        ! -path './lib/*' -printf '%P\n' | sort)
 if ((${#fixtures[@]})) && [[ -n $filter ]]; then
     mapfile -t fixtures < <(printf '%s\n' "${fixtures[@]}" |
         grep -F -e "$filter" || true)

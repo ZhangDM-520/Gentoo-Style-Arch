@@ -18,9 +18,10 @@ set -euo pipefail
 # diffed, never written to.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 # Concurrency: makepkg --printsrcinfo is cheap and pure, so the whole map is
-# checked at once (one job per hardware thread; override with GSA_SRCINFO_JOBS).
-jobs=${GSA_SRCINFO_JOBS:-$(nproc 2>/dev/null || echo 8)}
+# checked at once (one job per hardware thread; override with GSA_FAKE_SRCINFO_JOBS).
+jobs=${GSA_FAKE_SRCINFO_JOBS:-$(nproc 2>/dev/null || echo 8)}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gsa-srcinfo-fixture.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 
@@ -31,7 +32,7 @@ check_recipe() {
         printf '%s\tno .SRCINFO committed\n' "$rel"
         return 0
     fi
-    if ! GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$dir" >"$out" 2>"$tmp/err.$$"; then
+    if ! makepkg_printsrcinfo "$dir" >"$out" 2>"$tmp/err.$$"; then
         printf '%s\tmakepkg --printsrcinfo failed: %s\n' "$rel" \
             "$(head -1 "$tmp/err.$$" 2>/dev/null)"
         rm -f -- "$out" "$tmp/err.$$"
@@ -44,6 +45,8 @@ check_recipe() {
     return 0
 }
 export -f check_recipe
+# check_recipe runs in `bash -c` workers, which only see exported functions.
+export -f makepkg_printsrcinfo
 export root tmp
 
 mapfile -t recipes < <(awk -F'|' '!/^#/ && NF==2 {print $2}' "$root/config/packages.map")

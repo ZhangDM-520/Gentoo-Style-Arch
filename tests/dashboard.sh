@@ -30,7 +30,7 @@ set -euo pipefail
 # below the stub lanes' natural ~10s runtime, so a pass proves the escalation
 # killed the lanes rather than their own loop ending.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-dashboard.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -42,31 +42,11 @@ command -v script >/dev/null || {
 # A long tail line, so a wide terminal has something to truncate: at 100
 # columns the row must still fit 99, which is what distinguishes a real width
 # from the 80-column fallback.
-make_workspace() { # $1 = dir, $2 = columns
-    local dir=$1 cols=$2
-    mkdir -p "$dir/config/groups" "$dir/bin"
-    cp "$root/build-all.fish" "$dir/build-all.fish"
-
-    cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=2
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-    : >"$dir/config/dependencies.conf"
-    for group in git stable core misc third-party app; do
-        : >"$dir/config/groups/$group.list"
-    done
-    : >"$dir/config/packages.map"
+make_case_workspace() { # $1 = dir, $2 = columns
+    local dir=$1 cols=$2 id
+    make_workspace "$dir" 2 2 low
     for id in p1 p2 p3; do
-        mkdir -p "$dir/packages/$id"
-        printf 'pkgname=%s\npkgver=1.0.0\npkgrel=1\narch=(any)\n' "$id" \
-            >"$dir/packages/$id/PKGBUILD"
-        printf '%s|packages/%s\n' "$id" "$id" >>"$dir/config/packages.map"
-        printf '%s\n' "$id" >>"$dir/config/groups/git.list"
+        add_package "$dir" "$id" "$gsa_meta_any"
     done
 
     cat >"$dir/bin/makepkg" <<'EOF'
@@ -76,8 +56,8 @@ id=$(basename "$PWD")
 # Case C records every lane child so its survival can be decided by PID
 # rather than by matching `ps` argv — the builder execs makepkg by its bare
 # name, so a path grep only ever matches the grep itself.
-if test -n "${GSA_LANE_MARKER:-}"; then
-    printf 'START %s\n' "$$" >>"$GSA_LANE_MARKER"
+if test -n "${GSA_FAKE_LANE_MARKER:-}"; then
+    printf 'START %s\n' "$$" >>"$GSA_FAKE_LANE_MARKER"
 fi
 # A lane supervisor is fish and dies on TERM; this child does not, which is
 # the case stop_lane_process' SIGKILL escalation exists for.
@@ -141,7 +121,7 @@ max_visible_width() { # $1 = rows file
 
 # ─── Case A: a narrow terminal truncates every row to width-1 ───────────────
 dir="$fixture/cols40"
-make_workspace "$dir" 40
+make_case_workspace "$dir" 40
 run_pty "$dir"
 
 if ((RAW_RC != 0)); then
@@ -169,7 +149,7 @@ fi
 
 # ─── Case B: a wide terminal is used, not the 80-column fallback ────────────
 dir="$fixture/cols100"
-make_workspace "$dir" 100
+make_case_workspace "$dir" 100
 run_pty "$dir"
 if ((RAW_RC != 0)); then
     printf 'cols=100: builder failed (rc=%s)\n' "$RAW_RC" >&2
@@ -223,7 +203,7 @@ done
 # A bare "no lane survived" check passes under both injections, because the
 # trailing `wait $lane_pid` reaps the lane whenever the killer does nothing.
 dir="$fixture/interrupt"
-make_workspace "$dir" 40
+make_case_workspace "$dir" 40
 cat >"$dir/run.sh" <<EOF
 #!/usr/bin/env bash
 stty cols 40 rows 24
@@ -239,7 +219,7 @@ export GSA_FAKE_TICKS=200
 # KILL, not the wall-clock length of the window, and waiting out a real 30 s
 # made this the slowest fixture in the battery.
 export _LANE_STOP_GRACE_S=5
-export GSA_LANE_MARKER="$dir/pids"
+export GSA_FAKE_LANE_MARKER="$dir/pids"
 fish "$dir/build-all.fish" --allow-broken-rustc --no-deps --no-sync --lanes 2 p1 p2 p3 &
 builder=\$!
 sleep 1.4

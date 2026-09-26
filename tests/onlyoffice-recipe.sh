@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 recipe="packages/git/onlyoffice-git"
 pkgbuild="$root/$recipe/PKGBUILD"
 
@@ -240,7 +241,7 @@ for dep in qt5-base-git qt5-multimedia qt5-svg qt5-x11extras; do
 done
 
 # .SRCINFO must match the recipe.
-if ! GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" |
+if ! makepkg_printsrcinfo "$root/$recipe" |
     diff -q - "$root/$recipe/.SRCINFO" >/dev/null; then
     fail ".SRCINFO is out of sync with the PKGBUILD"
 fi

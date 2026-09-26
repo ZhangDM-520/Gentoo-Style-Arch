@@ -24,6 +24,7 @@ set -euo pipefail
 # Read-only: scratch lives in $TMPDIR, the recipe is never written to.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 recipe=$root/packages/misc/linux-cachyos
 verify=$recipe/verify-config.sh
 pkgbuild=$recipe/PKGBUILD
@@ -249,7 +250,7 @@ probe() { # dir [KEY=VAL...]
 
 # --- the shipped default set and the shipped sums must agree ---------------
 srcinfo=$tmp/.SRCINFO
-GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" >"$srcinfo" 2>"$tmp/err" ||
+makepkg_printsrcinfo "$root/$recipe" >"$srcinfo" 2>"$tmp/err" ||
     fail "makepkg --printsrcinfo failed for $recipe (the default knob set must parse): $(head -1 "$tmp/err")"
 
 info_sources=$(grep -c '^[[:space:]]*source = ' "$srcinfo")
@@ -353,7 +354,7 @@ fail() {
 }
 
 srcinfo=$tmp/.SRCINFO
-GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$root/$recipe" >"$srcinfo" 2>"$tmp/err" ||
+makepkg_printsrcinfo "$root/$recipe" >"$srcinfo" 2>"$tmp/err" ||
     fail "makepkg --printsrcinfo failed for $recipe: $(head -1 "$tmp/err")"
 
 sources=$(sed -n 's/^[[:space:]]*source = //p' "$srcinfo")

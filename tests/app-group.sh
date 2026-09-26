@@ -16,7 +16,7 @@ set -euo pipefail
 #   6. -g app combined with -g git: the filter touches only the app portion
 #   7. a REAL build prompts too and builds only the checked subset
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-app-fixture.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -29,18 +29,7 @@ fail() {
 }
 
 # ── Synthetic workspace: five fake packages, six group files ────────────────
-mkdir -p "$fixture/config/groups" "$fixture/packages" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
+make_workspace "$fixture" auto auto xhigh
 
 # app2 depends on extdep (a NON-app workspace package: must never be pulled
 # in) and app3 depends on app2 (in-group edge: fixes dependency order).
@@ -49,20 +38,15 @@ app2:extdep
 app3:app2
 EOF
 
+# pkgver=1 (not the helper's $gsa_meta_any default) keeps these PKGBUILDs
+# byte-identical to the hand-written skeleton this replaced.
 for pair in "git:gitp1" "misc:extdep" "app:app1 app2 app3"; do
     grp=${pair%%:*}
     members=${pair#*:}
     for id in $members; do
-        printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
-        mkdir -p "$fixture/packages/$id"
-        printf 'pkgname=%s\npkgver=1\npkgrel=1\narch=(any)\n' \
-            "$id" >"$fixture/packages/$id/PKGBUILD"
+        add_package "$fixture" "$id" $'pkgver=1\npkgrel=1\narch=(any)' "$grp"
     done
-    printf '%s\n' $members >"$fixture/config/groups/$grp.list"
 done
-: >"$fixture/config/groups/core.list"
-: >"$fixture/config/groups/stable.list"
-: >"$fixture/config/groups/third-party.list"
 cp "$fixture/config/groups/app.list" "$fixture/config/groups/app.list.content"
 
 cat >"$fixture/bin/makepkg" <<'EOF'

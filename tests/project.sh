@@ -41,6 +41,12 @@ mkdir -p "$cache"
 # that was pre-executed for it.
 run_key() { printf '%s\0' "$@" | md5sum | cut -d' ' -f1; }
 
+# Column-0 call syntax is load-bearing: the parallel pre-executor further down
+# scrapes THIS FILE with grep -E '^(run|run_split) ' and pre-runs exactly the
+# lines that match. Every run/run_split CALL must therefore start at column 0
+# (a leading space leaves it unpre-executed and its replay fails with "no
+# pre-executed invocation"), and nothing that merely looks like one may start
+# there. The scrape count is asserted below.
 run() { # [args...] — replay a pre-executed invocation
     local key
     key=$(run_key "$@")
@@ -52,7 +58,8 @@ run() { # [args...] — replay a pre-executed invocation
 
 out_stdout=
 out_stderr=
-run_split() { # [args...] — replay with stdout/stderr kept apart
+run_split() { # [args...] — replay with stdout/stderr kept apart. Same column-0
+              # call contract as run() above.
     local key
     key=$(run_key "$@")
     out_stdout=$(cat "$cache/$key.out" 2>/dev/null) ||
@@ -86,6 +93,14 @@ rows() { # print the numbered rows of $out, as bare package names
 # per-invocation startup (config load plus the full map/graph/sort validation
 # the loader performs on every call) is paid across all invocations at once
 # instead of one after another (~27s -> ~7s).
+#
+# The scrape is self-pinning: if its match count drifts from the number of
+# calls this file actually carries, a call was added/indented without updating
+# the expectation below (or a non-call line started imitating one).
+expected_invocations=20
+scanned_invocations=$(grep -c -E '^(run|run_split) ' "${BASH_SOURCE[0]}")
+[[ $scanned_invocations -eq $expected_invocations ]] ||
+    fail "self-scan found $scanned_invocations column-0 run/run_split calls, expected $expected_invocations (new calls must start at column 0 and bump this count)"
 pids=()
 declare -A scheduled=()
 while IFS= read -r line; do

@@ -24,6 +24,7 @@ set -euo pipefail
 # $TMPDIR, and `sudo` is a stub that runs the command it is handed.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-cleanup-fixture.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -32,27 +33,8 @@ fail() {
     exit 1
 }
 
-mkdir -p "$fixture/config/groups" "$fixture/packages/demo" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$fixture/config/groups/$group.list"
-done
-printf 'demo|packages/demo\n' >"$fixture/config/packages.map"
-printf 'demo\n' >"$fixture/config/groups/git.list"
-
-cat >"$fixture/packages/demo/PKGBUILD" <<'EOF'
-pkgname=demo
+make_workspace "$fixture" auto auto xhigh
+demo_meta=$(cat <<'EOF'
 pkgver=1.0
 source=('https://example.invalid/thing-1.0.tar.xz'
         'https://example.invalid/bundle-2.0.tgz'
@@ -65,16 +47,13 @@ source=('https://example.invalid/thing-1.0.tar.xz'
         'local.patch'
         'local.patch.sig')
 EOF
+)
+add_package "$fixture" demo "$demo_meta"
 
-# A stub that behaves like a passwordless `sudo`: run what it was given.
-cat >"$fixture/bin/sudo" <<'EOF'
-#!/usr/bin/env bash
-if [[ ${1:-} == -n ]]; then
-    shift
-fi
-exec "$@"
-EOF
-chmod +x "$fixture/bin/sudo"
+# A stub that behaves like a passwordless `sudo`: run what it was given. Leading
+# sudo flags are dropped (including --preserve-env, which host fish `sudo`
+# wrapper functions inject).
+stub_sudo "$fixture"
 
 pkgdir="$fixture/packages/demo"
 

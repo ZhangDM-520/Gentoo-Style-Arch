@@ -28,7 +28,7 @@ set -euo pipefail
 # All collaborators (pacman, curl, updpkgsums, makepkg) are PATH stubs; the
 # run builds nothing real and touches no network.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-anchor-defer.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -43,34 +43,16 @@ command -v vercmp >/dev/null || {
 }
 
 dir="$fixture/ws"
-mkdir -p "$dir/config/groups" "$dir/packages/stable/a-stable" "$dir/bin" "$dir/fake"
-cp "$root/build-all.fish" "$dir/build-all.fish"
-
-cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=1
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
+make_workspace "$dir" 1 2 low
+mkdir -p "$dir/packages/stable/a-stable"
 printf 'b-dep:a-stable\n' >"$dir/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$dir/config/groups/$group.list"
-done
-printf 'a-stable\n' >>"$dir/config/groups/stable.list"
-printf 'b-dep\nc-plain\n' >>"$dir/config/groups/git.list"
-{
-    printf 'a-stable|packages/stable/a-stable\n'
-    printf 'b-dep|packages/b-dep\n'
-    printf 'c-plain|packages/c-plain\n'
-} >"$dir/config/packages.map"
 
 # a-stable: a stable recipe whose moved source gets NO official document (404)
 # → anchor_sums_from_official refuses with rc 3, which the lane reports as the
 # defer code. $pkgver must be literal: the builder expands source=() by
-# sourcing the recipe.
+# sourcing the recipe. Its recipe path (packages/stable/) is not what
+# add_package records, so its recipe, map record and group entry stay inline;
+# the map record is written FIRST to keep the original map order.
 {
     printf 'pkgname=a-stable\n'
     printf 'pkgver=1.0.0\n'
@@ -79,14 +61,14 @@ printf 'b-dep\nc-plain\n' >>"$dir/config/groups/git.list"
     printf 'source=("https://example.invalid/a-$pkgver.tar.gz")\n'
     printf "sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')\n"
 } >"$dir/packages/stable/a-stable/PKGBUILD"
+printf 'a-stable|packages/stable/a-stable\n' >"$dir/config/packages.map"
+printf 'a-stable\n' >"$dir/config/groups/stable.list"
 
 # b-dep / c-plain: ordinary recipes with working builds.
-for id in b-dep c-plain; do
-    mkdir -p "$dir/packages/$id"
-    printf 'pkgname=%s\npkgver=1.0.0\npkgrel=1\narch=(any)\n' "$id" \
-        >"$dir/packages/$id/PKGBUILD"
-done
+add_package "$dir" b-dep "$gsa_meta_any"
+add_package "$dir" c-plain "$gsa_meta_any"
 
+mkdir -p "$dir/fake"
 printf '2.0.0-1\n' >"$dir/fake/repo_version"
 
 cat >"$dir/bin/pacman" <<'EOF'

@@ -20,7 +20,7 @@ set -euo pipefail
 # same EACCES either way (root-owned 644 vs own 0444). The root-mode branch
 # (chown repair) needs real root and is argued in docs/NOTE.md, not pinned here.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-log-ownership.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -30,63 +30,30 @@ fail() {
     exit 1
 }
 
-make_workspace() { # $1 = sandbox dir
+make_case_workspace() { # $1 = sandbox dir
     local dir=$1
-    mkdir -p "$dir/config/groups" "$dir/bin"
-    cp "$root/build-all.fish" "$dir/build-all.fish"
-
-    cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=1
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-    : >"$dir/config/dependencies.conf"
-    for group in git stable core misc third-party app; do
-        : >"$dir/config/groups/$group.list"
-    done
-    : >"$dir/config/packages.map"
-    mkdir -p "$dir/packages/p1"
-    printf 'pkgname=p1\npkgver=1.0.0\npkgrel=1\narch=(any)\n' \
-        >"$dir/packages/p1/PKGBUILD"
-    printf '%s|packages/%s\n' p1 p1 >>"$dir/config/packages.map"
-    printf '%s\n' p1 >>"$dir/config/groups/git.list"
+    make_workspace "$dir" 1 2 low
+    add_package "$dir" p1 "$gsa_meta_any"
 
     cat >"$dir/bin/makepkg" <<'EOF'
 #!/usr/bin/env bash
 set -u
 id=$(basename "$PWD")
-# Scenario knob (fixture-defined, like GSA_FAIL_PACKAGE): hold the lane open
+# Scenario knob (fixture-defined, like GSA_FAKE_FAIL_PACKAGE): hold the lane open
 # so a signal can land mid-run while the dispatcher is alive.
-sleep "${GSA_FIXTURE_BUILD_SLEEP:-0}"
+sleep "${GSA_FAKE_BUILD_SLEEP:-0}"
 : >"$PWD/$id-1.0.0-1-any.pkg.tar.zst"
 printf 'fake makepkg %s\n' "$PWD"
 exit 0
 EOF
     chmod +x "$dir/bin/makepkg"
 
-    cat >"$dir/bin/sudo" <<'EOF'
-#!/usr/bin/env bash
-set -u
-args=()
-for a in "$@"; do
-    case $a in
-    -n | -v | --) ;;
-    *) args+=("$a") ;;
-    esac
-done
-((${#args[@]})) || exit 0
-exec "${args[@]}"
-EOF
-    chmod +x "$dir/bin/sudo"
+    stub_sudo "$dir"
 }
 
 # ─── Run B meets run A's poisoned log ────────────────────────────────────────
 dir="$fixture/poisoned"
-make_workspace "$dir"
+make_case_workspace "$dir"
 mkdir -p "$dir/state/logs"
 sentinel='SENTINEL run-A crash evidence'
 printf '%s\n' "$sentinel" >"$dir/state/logs/p1.log"
@@ -147,7 +114,7 @@ fi
 # dispatcher.log used to lose signal forensics silently. Same contract: it must
 # be reopened/quarantined, not dropped.
 dir="$fixture/poisoned-dispatcher"
-make_workspace "$dir"
+make_case_workspace "$dir"
 mkdir -p "$dir/state/logs"
 printf 'SENTINEL run-A dispatcher\n' >"$dir/state/logs/dispatcher.log"
 chmod 0444 "$dir/state/logs/dispatcher.log"
@@ -162,7 +129,7 @@ output=$(
         GSA_STATE_DIR="$dir/state" \
         GSA_CPU_THREADS=8 \
         GSA_MEMORY_GIB=16 \
-        GSA_FIXTURE_BUILD_SLEEP=30 \
+        GSA_FAKE_BUILD_SLEEP=30 \
         fish "$dir/build-all.fish" --no-deps --allow-broken-rustc --no-sync p1 \
         2>&1 &
     builder=$!
@@ -234,7 +201,6 @@ printf 'log-ownership fixture: PASS\n'
 # pre-write-time repair — which the startup/exit `chown -R` sweeps can never
 # produce (they name directories, never the log file).
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-log-ownership-root.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -245,29 +211,9 @@ fail() {
 }
 
 dir="$fixture/rootmode"
-mkdir -p "$dir/config/groups" "$dir/bin"
-cp "$root/build-all.fish" "$dir/build-all.fish"
-
-cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=2
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$dir/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$dir/config/groups/$group.list"
-done
-: >"$dir/config/packages.map"
+make_workspace "$dir" 2 2 low
 for id in p1 p2; do
-    mkdir -p "$dir/packages/$id"
-    printf 'pkgname=%s\npkgver=1.0.0\npkgrel=1\narch=(any)\n' "$id" \
-        >"$dir/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$dir/config/packages.map"
-    printf '%s\n' "$id" >>"$dir/config/groups/git.list"
+    add_package "$dir" "$id" "$gsa_meta_any"
 done
 
 cat >"$dir/bin/makepkg" <<'EOF'
@@ -293,10 +239,16 @@ exec /usr/bin/id "$@"
 EOF
 
 # Record every sudo invocation; `sudo -u <user> cmd…` drops the impersonation
-# pair (the fixture really runs as the build user) and execs the rest.
+# pair (the fixture really runs as the build user) and execs the rest. Leading
+# sudo flags are dropped first (including --preserve-env, which host fish `sudo`
+# wrapper functions inject).
 cat >"$dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GSA_FAKE_SUDO_LOG:?fixture forgot GSA_FAKE_SUDO_LOG}"
+while [[ ${1:-} == -* ]]; do
+    [[ ${1:-} == -u ]] && break
+    shift
+done
 if [[ ${1:-} == -u && $# -ge 2 ]]; then
     shift 2
 fi

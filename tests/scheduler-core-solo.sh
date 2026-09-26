@@ -41,26 +41,11 @@ set -euo pipefail
 # exercised rather than the trivial case where core happens to be dispatched
 # first.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-core-solo.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
-mkdir -p "$fixture/config/groups" "$fixture/packages" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$fixture/config/groups/$group.list"
-done
+make_workspace "$fixture" auto auto xhigh
 
 # n1..n4 are ordinary members; c1 is a core member that is also in git, which
 # mirrors the real vocabulary (autofdo-git and libclc-git are packages/git
@@ -69,11 +54,7 @@ normal_ids=(n1 n2 n3 n4)
 core_id=c1
 selection=(n1 n2 n3 c1 n4)
 for id in "${normal_ids[@]}" "$core_id"; do
-    mkdir -p "$fixture/packages/$id"
-    printf 'pkgname=%s\npkgver=1.0.0\npkgrel=1\narch=(any)\n' "$id" \
-        >"$fixture/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
-    printf '%s\n' "$id" >>"$fixture/config/groups/git.list"
+    add_package "$fixture" "$id" "$gsa_meta_any"
 done
 printf '%s\n' "$core_id" >>"$fixture/config/groups/core.list"
 

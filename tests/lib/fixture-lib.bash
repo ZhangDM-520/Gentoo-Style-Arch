@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# tests/lib/fixture-lib.bash — fixture SYNTHESIS/INTERFACE helper. SOURCED, never
+# executed as a fixture. Two conventions keep it out of the battery, and both are
+# load-bearing (see tests/run-all.sh):
+#   * the extension is .bash, not .sh — run-all.sh discovers fixtures with
+#     `find . -name '*.sh'`, so this file can never be picked up as one;
+#   * run-all.sh additionally excludes ./lib/* — defence in depth, so a future
+#     tests/lib/anything.sh cannot become a phantom fixture either.
+#
+# Source it from a fixture (works both under `bash tests/<fixture>` via
+# run-all.sh and under direct invocation, because the repo root is resolved
+# from THIS file's BASH_SOURCE, not from run-all's exported root/work):
+#
+#   source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
+#
+# SCOPE: synthesis and interface only. This file knows how to build the
+# workspace skeleton every scheduler/install/cleanup fixture needs and how to
+# write the trivial byte-identical stubs. Everything ORACLE-shaped stays
+# inline in the fixture that gives it meaning: dashboard's TERM-immune ticking
+# makepkg, sudo-keepalive's fake date and sudo modes, signal-abort-lock's
+# signal loggers and flock/pgrep shims, scheduler-intensity's job-flag print
+# and durations, scheduler-core-solo's interval recorder, abi-batch's
+# marker-flipping pacman, install-archive-guard's -Qp/-Qi pacman oracle,
+# pgo-payload-guard's staged archives. Assertions, fail() prefixes and the
+# `( subshell )` section structure of multi-subject fixtures also stay inline.
+#
+# ─── Stub-variable vocabulary (fixture-side only; the builder must NOT change) ─
+# Every knob a stub script reads is named GSA_FAKE_*. The builder's own seven
+# inputs (GSA_LANES, GSA_JOBS, GSA_INTENSITY, GSA_CPU_THREADS, GSA_MEMORY_GIB,
+# GSA_STATE_DIR, GSA_TARGET_CPU) and its output GSA_BUILD_JOBS keep their
+# names and are NOT part of this vocabulary. Full final table:
+#
+#   GSA_FAKE_BUILD_SECONDS     sleep duration of a stallable makepkg stub
+#                              (app-group, pacman-mutex-shim, scheduler-intensity,
+#                              signal-abort-lock, sudo-keepalive)
+#   GSA_FAKE_BUILD_SLEEP       log-ownership's makepkg: hold the lane open so a
+#                              signal can land mid-run (was GSA_FIXTURE_BUILD_SLEEP)
+#   GSA_FAKE_CHOWN_LOG         log-ownership chown stub: invocation log
+#   GSA_FAKE_DATE_COUNTER      sudo-keepalive fake `date`: virtual-clock counter
+#   GSA_FAKE_DB_PATH           pacman-conf stub's DBPath answer (pacman-mutex-shim,
+#                              signal-abort-lock) — never the host's real db.lck
+#   GSA_FAKE_DIR               stub scratch dir for curl/updpkgsums/makepkg call
+#                              logs (anchor-defer, stable-sync-checksums)
+#   GSA_FAKE_DURATIONS         scheduler-core-solo: per-package duration table
+#   GSA_FAKE_FAIL_PACKAGE      trivial makepkg stub: package id whose build must
+#                              fail (was GSA_FAIL_PACKAGE)
+#   GSA_FAKE_LANE_INTERVALS    scheduler-core-solo: START/END timestamp log
+#   GSA_FAKE_LANE_MARKER       dashboard makepkg stub: lane-child PID log
+#                              (was GSA_LANE_MARKER)
+#   GSA_FAKE_MAKEPKG_COUNT     install-archive-guard makepkg stub: invocation
+#                              counter (was GSA_FIXTURE_MAKEPKG_COUNT)
+#   GSA_FAKE_MAKEPKG_LOG       abi-batch makepkg stub: BUILD marker log
+#                              (was GSA_FIXTURE_MAKEPKG_LOG)
+#   GSA_FAKE_MARKER_DIR        per-package build marker dir (abi-batch,
+#                              log-ownership, pacman-mutex-shim, signal-abort-lock,
+#                              sudo-keepalive)
+#   GSA_FAKE_NO_ARCHIVE        install-archive-guard makepkg stub: "build
+#                              succeeded, archive absent" (was GSA_FIXTURE_NO_ARCHIVE)
+#   GSA_FAKE_PACMAN_ENV_LOG    PACMAN env-observation log (pacman-mutex-shim,
+#                              signal-abort-lock)
+#   GSA_FAKE_PACMAN_LOG        trivial pacman stub: argv log — `${VAR:?}`-guarded
+#                              (was GSA_FIXTURE_PACMAN_LOG in install-archive-guard,
+#                              resume-command, abi-batch-policy; the name also
+#                              covers pgo-payload-guard's same-purpose stub)
+#   GSA_FAKE_PACMAN_RC         install-archive-guard pacman stub: exit status
+#                              (was GSA_FIXTURE_PACMAN_RC)
+#   GSA_FAKE_PGREP_HOLDER      pgrep stub: THE pid "holding" the lock/db
+#                              (local-db-repair, signal-abort-lock)
+#   GSA_FAKE_QI                install-archive-guard pacman stub: `pacman -Qi`
+#                              answer (was GSA_FIXTURE_QI)
+#   GSA_FAKE_QP                install-archive-guard pacman stub: `pacman -Qp`
+#                              answer (was GSA_FIXTURE_QP)
+#   GSA_FAKE_ROOT_FILE         log-ownership stat stub: the file reported
+#                              root-owned
+#   GSA_FAKE_ROOT_MODE         log-ownership id stub: answer "root"
+#   GSA_FAKE_SIGNAL_LOG        signal-abort-lock makepkg stub: signal-receipt log
+#   GSA_FAKE_SPAWN_LOG         spawned-helper argv log (abi-batch-policy,
+#                              texlive-split) (was GSA_SPAWN_LOG)
+#   GSA_FAKE_SRCINFO_JOBS      srcinfo-freshness: parallelism of its own
+#                              printsrcinfo sweep (was GSA_SRCINFO_JOBS)
+#   GSA_FAKE_STUB_PACMAN       path to the recorder the flock shim redirects the
+#                              baked /usr/bin/pacman to (pacman-mutex-shim,
+#                              signal-abort-lock)
+#   GSA_FAKE_STUB_PACMAN_LOG   that recorder's argv log
+#   GSA_FAKE_SUDO_LOG          sudo stub: argv log
+#   GSA_FAKE_SUDO_MODE         sudo stub: scenario mode (sudo-keepalive)
+#   GSA_FAKE_SUDO_STATE        sudo stub: state dir (sudo-keepalive)
+#   GSA_FAKE_TICKS             dashboard makepkg stub: tail-line count
+
+# Repo root from this file's own location: tests/lib/fixture-lib.bash → repo.
+_gsa_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+gsa_repo_root=$(cd "$_gsa_lib_dir/../.." && pwd)
+
+# The pkgver/pkgrel/arch triple most synthetic PKGBUILDs carry, for add_package's
+# extra-pkglines. The trivial stubs' archive names assume exactly this shape
+# ($id-1.0.0-1-any); a fixture whose stubs assume something else passes its own
+# lines instead.
+gsa_meta_any=$'pkgver=1.0.0\npkgrel=1\narch=(any)'
+
+# make_workspace DIR [lanes [jobs [intensity]]]
+# Minimal but fully valid workspace skeleton: the loader validates map, groups,
+# deps and a full topological sort on EVERY invocation (--list, --audit, --help),
+# so a fixture workspace must be complete or every run fails in the loader.
+# Creates config/build-defaults.conf (lanes/jobs/intensity parameterised; the
+# memory numbers are the fixtures' shared constants), an empty
+# config/dependencies.conf, an empty config/packages.map, the six group lists,
+# plus packages/ and bin/ for the fixture to fill. Fixture-specific dependency
+# edges and anything after that belong to the fixture.
+make_workspace() {
+    local dir=$1 lanes=${2:-auto} jobs=${3:-auto} intensity=${4:-xhigh}
+    mkdir -p "$dir/config/groups" "$dir/packages" "$dir/bin"
+    cp "$gsa_repo_root/build-all.fish" "$dir/build-all.fish"
+    cat >"$dir/config/build-defaults.conf" <<EOF
+lanes=$lanes
+jobs=$jobs
+intensity=$intensity
+memory_per_job_gib=3
+core_memory_per_job_gib=4
+reserved_memory_gib=2
+state_dir=auto
+EOF
+    : >"$dir/config/dependencies.conf"
+    : >"$dir/config/packages.map"
+    local group
+    for group in git stable core misc third-party app; do
+        : >"$dir/config/groups/$group.list"
+    done
+}
+
+# add_package DIR ID [extra-pkglines [group]]
+# One synthetic package: a one-line PKGBUILD (`pkgname=ID`) — the shape most
+# stub-driven fixtures need — plus its packages.map record and one group-list
+# entry (default group: git). extra-pkglines are appended to the PKGBUILD
+# verbatim, so a fixture reproduces whatever metadata its own stubs key on
+# (pkgver/pkgrel/arch for archive names, build() bodies, ...) without the
+# helper guessing. A package in several groups: call for one, append the rest
+# to the other group lists in the fixture.
+add_package() {
+    local dir=$1 id=$2 extra=${3:-} group=${4:-git}
+    mkdir -p "$dir/packages/$id"
+    {
+        printf 'pkgname=%s\n' "$id"
+        if [[ -n $extra ]]; then
+            printf '%s\n' "$extra"
+        fi
+    } >"$dir/packages/$id/PKGBUILD"
+    printf '%s|packages/%s\n' "$id" "$id" >>"$dir/config/packages.map"
+    printf '%s\n' "$id" >>"$dir/config/groups/$group.list"
+}
+
+# stub_sudo DIR — the sudo passthrough stub: strips the builder's
+# non-interactive flags (-n/-v/--) and execs the rest, so
+# `sudo -n pacman -U ...` reaches the fixture's pacman stub. --preserve-env is
+# stripped too: some hosts wrap `sudo` in a fish function that re-execs it as
+# `command sudo --preserve-env ...`, and real sudo accepts that flag — a stub
+# that chokes on it makes every -i fixture fail in the preflight probe.
+stub_sudo() {
+    cat >"$1/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -u
+args=()
+for a in "$@"; do
+    case $a in
+    -n | -v | --preserve-env | --preserve-env=* | --) ;;
+    *) args+=("$a") ;;
+    esac
+done
+((${#args[@]})) || exit 0
+exec "${args[@]}"
+EOF
+    chmod +x "$1/bin/sudo"
+}
+
+# stub_pacman DIR — the pacman log stub: appends every argv to
+# $GSA_FAKE_PACMAN_LOG and exits 0. Oracle-shaped pacman stubs (-Qp/-Qi
+# answers, -Si repo data, marker flipping) stay inline in their fixtures.
+stub_pacman() {
+    cat >"$1/bin/pacman" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf 'pacman %s\n' "$*" >>"${GSA_FAKE_PACMAN_LOG:?}"
+exit 0
+EOF
+    chmod +x "$1/bin/pacman"
+}
+
+# stub_makepkg DIR — the trivial makepkg stub: fails the package named by
+# $GSA_FAKE_FAIL_PACKAGE, otherwise touches a 1.0.0-1-any archive and echoes
+# its startdir. The archive name assumes add_package extras of
+# pkgver=1.0.0 / pkgrel=1 / arch=(any); a stub that stamps, times, sleeps or
+# signals is an oracle and stays inline in its fixture.
+stub_makepkg() {
+    cat >"$1/bin/makepkg" <<'EOF'
+#!/usr/bin/env bash
+set -u
+id=$(basename "$PWD")
+[[ "${GSA_FAKE_FAIL_PACKAGE:-}" == "$id" ]] && exit 1
+: >"$PWD/$id-1.0.0-1-any.pkg.tar.zst"
+printf 'fake makepkg %s\n' "$PWD"
+exit 0
+EOF
+    chmod +x "$1/bin/makepkg"
+}
+
+# run_builder CMD [ARG...] — the capture helper. Runs the command with combined
+# stdout+stderr captured in FIXTURE_OUTPUT and its exit status in FIXTURE_RC.
+# ALWAYS returns 0 (a failing builder is the fixture's data, not a reason to
+# trip the fixture's own `set -e`) — assert on FIXTURE_RC explicitly. A fixture
+# that wants `if run_builder ...` status semantics wraps this in a local
+# one-liner that returns $FIXTURE_RC.
+run_builder() {
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    FIXTURE_OUTPUT=$("$@" 2>&1)
+    FIXTURE_RC=$?
+    ((had_errexit)) && set -e
+    return 0
+}
+
+# makepkg_printsrcinfo DIR — `makepkg --printsrcinfo` with GIT_CONFIG_COUNT=0:
+# agent shells inject git config (safe.bareRepository=explicit) that breaks
+# makepkg VCS operations, so every printsrcinfo call carries that override.
+# stdout/stderr pass through; the caller redirects and checks the status.
+makepkg_printsrcinfo() {
+    GIT_CONFIG_COUNT=0 makepkg --printsrcinfo --dir "$1"
+}

@@ -35,6 +35,7 @@ set -euo pipefail
 # worth probing) when this run's own llvm install landed.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-abi-batch.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -43,85 +44,32 @@ fail() {
     exit 1
 }
 
-# Runs the builder and captures output+status in FIXTURE_OUTPUT/FIXTURE_RC
-# (config-diagnostics' pattern: assertions need the status of a failing run).
-run_builder() {
-    set +e
-    FIXTURE_OUTPUT=$("$@" 2>&1)
-    FIXTURE_RC=$?
-    set -e
-}
-
-# Minimal but fully valid workspace skeleton (config-diagnostics' recipe:
-# the loader validates map/groups/deps on EVERY invocation, --audit included).
-make_workspace() {
-    local dir=$1
-    mkdir -p "$dir/config/groups" "$dir/bin"
-    cp "$root/build-all.fish" "$dir/build-all.fish"
-    cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=1
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-    : >"$dir/config/dependencies.conf"
-    for group in git stable core misc third-party app; do
-        : >"$dir/config/groups/$group.list"
-    done
-    : >"$dir/config/packages.map"
-}
-
-add_package() { # $1 = dir, $2 = id, $3 = extra PKGBUILD lines (may be empty)
-    local dir=$1 id=$2 extra=${3:-}
-    mkdir -p "$dir/packages/$id"
-    {
-        printf 'pkgname=%s\npkgver=1.0.0\npkgrel=1\narch=(any)\n' "$id"
-        if [[ -n $extra ]]; then
-            printf '%s\n' "$extra"
-        fi
-    } >"$dir/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$dir/config/packages.map"
-    printf '%s\n' "$id" >>"$dir/config/groups/git.list"
-}
-
-# sudo stub: strips the builder's non-interactive flags and runs the rest —
-# the builder's install path is `sudo -n pacman -U ...` under the mutex shim.
-write_sudo_stub() {
-    cat >"$1/bin/sudo" <<'EOF'
-#!/usr/bin/env bash
-set -u
-args=()
-for a in "$@"; do
-    case $a in
-    -n | -v | --) ;;
-    *) args+=("$a") ;;
-    esac
-done
-((${#args[@]})) || exit 0
-exec "${args[@]}"
-EOF
-    chmod +x "$1/bin/sudo"
+# Synthetic packages carry the 1.0.0-1-any metadata their stubs' archive names
+# assume; the helper's add_package writes a one-line PKGBUILD, so that metadata
+# rides in as extra-pkglines via gsa_meta_any. run_builder (output+status in
+# FIXTURE_OUTPUT/FIXTURE_RC) comes from the helper.
+add_meta_package() { # $1 = dir, $2 = id, $3 = extra PKGBUILD body (may be empty)
+    local extra=$gsa_meta_any
+    [[ -n ${3:-} ]] && extra+=$'\n'"$3"
+    add_package "$1" "$2" "$extra"
 }
 
 # ─── A. --audit lint: cargo/rustc recipes need a rust-git edge ───────────────
 dir_a="$fixture/audit"
-make_workspace "$dir_a"
-add_package "$dir_a" p1 'build() {
+make_workspace "$dir_a" 1 2 low
+add_meta_package "$dir_a" p1 'build() {
     cargo build --release
 }'
-add_package "$dir_a" p2 'build() {
+add_meta_package "$dir_a" p2 'build() {
     cargo build --release
 }'
 # Comment-only mention: not an invocation, must not fire.
-add_package "$dir_a" p3 '# historically built with cargo and rustc
+add_meta_package "$dir_a" p3 '# historically built with cargo and rustc
 build() {
     true
 }'
 # rust-git is the toolchain itself and is excepted by the lint.
-add_package "$dir_a" rust-git 'build() {
+add_meta_package "$dir_a" rust-git 'build() {
     rustc --version
     cargo build --release
 }'
@@ -169,19 +117,19 @@ fi
 
 # ─── B. ABI-batch refusal: llvm-git without rust-git ─────────────────────────
 dir_b="$fixture/refusal"
-make_workspace "$dir_b"
-add_package "$dir_b" llvm-git ''
-add_package "$dir_b" rust-git ''
-add_package "$dir_b" q1 ''
+make_workspace "$dir_b" 1 2 low
+add_meta_package "$dir_b" llvm-git ''
+add_meta_package "$dir_b" rust-git ''
+add_meta_package "$dir_b" q1 ''
 printf 'rust-git:llvm-git\n' >"$dir_b/config/dependencies.conf"
-write_sudo_stub "$dir_b"
+stub_sudo "$dir_b"
 
 # The stub pacman reports rust-git as INSTALLED — the refusal's precondition.
 # -Qp/-Qi answer nothing, so the -i same-version check stays conservative.
 cat >"$dir_b/bin/pacman" <<'EOF'
 #!/usr/bin/env bash
 set -u
-printf 'pacman %s\n' "$*" >>"${GSA_FIXTURE_PACMAN_LOG:?}"
+printf 'pacman %s\n' "$*" >>"${GSA_FAKE_PACMAN_LOG:?}"
 case ${1:-} in
 -Q)
     [[ ${2:-} == rust-git ]] && exit 0
@@ -197,7 +145,7 @@ cat >"$dir_b/bin/makepkg" <<'EOF'
 #!/usr/bin/env bash
 set -u
 id=$(basename "$PWD")
-printf 'BUILD %s\n' "$id" >>"${GSA_FIXTURE_MAKEPKG_LOG:?}"
+printf 'BUILD %s\n' "$id" >>"${GSA_FAKE_MAKEPKG_LOG:?}"
 : >"$PWD/$id-1.0.0-1-any.pkg.tar.zst"
 exit 0
 EOF
@@ -207,8 +155,8 @@ run_env_b() {
     run_builder env \
         PATH="$dir_b/bin:$PATH" \
         GSA_STATE_DIR="$dir_b/state" \
-        GSA_FIXTURE_PACMAN_LOG="$dir_b/pacman.log" \
-        GSA_FIXTURE_MAKEPKG_LOG="$dir_b/makepkg.log" \
+        GSA_FAKE_PACMAN_LOG="$dir_b/pacman.log" \
+        GSA_FAKE_MAKEPKG_LOG="$dir_b/makepkg.log" \
         GSA_CPU_THREADS=8 \
         GSA_MEMORY_GIB=16 \
         fish "$dir_b/build-all.fish" "$@"
@@ -269,11 +217,11 @@ fi
 
 # ─── C. dispatcher: mid-run probe after the run's own llvm install ──────────
 dir_c="$fixture/dispatch"
-make_workspace "$dir_c"
-add_package "$dir_c" llvm-git ''
-add_package "$dir_c" p2 ''
+make_workspace "$dir_c" 1 2 low
+add_meta_package "$dir_c" llvm-git ''
+add_meta_package "$dir_c" p2 ''
 printf 'p2:llvm-git\n' >"$dir_c/config/dependencies.conf"
-write_sudo_stub "$dir_c"
+stub_sudo "$dir_c"
 
 # The stub build: llvm-git's build "installs" a new LLVM by creating the skew
 # marker; p2's build compiles Rust and dies once the marker exists. The
@@ -282,7 +230,7 @@ cat >"$dir_c/bin/makepkg" <<'EOF'
 #!/usr/bin/env bash
 set -u
 id=$(basename "$PWD")
-printf 'BUILD %s\n' "$id" >>"${GSA_SPAWN_LOG:?}"
+printf 'BUILD %s\n' "$id" >>"${GSA_FAKE_SPAWN_LOG:?}"
 if [[ $id == llvm-git ]]; then
     mkdir -p "${GSA_FAKE_MARKER_DIR:?}"
     : >"$GSA_FAKE_MARKER_DIR/llvm-skew"
@@ -311,7 +259,7 @@ chmod +x "$dir_c/bin/rustc"
 cat >"$dir_c/bin/pacman" <<'EOF'
 #!/usr/bin/env bash
 set -u
-printf 'pacman %s\n' "$*" >>"${GSA_FIXTURE_PACMAN_LOG:?}"
+printf 'pacman %s\n' "$*" >>"${GSA_FAKE_PACMAN_LOG:?}"
 case ${1:-} in
 -Q)
     if [[ ${2:-} == rust-git &&
@@ -332,8 +280,8 @@ run_builder env \
     PATH="$dir_c/bin:$PATH" \
     GSA_STATE_DIR="$dir_c/state" \
     GSA_FAKE_MARKER_DIR="$marker_dir" \
-    GSA_SPAWN_LOG="$dir_c/spawn.log" \
-    GSA_FIXTURE_PACMAN_LOG="$dir_c/pacman.log" \
+    GSA_FAKE_SPAWN_LOG="$dir_c/spawn.log" \
+    GSA_FAKE_PACMAN_LOG="$dir_c/pacman.log" \
     GSA_CPU_THREADS=8 \
     GSA_MEMORY_GIB=16 \
     fish "$dir_c/build-all.fish" -i llvm-git p2

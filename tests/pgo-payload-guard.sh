@@ -23,42 +23,37 @@
 #              that really replaced its phase-3 flags must not be refused)
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-pgo-payload.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
-mkdir -p "$fixture/config/groups" "$fixture/packages" "$fixture/bin"
-cp "$root/build-all.fish" "$fixture/build-all.fish"
-
-cat >"$fixture/config/build-defaults.conf" <<'EOF'
-lanes=auto
-jobs=auto
-intensity=xhigh
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-: >"$fixture/config/dependencies.conf"
-for group in git stable core misc third-party app; do
-    : >"$fixture/config/groups/$group.list"
-done
+make_workspace "$fixture" auto auto xhigh
 
 # A recipe counts as PGO to the gate purely by naming an instrumenting flag,
 # so the gate and the payload are varied independently.
 add_recipe() {
-    local id="$1" instrumenting="$2"
-    mkdir -p "$fixture/packages/$id"
-    {
-        printf 'pkgname=%s\npkgver=1.0\npkgrel=1\narch=(x86_64)\n' "$id"
-        case "$instrumenting" in
-            yes) printf 'build() {\n  CFLAGS+=" -fprofile-generate"\n}\n' ;;
-            rust) printf 'build() {\n  RUSTFLAGS+=" -Cprofile-generate=$srcdir/pgo-data"\n}\n' ;;
-            *) printf 'build() {\n  :\n}\n' ;;
-        esac
-    } >"$fixture/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$fixture/config/packages.map"
-    printf '%s\n' "$id" >>"$fixture/config/groups/git.list"
+    local id="$1" instrumenting="$2" extra
+    case "$instrumenting" in
+        yes) extra='pkgver=1.0
+pkgrel=1
+arch=(x86_64)
+build() {
+  CFLAGS+=" -fprofile-generate"
+}' ;;
+        rust) extra='pkgver=1.0
+pkgrel=1
+arch=(x86_64)
+build() {
+  RUSTFLAGS+=" -Cprofile-generate=$srcdir/pgo-data"
+}' ;;
+        *) extra='pkgver=1.0
+pkgrel=1
+arch=(x86_64)
+build() {
+  :
+}' ;;
+    esac
+    add_package "$fixture" "$id" "$extra"
 }
 
 leak_path() { printf '/home/someone/build/pgo-fixture/%s/src/A.dir/b.cxx.gcda' "$1"; }
@@ -118,6 +113,11 @@ chmod +x "$fixture/bin/pacman"
 
 cat >"$fixture/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
+# Run what it was given; leading sudo flags are dropped (including
+# --preserve-env, which host fish `sudo` wrapper functions inject).
+while [[ ${1:-} == -* ]]; do
+    shift
+done
 exec "$@"
 EOF
 chmod +x "$fixture/bin/sudo"
@@ -127,16 +127,20 @@ export GSA_FAKE_PACMAN_LOG="$fixture/pacman.log"
 temp_root="${TMPDIR:-/tmp}"
 leftovers_before=$(find "$temp_root" -maxdepth 1 -name 'gsa-pgo-verify.*' 2>/dev/null | wc -l)
 
-run_builder() {
-    PATH="$fixture/bin:$PATH" \
-    GSA_STATE_DIR="$fixture/state" \
-    fish "$fixture/build-all.fish" --installall 2>&1
+# status-returning wrapper over the helper's capture runner
+run_case() {
+    run_builder env \
+        PATH="$fixture/bin:$PATH" \
+        GSA_STATE_DIR="$fixture/state" \
+        fish "$fixture/build-all.fish" --installall
+    printf '%s\n' "$FIXTURE_OUTPUT"
+    return "$FIXTURE_RC"
 }
 
 # $1 archive basename, $2 member the refusal must name
 refuses() {
     local output
-    if output=$(run_builder); then
+    if output=$(run_case); then
         printf 'instrumented payload in %s was installed instead of refused:\n%s\n' \
             "$1" "$output" >&2
         exit 1
@@ -171,7 +175,7 @@ refuses rust-bad './usr/bin/rust-bad'
 
 # ── Case C: a clean PGO archive installs, and the non-PGO one is not unrolled
 rm -f "$(archive_of rust-bad)"
-if ! output=$(run_builder); then
+if ! output=$(run_case); then
     printf 'clean payloads were incorrectly refused:\n%s\n' "$output" >&2
     exit 1
 fi

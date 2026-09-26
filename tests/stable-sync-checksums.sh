@@ -52,7 +52,7 @@ set -euo pipefail
 # All four collaborators (pacman, curl, updpkgsums, makepkg) are stubs on PATH,
 # so this runs with no network and never builds anything.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-stable-sync.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
@@ -91,27 +91,16 @@ fail() {
 
 # ─── The sandbox ────────────────────────────────────────────────────────────
 # $1 = dir · $2 = the version the stub repo advertises · $3 = source entry
-# (default: one whose URL spells $pkgver out) · $4 = the staged sum arrays
-make_workspace() {
+# (default: one whose URL spells $pkgver out) · $4 = the staged sum arrays.
+# Skeleton synthesis comes from tests/lib/fixture-lib.bash; s1's recipe lives
+# at the non-default path packages/stable/s1 with a fully parameterised
+# PKGBUILD, so it is written here rather than via add_package.
+make_case_workspace() {
     local dir=$1 repo_full=$2
     local source_entry=${3:-'https://example.invalid/s1-$pkgver.tar.gz'}
     local sum_lines=${4:-"sha256sums=('$staged_sum')"}
-    mkdir -p "$dir/config/groups" "$dir/packages/stable/s1" "$dir/bin" "$dir/fake"
-    cp "$root/build-all.fish" "$dir/build-all.fish"
-
-    cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=1
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-    : >"$dir/config/dependencies.conf"
-    for group in git stable core misc third-party app; do
-        : >"$dir/config/groups/$group.list"
-    done
+    make_workspace "$dir" 1 2 low
+    mkdir -p "$dir/packages/stable/s1" "$dir/fake"
     printf 's1\n' >>"$dir/config/groups/stable.list"
     printf 's1|packages/stable/s1\n' >"$dir/config/packages.map"
 
@@ -279,7 +268,7 @@ recipe_log() { printf '%s/state/logs/s1.log' "$1"; }
 
 # ─── Case 1: anchored and verified — the happy path ─────────────────────────
 dir="$fixture/anchor"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = https://example.invalid/s1-$repo_version.tar.gz" \
     "	sha256sums = $published_sha"
@@ -310,7 +299,7 @@ grep -q 're-anchored to the official' "$(recipe_log "$dir")" \
 # This is the case that separates anchoring from rubber-stamping: hashing what
 # arrived (updpkgsums alone) accepts this build.
 dir="$fixture/tampered"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = https://example.invalid/s1-$repo_version.tar.gz" \
     "	sha256sums = $published_sha"
@@ -333,7 +322,7 @@ grep -q "^sha256sums=('$staged_sum')$" "$(pkgfile "$dir")" \
 
 # ─── Case 3: no official .SRCINFO at all (a recipe Arch does not carry) ─────
 dir="$fixture/no-official"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 : >"$dir/fake/srcinfo"                       # the fetch 404s
 : >"$dir/fake/srcinfo_tag"
 set_delivery "$dir" "$published_payload"
@@ -353,7 +342,7 @@ grep -q "^sha256sums=('$staged_sum')$" "$(pkgfile "$dir")" \
 # ─── Case 4: the official repo carries a different version ──────────────────
 # Anchoring to another version's checksums would be worse than not anchoring.
 dir="$fixture/other-version"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" '1.5.0' \
     '	source = https://example.invalid/s1-1.5.0.tar.gz' \
     "	sha256sums = $published_sha"
@@ -379,7 +368,7 @@ grep -q "^sha256sums=('$staged_sum')$" "$(pkgfile "$dir")" \
 # verification disabled, or any weakening for entries Arch DOES publish
 # (cases 1/2 pin that half independently).
 dir="$fixture/unanchored"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = https://example.invalid/s1-$repo_version.tar.xz" \
     "	sha256sums = $published_sha"
@@ -415,7 +404,7 @@ grep -q 'refresh-only' "$dir/out.txt" \
 # dispatch. The dispatch half is re-pinned end to end in tests/anchor-defer.sh;
 # here the refusal itself and the parking marker are asserted.
 dir="$fixture/refresh-fails"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = https://example.invalid/s1-$repo_version.tar.xz" \
     "	sha256sums = $published_sha"
@@ -445,9 +434,9 @@ grep -q '^  build-all.fish ' "$dir/out.txt" \
 for variant in pkgrel-only static-pkgver; do
     dir="$fixture/$variant"
     if [[ $variant == pkgrel-only ]]; then
-        make_workspace "$dir" "$staged_version-2"
+        make_case_workspace "$dir" "$staged_version-2"
     else
-        make_workspace "$dir" "$repo_version-1" \
+        make_case_workspace "$dir" "$repo_version-1" \
             "https://example.invalid/s1-$staged_version.tar.gz"
     fi
     set_official_srcinfo "$dir" "$repo_version" \
@@ -480,7 +469,7 @@ grep -q "^pkgver=$repo_version$" "$(pkgfile "$fixture/static-pkgver")" \
 # The sums for one file list do not line up flat: fish has a single source with
 # both a sha512 and a b2 sum, and reading them as one list refuses the build.
 dir="$fixture/two-algorithms"
-make_workspace "$dir" "$repo_version-1" \
+make_case_workspace "$dir" "$repo_version-1" \
     'https://example.invalid/s1-$pkgver.tar.gz' \
     "$(printf "sha256sums=('%s')\nb2sums=('%s')" "$staged_sum" "$staged_b2")"
 set_official_srcinfo "$dir" "$repo_version" \
@@ -501,7 +490,7 @@ grep -q "^b2sums=('$published_b2')$" "$(pkgfile "$dir")" \
 # override. Looking for the URL's basename finds nothing (or, for util-linux's
 # renamed LICENSE, an unrelated file that happens to share the name).
 dir="$fixture/renamed"
-make_workspace "$dir" "$repo_version-1" \
+make_case_workspace "$dir" "$repo_version-1" \
     's1-local.tar.gz::https://example.invalid/s1-$pkgver.tar.gz'
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = s1-local.tar.gz::https://example.invalid/s1-$repo_version.tar.gz" \
@@ -521,7 +510,7 @@ grep -q 're-anchored to the official' "$(recipe_log "$dir")" \
 # bash's main branch is 5.3.20 while the repos serve 5.3.15, so anchoring to main
 # would anchor to a different version's files.
 dir="$fixture/version-tag"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 # main carries a different version, so it is no anchor; the version's own tag
 # carries ours.
 set_official_srcinfo "$dir" '1.5.0' \
@@ -546,7 +535,7 @@ grep -q "^sha256sums=('$published_sha')$" "$(pkgfile "$dir")" \
 # tag. Verifying it as a download reports "not fetched", and anchoring to a
 # value that was never checked is the rubber stamp again.
 dir="$fixture/vcs"
-make_workspace "$dir" "$repo_version-1" \
+make_case_workspace "$dir" "$repo_version-1" \
     's1git::git+https://example.invalid/s1.git#tag=$pkgver' \
     "sha512sums=('$staged_sum')"
 # The checkout exists before the run (updpkgsums reuses it), so the value Arch
@@ -578,7 +567,7 @@ grep -q 're-anchored to the official' "$(recipe_log "$dir")" \
 
 # ─── Case 11: --no-sync disables the whole path ─────────────────────────────
 dir="$fixture/no-sync"
-make_workspace "$dir" "$repo_version-1"
+make_case_workspace "$dir" "$repo_version-1"
 set_official_srcinfo "$dir" "$repo_version" \
     "	source = https://example.invalid/s1-$repo_version.tar.gz" \
     "	sha256sums = $published_sha"

@@ -14,54 +14,32 @@ set -euo pipefail
 # pins the second half — when the archive genuinely cannot be found the run
 # must FAIL, because silence is what hid the bug for so long.
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gsa-install-guard.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
-make_workspace() { # $1 = sandbox dir, $2 = pkgver line in the PKGBUILD
+make_case_workspace() { # $1 = sandbox dir, $2 = pkgver line in the PKGBUILD
     local dir=$1 pkgver_line=$2
-    mkdir -p "$dir/config/groups" "$dir/packages/p1" "$dir/bin"
-
-    # Fixtures run the copied script from $dir, exactly like the real checkout.
-    cp "$root/build-all.fish" "$dir/build-all.fish"
-
-    cat >"$dir/config/build-defaults.conf" <<'EOF'
-lanes=1
-jobs=2
-intensity=low
-memory_per_job_gib=3
-core_memory_per_job_gib=4
-reserved_memory_gib=2
-state_dir=auto
-EOF
-    : >"$dir/config/dependencies.conf"
-    for group in git stable core misc third-party app; do
-        : >"$dir/config/groups/$group.list"
-    done
-    printf 'p1\n' >>"$dir/config/groups/git.list"
-    printf 'p1|packages/p1\n' >"$dir/config/packages.map"
+    make_workspace "$dir" 1 2 low
 
     # The trailing comment is the whole point of case A: it is legal PKGBUILD
-    # syntax and the builder must read the VALUE, not the line.
-    cat >"$dir/packages/p1/PKGBUILD" <<EOF
-pkgname=p1
-$pkgver_line
-pkgrel=1
-arch=(any)
-EOF
+    # syntax and the builder must read the VALUE, not the line. It rides in as
+    # add_package's extra-pkglines, so the PKGBUILD stays exactly four lines.
+    add_package "$dir" p1 "$pkgver_line"$'\n'"pkgrel=1
+arch=(any)"
 
     cat >"$dir/bin/makepkg" <<'EOF'
 #!/usr/bin/env bash
 set -u
 # A real makepkg writes $pkgname-$pkgver-$pkgrel-$arch.pkg.tar.zst into
-# $startdir. GSA_FIXTURE_NO_ARCHIVE models "build succeeded, archive absent".
-if [[ "${GSA_FIXTURE_NO_ARCHIVE:-0}" != 1 ]]; then
+# $startdir. GSA_FAKE_NO_ARCHIVE models "build succeeded, archive absent".
+if [[ "${GSA_FAKE_NO_ARCHIVE:-0}" != 1 ]]; then
     : >"$PWD/p1-1.0.0-1-any.pkg.tar.zst"
 fi
 # Invocation counter: the -s cases must observe that a SKIPPED build never
 # reaches makepkg — the lane's "already built" line is silent in quiet mode.
-if [[ -n ${GSA_FIXTURE_MAKEPKG_COUNT:-} ]]; then
-    printf 'run\n' >>"$GSA_FIXTURE_MAKEPKG_COUNT"
+if [[ -n ${GSA_FAKE_MAKEPKG_COUNT:-} ]]; then
+    printf 'run\n' >>"$GSA_FAKE_MAKEPKG_COUNT"
 fi
 printf 'fake makepkg %s\n' "$PWD"
 exit 0
@@ -70,74 +48,60 @@ EOF
 
     # sudo is faked so the fixture never depends on the host's timestamp: the
     # builder's install path is `run_pacman_locked ... sudo pacman -U ...`.
-    cat >"$dir/bin/sudo" <<'EOF'
-#!/usr/bin/env bash
-set -u
-args=()
-for a in "$@"; do
-    case $a in
-    -n | -v | --) ;;
-    *) args+=("$a") ;;
-    esac
-done
-((${#args[@]})) || exit 0
-exec "${args[@]}"
-EOF
-    chmod +x "$dir/bin/sudo"
+    stub_sudo "$dir"
 
     # Records every install attempt, so the assertion is "pacman ran with this
     # archive" rather than "the output looked encouraging". The same-version
-    # check's queries (-Qp/-Qi) are answered from GSA_FIXTURE_QP/QI; unset,
+    # check's queries (-Qp/-Qi) are answered from GSA_FAKE_QP/QI; unset,
     # they print nothing and fail — the builder's conservative
     # "no answer → install" fallback, which is what keeps cases A/B honest.
     cat >"$dir/bin/pacman" <<'EOF'
 #!/usr/bin/env bash
 set -u
-printf 'pacman %s\n' "$*" >>"${GSA_FIXTURE_PACMAN_LOG:?}"
+printf 'pacman %s\n' "$*" >>"${GSA_FAKE_PACMAN_LOG:?}"
 case ${1:-} in
 -Qp)
-    [[ -n ${GSA_FIXTURE_QP:-} ]] || exit 1
-    printf '%s\n' "$GSA_FIXTURE_QP"
+    [[ -n ${GSA_FAKE_QP:-} ]] || exit 1
+    printf '%s\n' "$GSA_FAKE_QP"
     ;;
 -Qi)
-    [[ -n ${GSA_FIXTURE_QI:-} ]] || exit 1
-    printf '%s\n' "$GSA_FIXTURE_QI"
+    [[ -n ${GSA_FAKE_QI:-} ]] || exit 1
+    printf '%s\n' "$GSA_FAKE_QI"
     ;;
 esac
-exit "${GSA_FIXTURE_PACMAN_RC:-0}"
+exit "${GSA_FAKE_PACMAN_RC:-0}"
 EOF
     chmod +x "$dir/bin/pacman"
 }
 
-# Builder flags for the NEXT run_builder call; cases override this instead of
+# Builder flags for the NEXT run_case call; cases override this instead of
 # duplicating the fixed --allow-broken-rustc/--no-deps/--no-sync preamble.
 builder_args=(-i p1)
 
-# Runs the builder against one sandbox; leaves output in $FIXTURE_OUTPUT and
-# returns the builder's exit status.
-run_builder() { # $1 = dir, $2 = extra env NAME=VALUE ...
+# Runs the builder against one sandbox through the helper's capture
+# (FIXTURE_OUTPUT/FIXTURE_RC); returns the builder's exit status so the cases'
+# `if run_case ...` checks read naturally.
+run_case() { # $1 = dir, $2 = extra env NAME=VALUE ...
     local dir=$1
     shift
-    FIXTURE_OUTPUT=$(
-        env "$@" \
-            PATH="$dir/bin:$PATH" \
-            GSA_STATE_DIR="$dir/state" \
-            GSA_FIXTURE_PACMAN_LOG="$dir/pacman.log" \
-            GSA_FIXTURE_MAKEPKG_COUNT="$dir/makepkg.count" \
-            GSA_CPU_THREADS=8 \
-            GSA_MEMORY_GIB=16 \
-            fish "$dir/build-all.fish" \
-            --allow-broken-rustc --no-deps --no-sync "${builder_args[@]}" 2>&1
-    ) || return $?
-    return 0
+    run_builder env "$@" \
+        PATH="$dir/bin:$PATH" \
+        GSA_STATE_DIR="$dir/state" \
+        GSA_FAKE_PACMAN_LOG="$dir/pacman.log" \
+        GSA_FAKE_MAKEPKG_COUNT="$dir/makepkg.count" \
+        GSA_CPU_THREADS=8 \
+        GSA_MEMORY_GIB=16 \
+        fish "$dir/build-all.fish" \
+        --allow-broken-rustc --no-deps --no-sync "${builder_args[@]}"
+    return "$FIXTURE_RC"
 }
 
 # ─── Case A: trailing comment on pkgver= must not hide the archive ───────────
 # Also pins the conservative fallback of the same-version check: the stub
 # answers neither -Qp nor -Qi here, and the run must still reach pacman -U.
 dir_a="$fixture/case-a"
-make_workspace "$dir_a" "pkgver=1.0.0 # bump me"
-if ! run_builder "$dir_a"; then
+make_case_workspace "$dir_a" "pkgver=1.0.0 # bump me"
+if ! run_case "$dir_a"; then
     printf 'case A: builder failed on a valid PKGBUILD with a commented pkgver:\n%s\n' \
         "$FIXTURE_OUTPUT" >&2
     exit 1
@@ -160,8 +124,8 @@ fi
 
 # ─── Case B: no archive at all must FAIL, never report success ───────────────
 dir_b="$fixture/case-b"
-make_workspace "$dir_b" "pkgver=1.0.0"
-if run_builder "$dir_b" GSA_FIXTURE_NO_ARCHIVE=1; then
+make_case_workspace "$dir_b" "pkgver=1.0.0"
+if run_case "$dir_b" GSA_FAKE_NO_ARCHIVE=1; then
     printf 'case B: `-i` succeeded with no package archive to install:\n%s\n' \
         "$FIXTURE_OUTPUT" >&2
     exit 1
@@ -229,10 +193,10 @@ assert_skip_message() { # $1 = dir, $2 = label — quiet lane logs go to state/
 # Case C: exact version already installed, install fresher than the archive
 # → no transaction, success still reported.
 dir_c="$fixture/case-c"
-make_workspace "$dir_c" "pkgver=1.0.0"
+make_case_workspace "$dir_c" "pkgver=1.0.0"
 builder_args=(-i p1)
-if ! run_builder "$dir_c" GSA_FIXTURE_QP='p1 1.0.0-1' \
-    "GSA_FIXTURE_QI=$(fresh_qi 1.0.0-1)"; then
+if ! run_case "$dir_c" GSA_FAKE_QP='p1 1.0.0-1' \
+    "GSA_FAKE_QI=$(fresh_qi 1.0.0-1)"; then
     printf 'case C: run failed although the exact version was installed:\n%s\n' \
         "$FIXTURE_OUTPUT" >&2
     exit 1
@@ -246,10 +210,10 @@ assert_skip_message "$dir_c" 'case C'
 
 # Case D: a DIFFERENT installed version must install.
 dir_d="$fixture/case-d"
-make_workspace "$dir_d" "pkgver=1.0.0"
+make_case_workspace "$dir_d" "pkgver=1.0.0"
 builder_args=(-i p1)
-if ! run_builder "$dir_d" GSA_FIXTURE_QP='p1 1.0.0-1' \
-    "GSA_FIXTURE_QI=$(fresh_qi 0.9.0-1)"; then
+if ! run_case "$dir_d" GSA_FAKE_QP='p1 1.0.0-1' \
+    "GSA_FAKE_QI=$(fresh_qi 0.9.0-1)"; then
     printf 'case D: run failed on a version difference:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
@@ -258,10 +222,10 @@ assert_u "$dir_d" 'case D'
 # Case E: same version, but the install PREDATES the archive — a rebuild that
 # never reached the system. The freshness guard must install it.
 dir_e="$fixture/case-e"
-make_workspace "$dir_e" "pkgver=1.0.0"
+make_case_workspace "$dir_e" "pkgver=1.0.0"
 builder_args=(-i p1)
-if ! run_builder "$dir_e" GSA_FIXTURE_QP='p1 1.0.0-1' \
-    "GSA_FIXTURE_QI=$(stale_qi 1.0.0-1)"; then
+if ! run_case "$dir_e" GSA_FAKE_QP='p1 1.0.0-1' \
+    "GSA_FAKE_QI=$(stale_qi 1.0.0-1)"; then
     printf 'case E: run failed on a stale install date:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
@@ -270,10 +234,10 @@ assert_u "$dir_e" 'case E'
 # Case F: -fi ALONE (no -i) implies install and bypasses the check that
 # cases C would apply — same fresh same-version state, but -U must run.
 dir_f="$fixture/case-f"
-make_workspace "$dir_f" "pkgver=1.0.0"
+make_case_workspace "$dir_f" "pkgver=1.0.0"
 builder_args=(-fi p1)
-if ! run_builder "$dir_f" GSA_FIXTURE_QP='p1 1.0.0-1' \
-    "GSA_FIXTURE_QI=$(fresh_qi 1.0.0-1)"; then
+if ! run_case "$dir_f" GSA_FAKE_QP='p1 1.0.0-1' \
+    "GSA_FAKE_QI=$(fresh_qi 1.0.0-1)"; then
     printf 'case F: -fi run failed:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
@@ -291,15 +255,15 @@ assert_u "$dir_f" 'case F'
 # Case G: the original complaint — resume with -s -i: the build is skipped
 # AND the already-installed package is not reinstalled.
 dir_g="$fixture/case-g"
-make_workspace "$dir_g" "pkgver=1.0.0"
+make_case_workspace "$dir_g" "pkgver=1.0.0"
 builder_args=(p1)
-if ! run_builder "$dir_g"; then # first run: build only (no -i)
+if ! run_case "$dir_g"; then # first run: build only (no -i)
     printf 'case G: initial build failed:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
 builder_args=(-s -i p1)
-if ! run_builder "$dir_g" GSA_FIXTURE_QP='p1 1.0.0-1' \
-    "GSA_FIXTURE_QI=$(fresh_qi 1.0.0-1)"; then
+if ! run_case "$dir_g" GSA_FAKE_QP='p1 1.0.0-1' \
+    "GSA_FAKE_QI=$(fresh_qi 1.0.0-1)"; then
     printf 'case G: -s -i resume failed:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
@@ -317,15 +281,15 @@ assert_skip_message "$dir_g" 'case G'
 
 # Case H: -s -fi — the build is still skipped, but the install is forced.
 dir_h="$fixture/case-h"
-make_workspace "$dir_h" "pkgver=1.0.0"
+make_case_workspace "$dir_h" "pkgver=1.0.0"
 builder_args=(p1)
-if ! run_builder "$dir_h"; then # first run: build only (no -i)
+if ! run_case "$dir_h"; then # first run: build only (no -i)
     printf 'case H: initial build failed:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
 builder_args=(-s -fi p1)
-if ! run_builder "$dir_h" GSA_FIXTURE_QP='p1 1.0.0-1' \
-    "GSA_FIXTURE_QI=$(fresh_qi 1.0.0-1)"; then
+if ! run_case "$dir_h" GSA_FAKE_QP='p1 1.0.0-1' \
+    "GSA_FAKE_QI=$(fresh_qi 1.0.0-1)"; then
     printf 'case H: -s -fi resume failed:\n%s\n' "$FIXTURE_OUTPUT" >&2
     exit 1
 fi
