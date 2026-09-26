@@ -4,8 +4,10 @@ set -euo pipefail
 # app group + TTY multi-select prompt fixture.
 #
 # Pins (decisions recorded in docs/NOTE.md 2026-09-23):
-#   1. loader demands exactly six group files (missing app.list = error)
-#   2. an EMPTY app.list refuses with a targeted hint (no phantom member)
+#   1. loader demands config/topology.conf (a missing file = error; group
+#      membership rides in each record's groups field, and the roster is the
+#      builder's six names — git, stable, core, misc, third-party, app)
+#   2. an app group with NO member refuses with a targeted hint (no phantom member)
 #   3. non-TTY -n -g app builds the whole group and says the prompt was
 #      skipped; the group is a LEAF selection — a local dependency edge to a
 #      non-app workspace package must NOT pull that package into the run
@@ -28,15 +30,8 @@ fail() {
     exit 1
 }
 
-# ── Synthetic workspace: five fake packages, six group files ────────────────
+# ── Synthetic workspace: five fake packages, one topology record each ───────
 make_workspace "$fixture" auto auto xhigh
-
-# app2 depends on extdep (a NON-app workspace package: must never be pulled
-# in) and app3 depends on app2 (in-group edge: fixes dependency order).
-cat >"$fixture/config/dependencies.conf" <<'EOF'
-app2:extdep
-app3:app2
-EOF
 
 # pkgver=1 (not the helper's $gsa_meta_any default) keeps these PKGBUILDs
 # byte-identical to the hand-written skeleton this replaced.
@@ -47,7 +42,11 @@ for pair in "git:gitp1" "misc:extdep" "app:app1 app2 app3"; do
         add_package "$fixture" "$id" $'pkgver=1\npkgrel=1\narch=(any)' "$grp"
     done
 done
-cp "$fixture/config/groups/app.list" "$fixture/config/groups/app.list.content"
+
+# app2 depends on extdep (a NON-app workspace package: must never be pulled
+# in) and app3 depends on app2 (in-group edge: fixes dependency order).
+set_topology_record "$fixture" app2 app 'extdep'
+set_topology_record "$fixture" app3 app 'app2'
 
 cat >"$fixture/bin/makepkg" <<'EOF'
 #!/usr/bin/env bash
@@ -98,32 +97,32 @@ listed_seq() {
         | grep -E '^ +[0-9]+\. ' | awk '{print $2}' | tr -d '\r'
 }
 
-# ── 1. Loader: missing app.list is an error ─────────────────────────────────
-mv "$fixture/config/groups/app.list" "$fixture/app.list.bak"
+# ── 1. Loader: a missing topology file is an error ──────────────────────────
+mv "$fixture/config/topology.conf" "$fixture/topology.conf.bak"
 if run_quiet "$fixture/o1" --list; then
-    fail "loader accepted a workspace without config/groups/app.list" "$fixture/o1"
+    fail "loader accepted a workspace without config/topology.conf" "$fixture/o1"
 fi
-grep -q 'group list not found:.*app\.list' "$fixture/o1" \
-    || fail "loader error does not name the missing app.list" "$fixture/o1"
-mv "$fixture/app.list.bak" "$fixture/config/groups/app.list"
+grep -q 'topology not found:' "$fixture/o1" \
+    || fail "loader error does not name the missing config/topology.conf" "$fixture/o1"
+mv "$fixture/topology.conf.bak" "$fixture/config/topology.conf"
 
-# ── 2. Empty app.list: refuse with a hint, never a phantom member ───────────
+# ── 2. Empty app membership: refuse with a hint, never a phantom member ─────
 # App members keep their category-group membership in the real tree, so mirror
-# that here: app1..app3 move to git.list while app.list itself is emptied.
-# Otherwise the loader's "listed in no group" rule would fail first and the
-# seam hint would never be reached.
-cp "$fixture/config/groups/git.list" "$fixture/git.list.content"
-cat "$fixture/config/groups/app.list" >>"$fixture/config/groups/git.list"
-printf '# intentionally empty\n' >"$fixture/config/groups/app.list"
+# that here: app1..app3 records move to the git group while no record carries
+# app in its groups field.
+set_topology_record "$fixture" app1 git ''
+set_topology_record "$fixture" app2 git 'extdep'
+set_topology_record "$fixture" app3 git 'app2'
 if run_quiet "$fixture/o2" -n -g app; then
-    fail "-n -g app succeeded with an empty app.list" "$fixture/o2"
+    fail "-n -g app succeeded with no app-group member" "$fixture/o2"
 fi
 grep -q 'the app list is empty' "$fixture/o2" \
-    || fail "empty app.list lacks the populate hint" "$fixture/o2"
+    || fail "empty app membership lacks the populate hint" "$fixture/o2"
 grep -q 'selection resolved to no packages' "$fixture/o2" \
-    || fail "empty app.list lacks the no-selection error" "$fixture/o2"
-cp "$fixture/config/groups/app.list.content" "$fixture/config/groups/app.list"
-cp "$fixture/git.list.content" "$fixture/config/groups/git.list"
+    || fail "empty app membership lacks the no-selection error" "$fixture/o2"
+set_topology_record "$fixture" app1 app ''
+set_topology_record "$fixture" app2 app 'extdep'
+set_topology_record "$fixture" app3 app 'app2'
 
 # ── 3. Non-TTY: whole group, prompt skipped, NO dependency expansion ────────
 run_quiet "$fixture/o3" -n -g app \

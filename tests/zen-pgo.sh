@@ -117,7 +117,7 @@ mapfile -t opts < <(grep -F 'opt=' <<<"$vars" | cut -d= -f2-)
     fail "source=() (${#sources[@]}) and sha256sums=() (${#sums[@]}) differ in length"
 
 # .SRCINFO freshness is owned by tests/srcinfo-freshness.sh (it regenerates and
-# diffs every recipe from config/packages.map), so it is not re-asserted here.
+# diffs every recipe from the --topology channel), so it is not re-asserted here.
 
 declare -A sum_of
 for i in "${!sources[@]}"; do

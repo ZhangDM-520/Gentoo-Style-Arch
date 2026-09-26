@@ -12,10 +12,11 @@ set -euo pipefail
 # at 1.19.1 with the previous tarball's hash. `makepkg --printsrcinfo` was
 # simply never re-run when the version was bumped.
 #
-# The recipe list comes from config/packages.map, which is the only place that
-# binds a package id to a recipe path, so a new recipe is covered without
-# touching this file. Read-only: each recipe is generated into $TMPDIR and
-# diffed, never written to.
+# The recipe list comes from the builder's --topology data channel (one
+# record per package, id|path|groups|edges|tags), which resolves
+# config/topology.conf — the only place that binds a package id to a recipe
+# path — so a new recipe is covered without touching this file. Read-only:
+# each recipe is generated into $TMPDIR and diffed, never written to.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$(dirname "${BASH_SOURCE[0]}")/lib/fixture-lib.bash"
@@ -49,9 +50,10 @@ export -f check_recipe
 export -f makepkg_printsrcinfo
 export root tmp
 
-mapfile -t recipes < <(awk -F'|' '!/^#/ && NF==2 {print $2}' "$root/config/packages.map")
+mapfile -t recipes < <(fish "$root/build-all.fish" --topology 2>/dev/null |
+    awk -F'|' '!/^#/ && NF == 5 {print $2}')
 ((${#recipes[@]} > 0)) || {
-    printf 'srcinfo freshness fixture: config/packages.map listed no recipes\n' >&2
+    printf 'srcinfo freshness fixture: the --topology channel listed no recipes\n' >&2
     exit 1
 }
 

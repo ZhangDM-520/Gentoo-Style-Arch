@@ -54,40 +54,40 @@ if ! run_list "$baseline"; then
     exit 1
 fi
 
-# ─── A package present in packages.map but in no group list ──────────────────
+# ─── A topology record naming no group ─────────────────────────────────────
 dir="$fixture/ungrouped"
 make_case_workspace "$dir"
-printf 'p1\n' >"$dir/config/groups/git.list" # p2 dropped from every group
-assert_rejected 'ungrouped package' "$dir" 'p2 is listed in'
+set_topology_record "$dir" p2 '' # p2 names no group at all
+assert_rejected 'ungrouped package' "$dir" 'topology record for p2 names no group'
 
-# ─── A dependency record naming a package that does not exist ───────────────
+# ─── An edge naming a package that does not exist ──────────────────────────
 dir="$fixture/unknown-dep"
 make_case_workspace "$dir"
-printf 'p1:ghost\n' >"$dir/config/dependencies.conf"
+set_topology_record "$dir" p1 git ghost
 assert_rejected 'unknown dependency' "$dir" 'unknown dependency: ghost'
 
-# ─── A dependency record naming an unknown package ──────────────────────────
+# ─── A record whose recipe does not exist ──────────────────────────────────
 dir="$fixture/unknown-pkg"
 make_case_workspace "$dir"
-printf 'ghost:p1\n' >"$dir/config/dependencies.conf"
-assert_rejected 'unknown package' "$dir" 'unknown package: ghost'
+set_topology_record "$dir" ghost git # no packages/ghost/PKGBUILD ever written
+assert_rejected 'unknown package' "$dir" 'invalid topology record path for ghost'
 
-# ─── A dependency record with no separator ──────────────────────────────────
-dir="$fixture/malformed-dep"
+# ─── A record with the wrong field count ───────────────────────────────────
+dir="$fixture/malformed-record"
 make_case_workspace "$dir"
-printf 'p1\n' >"$dir/config/dependencies.conf"
-assert_rejected 'malformed dependency record' "$dir" "invalid dependency record (expected"
+printf 'p1\n' >"$dir/config/topology.conf" # one bare field, not a record
+assert_rejected 'malformed topology record' "$dir" "invalid topology record (expected"
 
 # ─── Missing config files are named, not just "invalid" ─────────────────────
-dir="$fixture/no-packages-map"
+dir="$fixture/no-topology"
 make_case_workspace "$dir"
-rm -f "$dir/config/packages.map"
-assert_rejected 'missing package map' "$dir" 'package map not found:'
+rm -f "$dir/config/topology.conf"
+assert_rejected 'missing topology' "$dir" 'topology not found:'
 
-dir="$fixture/no-dependencies-conf"
+dir="$fixture/no-build-defaults"
 make_case_workspace "$dir"
-rm -f "$dir/config/dependencies.conf"
-assert_rejected 'missing dependency config' "$dir" 'dependency config not found:'
+rm -f "$dir/config/build-defaults.conf"
+assert_rejected 'missing build defaults' "$dir" 'build defaults not found:'
 
 # ─── An invalid build default still names its key (pre-existing behaviour) ──
 dir="$fixture/bad-default"
@@ -95,21 +95,45 @@ make_case_workspace "$dir"
 sed -i 's/^memory_per_job_gib=.*/memory_per_job_gib=0/' "$dir/config/build-defaults.conf"
 assert_rejected 'invalid numeric default' "$dir" 'memory_per_job_gib=0'
 
-# ─── Group-list problems name the line, not just the group ──────────────────
+# ─── Per-record problems name the record, not just the file ─────────────────
 dir="$fixture/group-duplicate"
 make_case_workspace "$dir"
-printf 'p1\np1\np2\n' >"$dir/config/groups/git.list"
-assert_rejected 'duplicate group entry' "$dir" 'p1 appears twice in'
+set_topology_record "$dir" p1 'git,git' # one group listed twice
+assert_rejected 'duplicate group in field' "$dir" 'appears twice in the groups field'
 
 dir="$fixture/group-unknown"
 make_case_workspace "$dir"
-printf 'p1\np2\nghost\n' >"$dir/config/groups/git.list"
-assert_rejected 'unknown group entry' "$dir" 'names no package: ghost'
+set_topology_record "$dir" p2 'git,ghost'
+assert_rejected 'unknown group in field' "$dir" 'unknown group in topology record p2: ghost'
 
-dir="$fixture/group-missing"
+dir="$fixture/edge-duplicate"
 make_case_workspace "$dir"
-rm -f "$dir/config/groups/git.list"
-assert_rejected 'missing group list' "$dir" 'group list not found:'
+set_topology_record "$dir" p1 git 'p2,p2'
+assert_rejected 'duplicate edge in field' "$dir" 'appears twice in the edges field'
+
+dir="$fixture/tag-unknown"
+make_case_workspace "$dir"
+set_topology_record "$dir" p1 git '' 'abi=maybe'
+assert_rejected 'unknown tag' "$dir" 'unknown tag in topology record p1'
+
+dir="$fixture/tag-conflict"
+make_case_workspace "$dir"
+set_topology_record "$dir" p1 git '' 'abi=must,abi=should'
+assert_rejected 'conflicting tags' "$dir" 'names both abi=must and abi=should'
+
+dir="$fixture/bad-id"
+make_case_workspace "$dir"
+printf '%s\n' 'bad id|packages/p1|git|' >>"$dir/config/topology.conf"
+assert_rejected 'invalid id' "$dir" 'invalid topology record id'
+
+# ─── NEW: a duplicate package id names the offender AND the line ────────────
+# The old map's duplicate-id path was a bare `return 1` with no offender name;
+# one record per package makes the duplicate possible again (two rows, one id),
+# so the fix the loader got is pinned here.
+dir="$fixture/duplicate-id"
+make_case_workspace "$dir"
+printf '%s\n' 'p1|packages/p1|git|' >>"$dir/config/topology.conf"
+assert_rejected 'duplicate id' "$dir" 'duplicate package id in topology record: p1'
 
 # ─── fixture-lib smoke: a helper-built workspace satisfies the loader ────────
 # The synthesis helper's contract is that its skeletons are valid OUT OF THE

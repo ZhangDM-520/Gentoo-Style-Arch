@@ -3,10 +3,15 @@
 ## Adding a recipe
 
 Place a clean recipe directory under the physical category that best describes
-it, add an entry to `config/packages.map`, and add its package ID to one or
-more logical group files. If it has local build-order coupling, add one
-record to `config/dependencies.conf`. The map is the only place that binds a
-package ID to a filesystem path.
+it, and add one record to `config/topology.conf`:
+`id|path|groups|edges[|tags]`. The record is the only place that binds a
+package ID to a filesystem path. `groups` is a comma list over the six group
+names (`git, stable, core, misc, third-party, app`), `edges` is the comma
+list of local build-order dependencies (a record ending in a bare `|` is a
+deliberate no-edge record), and `tags` carries coupled-batch policy
+(`abi=must` / `abi=should`, see "Updating coupled stacks"). The loader
+validates every record on every invocation and one malformed record breaks
+every command — and names the offender.
 
 Keep `.SRCINFO` synchronized:
 
@@ -37,11 +42,23 @@ batch. ROCm and stock-name replacement packages may require immediate
 installation before the next consumer starts. Verify the installed ABI,
 provides, and dependency closure rather than trusting version strings alone.
 
+Coupled-batch membership is topology data, in the record's `tags` field:
+`abi=must` marks the ABI origin (llvm-git, the Qt base packages) and the
+modules that must rebuild with it; `abi=should` marks same-pass candidates
+that are only noted, never gated. The batch itself is derived from the edge
+graph — every abi-tagged package that transitively depends on a selected
+anchor — so membership cannot drift away from the edges the way prose could.
+A real build whose selection includes an `abi=must` anchor while an installed
+`abi=must` batch member is omitted is refused before anything dispatches,
+with the missing members named; `-n` and `-l` never gate. Uninstalled members
+are never gated: they rebuild against the new ABI on their next build anyway.
+
 The same trap appears when a recipe *becomes* a Rust consumer.
 `mold-git` was reworked into a cargo-based 3-phase Rust PGO build, which
-silently made it a system rustc/cargo consumer, while its
-`config/dependencies.conf` record stayed the deliberate no-edge `mold-git:` —
-a lone `package-id:` is valid syntax, and the scheduler trusts it blindly, so
+silently made it a system rustc/cargo consumer, while its edge record stayed
+a deliberate no-edge record (today: an empty `edges` field in its
+`config/topology.conf` record) — a no-edge record is valid syntax, and the
+scheduler trusts it blindly, so
 mold could dispatch before `rust-git` and died on an ABI-skewed `rustc` one
 llvm-snapshot bump later (`prepare()`'s `cargo fetch` hit the undefined
 `cl::ParseCommandLineOptions` symbol). A recipe that gains a `cargo`/`rustc`
@@ -49,7 +66,7 @@ invocation in ANY phase (prepare/build/check/package) must gain a `rust-git`
 edge in the same change, and `fish build-all.fish --audit` now flags violations
 of that (toolchain lint). With the edge in place a bare `mold-git` selection
 chain-expands to **three** packages — `llvm-git`, `rust-git`, `mold-git` —
-because the pre-existing `rust-git:llvm-git` edge transitively pulls llvm-git
+because the pre-existing `rust-git → llvm-git` edge transitively pulls llvm-git
 in; the ordering guarantee that matters is rust-git before mold-git.
 
 For VCS (`-git`) pairs the drift is subtler: a consumer that fetches new

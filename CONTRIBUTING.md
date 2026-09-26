@@ -32,13 +32,15 @@ belong in `docs/NOTE.md`; `docs/MEMORY.md` §5 holds a live decision.
    with `git check-ignore -v <asset>` (no output = visible). Never let a recipe
    `.gitignore` match itself: an ignore file that hides itself cannot be
    committed, so on a clean checkout the rule is simply absent.
-4. Update `config/packages.map` only when adding or relocating a recipe. The
-   format is exactly two fields, `package-id|recipe-path`; the loader rejects
-   any other field count, and the map is the only place that binds an ID to a
+4. Update `config/topology.conf` when adding or relocating a recipe. The
+   record format is exactly `id|path|groups|edges[|tags]`; the loader rejects
+   any other shape, and the record is the only place that binds an ID to a
    path.
-5. Update the appropriate group file and `config/dependencies.conf` only after
-   verifying the dependency with the package metadata and a build-order
-   reason.
+5. Record group membership (`groups`, a comma list of the six group names)
+   and any local dependency edges (`edges`) in the same record, and only after
+   verifying a dependency with the package metadata and a build-order reason.
+   Coupled-batch tags (`abi=must`/`abi=should`) belong in the same record's
+   `tags` field — see "Updating coupled stacks" in `docs/maintainer-guide.md`.
 6. Regenerate `.SRCINFO`:
 
    ```sh
@@ -138,6 +140,8 @@ child-process cleanup.
 
 Keep ABI-coupled packages in the same documented batch. LLVM consumers,
 Rust, Qt private-API modules, ROCm, and the system replacement packages are
-not ordinary independent leaf updates. Record the reason for a new edge in
-`docs/NOTE.md` and update the maintainer rules in `docs/MEMORY.md` when the
-operational contract changes.
+not ordinary independent leaf updates. Batch membership is declared in the
+`tags` field of the package's `config/topology.conf` record
+(`abi=must` / `abi=should`); the batch itself is derived from the edge graph.
+Record the reason for a new edge in `docs/NOTE.md` and update the maintainer
+rules in `docs/MEMORY.md` when the operational contract changes.

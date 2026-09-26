@@ -158,13 +158,15 @@ grep -Fxq 'Target = usr/share/applications/discord.desktop' \
     "$root/$recipe/vencord-discord-desktop.hook" ||
     fail "hook does not trigger on the stock discord.desktop path"
 
-# Topology: the recipe must be reachable through the map and the git group.
-grep -Fxq "vencord-git|$recipe" \
-    "$root/config/packages.map" || fail "not registered in config/packages.map"
-grep -Fxq 'vencord-git' "$root/config/groups/git.list" ||
+# Topology: the recipe must be reachable through a topology record (id+path)
+# and a git-group membership, read through the builder's --topology channel.
+topo=$(fish "$root/build-all.fish" --topology) || fail "--topology failed"
+rec=$(printf '%s\n' "$topo" | awk -F'|' -v id=vencord-git '$1 == id')
+[[ -n $rec ]] || fail "not registered in config/topology.conf (no record)"
+[[ $(printf '%s\n' "$rec" | cut -d'|' -f2) == "$recipe" ]] ||
+    fail "topology record does not point at $recipe"
+[[ ",$(printf '%s\n' "$rec" | cut -d'|' -f3)," == *,git,* ]] ||
     fail "not a member of the git group"
-grep -q '^vencord-git:' "$root/config/dependencies.conf" ||
-    fail "not registered in config/dependencies.conf"
 
 # .SRCINFO must match the recipe.
 if ! makepkg_printsrcinfo "$root/$recipe" |

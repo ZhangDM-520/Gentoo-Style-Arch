@@ -164,13 +164,15 @@ for script in texlive-fmtutil texlive-language texlive-updmap; do
         fail "missing alpm script install: $script"
 done
 
-# Topology registration.
-grep -Fxq "texlive-texmf|$recipe" "$root/config/packages.map" ||
-    fail "not registered in config/packages.map"
-grep -Fxq 'texlive-texmf' "$root/config/groups/git.list" ||
+# Topology registration, read through the builder's --topology channel
+# (id|path|groups|edges|tags).
+topo=$(fish "$root/build-all.fish" --topology) || fail "--topology failed"
+rec=$(printf '%s\n' "$topo" | awk -F'|' -v id=texlive-texmf '$1 == id')
+[[ -n $rec ]] || fail "not registered in config/topology.conf (no record)"
+[[ $(printf '%s\n' "$rec" | cut -d'|' -f2) == "$recipe" ]] ||
+    fail "topology record does not point at $recipe"
+[[ ",$(printf '%s\n' "$rec" | cut -d'|' -f3)," == *,git,* ]] ||
     fail "not a member of the git group"
-grep -q '^texlive-texmf:' "$root/config/dependencies.conf" ||
-    fail "not registered in config/dependencies.conf"
 grep -Fq "'^svn\+|^svn://'" "$root/build-all.fish" ||
     fail "build-all.fish does not clean svn source checkouts"
 # This recipe downloads a wheel, so the builder's cleanup list must cover
@@ -181,6 +183,6 @@ grep -q '^set -g _DOWNLOAD_ARCHIVE_EXTS .*\(^\| \)whl\( \|$\)' "$root/build-all.
     fail "build-all.fish does not clean downloaded wheels"
 
 # .SRCINFO freshness is owned by tests/srcinfo-freshness.sh (it regenerates and
-# diffs every recipe from config/packages.map), so it is not re-asserted here.
+# diffs every recipe from the --topology channel), so it is not re-asserted here.
 
 printf 'texlive-texmf recipe fixture: PASS\n'

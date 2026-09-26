@@ -17,7 +17,7 @@ set -euo pipefail
 #     recovery lines ('Refresh them by hand', '--no-sync'), makepkg never
 #     ran for it, and the recipe is not counted as succeeded or failed;
 #   * c-plain, independent of a-stable, still BUILDS — dispatch continues;
-#   * b-dep (dependencies.conf: b-dep:a-stable) is never dispatched: building
+#   * b-dep (a topology edge b-dep → a-stable) is never dispatched: building
 #     it against a package that was never built/installed this run is the
 #     rule-11 hazard -i exists to prevent. It is labelled as waiting on the
 #     deferred recipe, not as a dependency cycle;
@@ -45,14 +45,12 @@ command -v vercmp >/dev/null || {
 dir="$fixture/ws"
 make_workspace "$dir" 1 2 low
 mkdir -p "$dir/packages/stable/a-stable"
-printf 'b-dep:a-stable\n' >"$dir/config/dependencies.conf"
 
 # a-stable: a stable recipe whose moved source gets NO official document (404)
 # → anchor_sums_from_official refuses with rc 3, which the lane reports as the
 # defer code. $pkgver must be literal: the builder expands source=() by
 # sourcing the recipe. Its recipe path (packages/stable/) is not what
-# add_package records, so its recipe, map record and group entry stay inline;
-# the map record is written FIRST to keep the original map order.
+# add_package records, so its recipe and topology record stay inline.
 {
     printf 'pkgname=a-stable\n'
     printf 'pkgver=1.0.0\n'
@@ -61,12 +59,13 @@ printf 'b-dep:a-stable\n' >"$dir/config/dependencies.conf"
     printf 'source=("https://example.invalid/a-$pkgver.tar.gz")\n'
     printf "sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')\n"
 } >"$dir/packages/stable/a-stable/PKGBUILD"
-printf 'a-stable|packages/stable/a-stable\n' >"$dir/config/packages.map"
-printf 'a-stable\n' >"$dir/config/groups/stable.list"
+printf 'a-stable|packages/stable/a-stable|stable|\n' >>"$dir/config/topology.conf"
 
-# b-dep / c-plain: ordinary recipes with working builds.
+# b-dep / c-plain: ordinary recipes with working builds. b-dep's edge on
+# a-stable is why a deferred a-stable parks it.
 add_package "$dir" b-dep "$gsa_meta_any"
 add_package "$dir" c-plain "$gsa_meta_any"
+set_topology_record "$dir" b-dep git 'a-stable'
 
 mkdir -p "$dir/fake"
 printf '2.0.0-1\n' >"$dir/fake/repo_version"

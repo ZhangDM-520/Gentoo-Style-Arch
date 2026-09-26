@@ -96,7 +96,7 @@ grep -qx 'Exec = /usr/share/libalpm/scripts/bpftune-restart post' "$root/$post_h
 # --- .SRCINFO must match the recipe ------------------------------------------
 # .SRCINFO freshness (the check that catches a checksum edited in the PKGBUILD
 # after .SRCINFO was generated) is owned by tests/srcinfo-freshness.sh, which
-# covers every recipe from config/packages.map — not re-asserted here.
+# covers every recipe from the --topology channel — not re-asserted here.
 
 # --- what the script decides, against a stubbed systemctl -------------------
 work=$(mktemp -d)

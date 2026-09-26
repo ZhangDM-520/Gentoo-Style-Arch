@@ -12,17 +12,22 @@ set -euo pipefail
 # Four policy seams are pinned here, one section each:
 #
 #   A. --audit toolchain lint: a recipe whose PKGBUILD invokes cargo/rustc
-#      must name rust-git in its dependencies.conf edge record (rust-git
+#      must name rust-git in its topology record's edges field (rust-git
 #      itself excepted).
-#   B. ABI-batch refusal: a REAL build whose selection contains llvm-git but
-#      not rust-git is refused up front while rust-git is installed; the
-#      read-only modes (-n, -l) stay unaffected.
+#   B. ABI-batch refusal (generic): a REAL build whose selection contains an
+#      abi=must batch anchor (llvm-git) while an installed abi=must batch
+#      member (rust-git) is omitted is refused up front; the read-only modes
+#      (-n, -l) stay unaffected. Batch membership is topology data — the
+#      tags field (abi=must / abi=should) plus the edge direction.
 #   C. Dispatcher probe: with -i, a successful lane for llvm-git re-runs
 #      check_rustc_sanity BEFORE anything else dispatches; a failing probe
 #      stops dispatch, drains in-flight lanes and exits non-zero.
-#   D. Repo policy: config/dependencies.conf declares mold-git:rust-git
+#   D. Repo policy: config/topology.conf declares mold-git's rust-git edge
 #      (the missing edge that let a cargo recipe dispatch before rust-git),
-#      and the edge actually orders a mold-git selection.
+#      the edge actually orders a mold-git selection, and the llvm-git /
+#      rust-git batch membership is recorded as tags. Read through the
+#      builder's --topology data channel — the same interface
+#      tests/srcinfo-freshness.sh consumes.
 #
 # Synthetic workspaces + PATH stubs only; nothing real is built or installed.
 #
@@ -73,7 +78,7 @@ add_meta_package "$dir_a" rust-git 'build() {
     rustc --version
     cargo build --release
 }'
-printf 'p2:rust-git\n' >"$dir_a/config/dependencies.conf"
+set_topology_record "$dir_a" p2 git 'rust-git'
 
 run_builder fish "$dir_a/build-all.fish" --audit
 out_a=$FIXTURE_OUTPUT
@@ -97,7 +102,7 @@ done
 # With the edge declared the finding must disappear, and the exit status must
 # treat a finding exactly like every other audit finding (report-only: the
 # audit exits 0 either way — findings never changed its exit status).
-printf 'p1:rust-git\n' >>"$dir_a/config/dependencies.conf"
+set_topology_record "$dir_a" p1 git 'rust-git'
 run_builder fish "$dir_a/build-all.fish" --audit
 out_a2=$FIXTURE_OUTPUT
 rc_a2=$FIXTURE_RC
@@ -121,7 +126,11 @@ make_workspace "$dir_b" 1 2 low
 add_meta_package "$dir_b" llvm-git ''
 add_meta_package "$dir_b" rust-git ''
 add_meta_package "$dir_b" q1 ''
-printf 'rust-git:llvm-git\n' >"$dir_b/config/dependencies.conf"
+# The batch data the generic gate acts on: llvm-git is the anchor (abi=must,
+# no abi-tagged dependency), rust-git is its mandatory member (abi=must plus
+# the llvm-git edge).
+set_topology_record "$dir_b" llvm-git git '' 'abi=must'
+set_topology_record "$dir_b" rust-git git 'llvm-git' 'abi=must'
 stub_sudo "$dir_b"
 
 # The stub pacman reports rust-git as INSTALLED — the refusal's precondition.
@@ -169,8 +178,8 @@ if [[ $FIXTURE_RC -eq 0 ]]; then
     exit 1
 fi
 for want in \
-    'llvm-git changes the LLVM C++ ABI' \
-    'rust-git first' \
+    'refusing to build llvm-git without rust-git' \
+    'abi=must batch anchor' \
     'rebuild in the same selection' \
     'rebuild rust-git in the same run' \
     'check_rustc_sanity recovery text'; do
@@ -220,7 +229,7 @@ dir_c="$fixture/dispatch"
 make_workspace "$dir_c" 1 2 low
 add_meta_package "$dir_c" llvm-git ''
 add_meta_package "$dir_c" p2 ''
-printf 'p2:llvm-git\n' >"$dir_c/config/dependencies.conf"
+set_topology_record "$dir_c" p2 git 'llvm-git'
 stub_sudo "$dir_c"
 
 # The stub build: llvm-git's build "installs" a new LLVM by creating the skew
@@ -315,18 +324,33 @@ if grep -Fq 'All builds succeeded!' <<<"$FIXTURE_OUTPUT"; then
     exit 1
 fi
 
-# ─── D. repo policy: mold-git must declare its rust-git edge ─────────────────
+# ─── D. repo policy: the committed topology orders and tags the batch ───────
 # The 2026-09-25 dispatch order let mold-git (a cargo recipe) build before
 # rust-git because its edge record was empty. Read-only against the committed
-# topology (vulkan-pair's style).
-deps="$root/config/dependencies.conf"
-mold_line=$(grep -E '^mold-git:' "$deps" || true)
+# topology, through the builder's --topology data channel (vulkan-pair's
+# style) — every record is id|path|groups|edges|tags, so field 4 is the edge
+# list and field 5 the batch tags.
+topo_out="$fixture/topology.txt"
+if ! fish "$root/build-all.fish" --topology >"$topo_out" 2>"$fixture/topology.err"; then
+    fail "D: --topology failed on the committed config: $(cat "$fixture/topology.err")"
+fi
+mold_line=$(awk -F'|' '$1 == "mold-git"' "$topo_out")
 if [[ -z $mold_line ]]; then
-    fail "D: no mold-git record in config/dependencies.conf"
+    fail "D: no mold-git record in the --topology output"
 fi
-if ! tr ',' '\n' <<<"${mold_line#*:}" | grep -qx 'rust-git'; then
-    fail "D: mold-git declares no rust-git edge (got: $mold_line)"
+mold_edges=$(awk -F'|' '$1 == "mold-git" { print $4 }' "$topo_out")
+if ! tr ',' '\n' <<<"$mold_edges" | grep -qx 'rust-git'; then
+    fail "D: mold-git declares no rust-git edge (got: $mold_edges)"
 fi
+
+# Batch membership is data now, not prose: llvm-git is the anchor and
+# rust-git its mandatory member — both must carry the abi=must tag.
+for id in llvm-git rust-git; do
+    tags=$(awk -F'|' -v id="$id" '$1 == id { print $5 }' "$topo_out")
+    if ! tr ',' '\n' <<<"$tags" | grep -qx 'abi=must'; then
+        fail "D: $id is not tagged abi=must in the committed topology (got: $tags)"
+    fi
+done
 
 # The edge must actually order the batch: a mold-git selection expands to
 # include rust-git, and rust-git builds BEFORE mold-git.

@@ -276,19 +276,42 @@ if ! grep -F 'xorg-xwayland-git' <<<"$output" >/dev/null; then
     exit 1
 fi
 
-# config/groups/ is reachable only through the six declared group names:
-# read_group_config is called for exactly git/stable/core/misc/third-party/app
-# and resolve_group rejects every other name, so any other file in that
-# directory is unreachable control state that silently goes stale. A run of
-# --list above already proved the six real files load, so only the directory's
-# contents need checking here.
-expected_files=(app.list core.list git.list misc.list stable.list third-party.list)
-mapfile -t group_files < <(
-    find "$root/config/groups" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+# config/ holds exactly the two files the builder reads: topology.conf (THE
+# topology source — one record per package, id|path|groups|edges[|tags]) and
+# build-defaults.conf. The six-group roster is stated once, in the builder's
+# group names; nothing else in config/ is reachable state, so a stray file
+# would silently go stale. A run of --list above already proved both files
+# load, so only the directory's contents need checking here.
+expected_files=(build-defaults.conf topology.conf)
+mapfile -t config_files < <(
+    find "$root/config" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
 )
-if [[ "${group_files[*]}" != "${expected_files[*]}" ]]; then
-    printf 'unexpected config/groups contents: %s (expected: %s)\n' \
-        "${group_files[*]}" "${expected_files[*]}" >&2
+if [[ "${config_files[*]}" != "${expected_files[*]}" ]]; then
+    printf 'unexpected config/ contents: %s (expected: %s)\n' \
+        "${config_files[*]}" "${expected_files[*]}" >&2
+    exit 1
+fi
+
+# The --topology channel is the data interface tooling consumes: a `# id|...`
+# header, then one record per package with ALWAYS five pipe fields
+# (id|path|groups|edges|tags; comma-joined lists, empty = none). The channel
+# is STDOUT and is captured as such: user fish config can print arbitrary
+# noise on stderr (under a foreign fish_function_path it even contains `|`),
+# and a data channel must not depend on what the stderr stream carries.
+topo=$(fish "$root/build-all.fish" --topology 2>/dev/null)
+topo_rc=$?
+if ((topo_rc != 0)); then
+    printf 'project configuration fixture: --topology failed (rc=%d):\n' "$topo_rc" >&2
+    fish "$root/build-all.fish" --topology >/dev/null || true
+    exit 1
+fi
+if [[ ${topo%%$'\n'*} != '# id|path|groups|edges|tags' ]]; then
+    printf -- '--topology header is not the pinned shape: %s\n' "${topo%%$'\n'*}" >&2
+    exit 1
+fi
+if ! grep -ve '^#' <<<"$topo" | awk -F'|' 'NF != 5 { exit 1 }'; then
+    printf -- '--topology emitted a record without exactly five pipe fields:\n%s\n' \
+        "$topo" >&2
     exit 1
 fi
 

@@ -101,8 +101,7 @@ make_case_workspace() {
     local sum_lines=${4:-"sha256sums=('$staged_sum')"}
     make_workspace "$dir" 1 2 low
     mkdir -p "$dir/packages/stable/s1" "$dir/fake"
-    printf 's1\n' >>"$dir/config/groups/stable.list"
-    printf 's1|packages/stable/s1\n' >"$dir/config/packages.map"
+    printf 's1|packages/stable/s1|stable|\n' >>"$dir/config/topology.conf"
 
     # $pkgver must stay literal here: the builder expands the array by sourcing
     # the recipe, so the value has to come from the recipe's own pkgver=. printf

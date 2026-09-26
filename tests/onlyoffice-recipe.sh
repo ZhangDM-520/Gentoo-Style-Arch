@@ -220,24 +220,27 @@ grep -Fq 'v8.data' "$pkgbuild" ||
     fail "the v8.data sentinel is missing; upstream would re-clone V8"
 
 # ----------------------------------------------------------------- topology
-grep -Fxq "onlyoffice-git|$recipe" "$root/config/packages.map" ||
-    fail "not registered in config/packages.map"
-grep -Fxq 'onlyoffice-git' "$root/config/groups/git.list" ||
+# Read through the builder's --topology channel (id|path|groups|edges|tags):
+# the record must exist, point at the recipe, and carry the git membership.
+topo=$(fish "$root/build-all.fish" --topology) || fail "--topology failed"
+rec=$(printf '%s\n' "$topo" | awk -F'|' -v id=onlyoffice-git '$1 == id')
+[[ -n $rec ]] || fail "not registered in config/topology.conf (no record)"
+[[ $(printf '%s\n' "$rec" | cut -d'|' -f2) == "$recipe" ]] ||
+    fail "topology record does not point at $recipe"
+[[ ",$(printf '%s\n' "$rec" | cut -d'|' -f3)," == *,git,* ]] ||
     fail "not a member of the git group"
-grep -q '^onlyoffice-git:' "$root/config/dependencies.conf" ||
-    fail "not registered in config/dependencies.conf"
 
 # The dependency edge must name the same capabilities the recipe declares, or
 # the recorded build order would not describe a real rebuild trigger. Ids are
-# the ones config/packages.map publishes: the VCS recipe keeps its -git suffix,
-# but the Qt5 module recipes are stable-named (qt5-multimedia, not
+# the ones config/topology.conf publishes: the VCS recipe keeps its -git
+# suffix, but the Qt5 module recipes are stable-named (qt5-multimedia, not
 # qt5-multimedia-git), so the ids cannot simply be derived by appending one.
-qtdeps=$(sed -n 's/^onlyoffice-git://p' "$root/config/dependencies.conf")
+qtdeps=$(printf '%s\n' "$rec" | cut -d'|' -f4)
 for dep in qt5-base-git qt5-multimedia qt5-svg qt5-x11extras; do
     [[ ",$qtdeps," == *",$dep,"* ]] ||
-        fail "dependencies.conf does not record the $dep rebuild trigger"
-    grep -q "^${dep}|" "$root/config/packages.map" ||
-        fail "$dep is recorded as a trigger but is not a recipe id in packages.map"
+        fail "topology edges field does not record the $dep rebuild trigger"
+    printf '%s\n' "$topo" | awk -F'|' -v id="$dep" '$1 == id { found = 1 } END { exit !found }' ||
+        fail "$dep is recorded as a trigger but has no topology record"
 done
 
 # .SRCINFO must match the recipe.

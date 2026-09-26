@@ -4,9 +4,9 @@
 
 set -g SCRIPT_DIR (realpath (status dirname))
 set -g CONFIG_DIR "$SCRIPT_DIR/config"
-set -g PACKAGE_MAP_FILE "$CONFIG_DIR/packages.map"
-set -g GROUP_CONFIG_DIR "$CONFIG_DIR/groups"
-set -g DEP_CONFIG_FILE "$CONFIG_DIR/dependencies.conf"
+# One topology file: per-package records (id|path|groups|edges[|tags]) replace
+# the former packages.map + groups/*.list + dependencies.conf trio (2026-09-26).
+set -g TOPOLOGY_FILE "$CONFIG_DIR/topology.conf"
 set -g DEFAULT_CONFIG_FILE "$CONFIG_DIR/build-defaults.conf"
 set -g _STATE_DIR "$SCRIPT_DIR/.state"
 if set -q GSA_STATE_DIR; and test -n "$GSA_STATE_DIR"
@@ -224,9 +224,15 @@ if not set -q _LANE_STOP_GRACE_S; or not string match -qr '^[0-9]+$' -- $_LANE_S
 end
 
 # ─── Project configuration ───────────────────────────────────────────────────
+# The group roster is stated ONCE, here. Group membership lives in each
+# topology record's groups field; only these six names are readable anywhere
+# (loader validation, resolve_group, usage, diagnostics all derive from this
+# list). Group variables are _GROUP_<name with '-' as '_'>.
+set -g _GROUP_NAMES git stable core misc third-party app
 set -g _PACKAGE_MAP
 set -g _PACKAGE_IDS
 set -g _DEPS
+set -g _TAGS
 set -g _GROUP_git
 set -g _GROUP_stable
 set -g _GROUP_core
@@ -267,20 +273,8 @@ end
 
 function assign_group -a group_name
     set -l values $argv[2..-1]
-    switch "$group_name"
-        case git
-            set -g _GROUP_git $values
-        case stable
-            set -g _GROUP_stable $values
-        case core
-            set -g _GROUP_core $values
-        case misc
-            set -g _GROUP_misc $values
-        case third-party
-            set -g _GROUP_third_party $values
-        case app
-            set -g _GROUP_app $values
-    end
+    set -l mangled (string replace - _ -- "$group_name")
+    set -g "_GROUP_$mangled" $values
     return 0
 end
 
@@ -393,46 +387,142 @@ function read_config_defaults
     end
 end
 
-function read_group_config -a group_name
-    set -l group_file "$GROUP_CONFIG_DIR/$group_name.list"
-    if not test -f "$group_file"
-        ui_error "group list not found: $group_file"
-        return 1
+# Read config/topology.conf — the ONE topology source. One record per package:
+#   id|path|groups|edges[|tags]
+# (a lone id|path|groups| is a deliberate no-edge record; records ALWAYS exist
+# for every package). Every validation path below names its offending record
+# or field: the caller can only say "project configuration is invalid", so a
+# bare return 1 leaves the user bisecting by hand (2026-09-20 rule).
+function read_topology_config
+    set -g _PACKAGE_MAP
+    set -g _PACKAGE_IDS
+    set -g _DEPS
+    set -g _TAGS
+    for group_name in $_GROUP_NAMES
+        assign_group "$group_name"
     end
-    set -l values
-    for raw_line in (cat "$group_file")
+    # Edge targets may name records further down the file, so edge validation
+    # is deferred until every id is known; these hold id:dep,... meanwhile.
+    set -l raw_edges
+    set -l line_no 0
+    for raw_line in (cat "$TOPOLOGY_FILE")
+        set line_no (math $line_no + 1)
         set -l line (string trim -- "$raw_line")
         test -n "$line"; or continue
         string match -q '#*' -- "$line"; and continue
-        # Name the line, not just the group. The caller can only say "invalid
-        # package group: git", which leaves the user diffing a 56-line list.
-        if not string match -qr '^[A-Za-z0-9._+-]+$' -- "$line"
-            ui_error "invalid entry in $group_file: '$line' (allowed: A-Za-z0-9._+-)"
+        set -l fields (string split '|' -- "$line")
+        # Four fields (no tags) or five (tags present) — anything else is a
+        # malformed record, not a historical shape.
+        if test (count $fields) -lt 4; or test (count $fields) -gt 5
+            ui_error "invalid topology record (expected 'id|path|groups|edges[|tags]'): $line"
             return 1
         end
-        if not contains "$line" $_PACKAGE_IDS
-            ui_error "entry in $group_file names no package: $line"
+        set -l id "$fields[1]"
+        set -l relative_path "$fields[2]"
+        if not string match -qr '^[A-Za-z0-9._+-]+$' -- "$id"
+            ui_error "invalid topology record id '$id' (allowed: A-Za-z0-9._+-): $line"
             return 1
         end
-        if contains "$line" $values
-            ui_error "$line appears twice in $group_file"
+        if contains "$id" $_PACKAGE_IDS
+            ui_error "duplicate package id in topology record: $id ($TOPOLOGY_FILE line $line_no)"
             return 1
         end
-        set -a values "$line"
+        if string match -q '/*' -- "$relative_path"; \
+                or string match -q '*..*' -- "$relative_path"; \
+                or not test -f "$SCRIPT_DIR/$relative_path/PKGBUILD"
+            ui_error "invalid topology record path for $id: $line"
+            return 1
+        end
+        # groups: at least one member of the closed roster, no repeats.
+        set -l record_groups
+        for grp in (string split ',' -- "$fields[3]")
+            test -n "$grp"; or continue
+            if not contains "$grp" $_GROUP_NAMES
+                ui_error "unknown group in topology record $id: $grp (allowed: "(string join ',' $_GROUP_NAMES)")"
+                return 1
+            end
+            if contains "$grp" $record_groups
+                ui_error "$grp appears twice in the groups field of topology record $id"
+                return 1
+            end
+            set -a record_groups "$grp"
+        end
+        if test (count $record_groups) -eq 0
+            ui_error "topology record for $id names no group (allowed: "(string join ',' $_GROUP_NAMES)")"
+            return 1
+        end
+        # edges: empty is valid and deliberate; repeats are drift.
+        set -l record_edges
+        for dep in (string split ',' -- "$fields[4]")
+            test -n "$dep"; or continue
+            if contains "$dep" $record_edges
+                ui_error "$dep appears twice in the edges field of topology record $id"
+                return 1
+            end
+            set -a record_edges "$dep"
+        end
+        # tags: closed vocabulary, no repeats. Unknown tags are refused, not
+        # ignored — a typo'd batch tag would silently disable the batch gate.
+        set -l record_tags
+        if test (count $fields) -eq 5
+            for tag in (string split ',' -- "$fields[5]")
+                test -n "$tag"; or continue
+                if not contains "$tag" abi=must abi=should
+                    ui_error "unknown tag in topology record $id: $tag (allowed: abi=must,abi=should)"
+                    return 1
+                end
+                if contains "$tag" $record_tags
+                    ui_error "$tag appears twice in the tags field of topology record $id"
+                    return 1
+                end
+                set -a record_tags "$tag"
+            end
+            if contains abi=must $record_tags; and contains abi=should $record_tags
+                ui_error "topology record for $id names both abi=must and abi=should"
+                return 1
+            end
+        end
+        set -a _PACKAGE_IDS "$id"
+        set -a _PACKAGE_MAP "$id|$relative_path"
+        set -a raw_edges (printf '%s:%s' "$id" (string join ',' $record_edges))
+        for grp in $record_groups
+            set -l mangled (string replace - _ -- "$grp")
+            set -a "_GROUP_$mangled" "$id"
+        end
+        if test (count $record_tags) -gt 0
+            set -a _TAGS (printf '%s|%s' "$id" (string join ',' $record_tags))
+        end
     end
-    assign_group "$group_name" $values
+
+    # Now every id is known: validate edge targets and publish _DEPS in the
+    # id:dep,... shape topo_sort/expand_deps/deps_of split on.
+    for entry in $raw_edges
+        set -l parts (string split -m 1 ':' -- "$entry")
+        set -l pkg "$parts[1]"
+        set -l record_edges
+        for dep in (string split ',' -- "$parts[2]")
+            test -n "$dep"; or continue
+            if not contains "$dep" $_PACKAGE_IDS
+                ui_error "topology record for $pkg names an unknown dependency: $dep"
+                return 1
+            end
+            set -a record_edges "$dep"
+        end
+        set -a _DEPS (printf '%s:%s' "$pkg" (string join ',' $record_edges))
+    end
+    return 0
 end
 
 function load_project_config
     # Every return 1 below names its offender. The caller can only say
     # "project configuration is invalid", so a bare return 1 leaves the user
     # bisecting their config by hand (2026-09-20 audit).
-    test -f "$PACKAGE_MAP_FILE"; or begin
-        ui_error "package map not found: $PACKAGE_MAP_FILE"
+    test -f "$TOPOLOGY_FILE"; or begin
+        ui_error "topology not found: $TOPOLOGY_FILE"
         return 1
     end
-    test -f "$DEP_CONFIG_FILE"; or begin
-        ui_error "dependency config not found: $DEP_CONFIG_FILE"
+    test -f "$DEFAULT_CONFIG_FILE"; or begin
+        ui_error "build defaults not found: $DEFAULT_CONFIG_FILE"
         return 1
     end
     if not read_config_defaults
@@ -466,89 +556,13 @@ function load_project_config
         return 1
     end
 
-    set -g _PACKAGE_MAP
-    set -g _PACKAGE_IDS
-    for raw_line in (cat "$PACKAGE_MAP_FILE")
-        set -l line (string trim -- "$raw_line")
-        test -n "$line"; or continue
-        string match -q '#*' -- "$line"; and continue
-        set -l fields (string split '|' -- "$line")
-        # Exactly two fields: the pre-Git `.Stable/.Heavy/.Static/...` location
-        # of each recipe was dropped 2026-09-17 — nothing read that third
-        # column, and a record that carries it is drift, not provenance.
-        if test (count $fields) -ne 2
-            ui_error "invalid package map record: $line"
-            return 1
-        end
-        set -l id "$fields[1]"
-        set -l relative_path "$fields[2]"
-        if not string match -qr '^[A-Za-z0-9._+-]+$' -- "$id"; \
-            or string match -q '/*' -- "$relative_path"; \
-            or string match -q '*..*' -- "$relative_path"; \
-            or not test -f "$SCRIPT_DIR/$relative_path/PKGBUILD"
-            ui_error "invalid package map path: $line"
-            return 1
-        end
-        contains "$id" $_PACKAGE_IDS; and return 1
-        set -a _PACKAGE_IDS "$id"
-        set -a _PACKAGE_MAP "$id|$relative_path"
-    end
-
-    for group_name in git stable core misc third-party app
-        # read_group_config names the offending file and line itself; a second
-        # generic "invalid package group" here would just follow it.
-        if not read_group_config "$group_name"
-            return 1
-        end
-    end
-
-    set -g _DEPS
-    for raw_line in (cat "$DEP_CONFIG_FILE")
-        set -l line (string trim -- "$raw_line")
-        test -n "$line"; or continue
-        string match -q '#*' -- "$line"; and continue
-        set -l fields (string split -m 1 ':' -- "$line")
-        if test (count $fields) -ne 2
-            ui_error "invalid dependency record (expected 'package:dependency,...'): $line"
-            return 1
-        end
-        set -l pkg "$fields[1]"
-        if not contains "$pkg" $_PACKAGE_IDS
-            ui_error "dependency record names an unknown package: $pkg"
-            return 1
-        end
-        for dep in (string split ',' -- "$fields[2]")
-            test -n "$dep"; or continue
-            if not contains "$dep" $_PACKAGE_IDS
-                ui_error "dependency record for $pkg names an unknown dependency: $dep"
-                return 1
-            end
-        end
-        set -a _DEPS "$line"
-    end
-
-    set -l listed
-    for group_name in git stable core misc third-party app
-        switch "$group_name"
-            case git
-                set -a listed $_GROUP_git
-            case stable
-                set -a listed $_GROUP_stable
-            case core
-                set -a listed $_GROUP_core
-            case misc
-                set -a listed $_GROUP_misc
-            case third-party
-                set -a listed $_GROUP_third_party
-            case app
-                set -a listed $_GROUP_app
-        end
-    end
-    for package_id in $_PACKAGE_IDS
-        if not contains "$package_id" $listed
-            ui_error "$package_id is listed in $PACKAGE_MAP_FILE but in no group list under $GROUP_CONFIG_DIR"
-            return 1
-        end
+    # One record per package: id, path, groups, edges and tags validate
+    # together (read_topology_config names every offender). The cross-file
+    # agreement the four-file split needed is now inherent: every package
+    # carries its groups and edges in its own record, so a package cannot be
+    # mapped-but-ungrouped or edge-only.
+    if not read_topology_config
+        return 1
     end
     topo_sort (string join ' ' $_PACKAGE_IDS) >/dev/null
     if test (count $_TOPO_BLOCKED) -gt 0
@@ -1856,8 +1870,12 @@ function audit_workspace
         end
     end
 
-    set -l listed $_GROUP_git $_GROUP_stable $_GROUP_core \
-        $_GROUP_misc $_GROUP_third_party $_GROUP_app
+    set -l listed
+    for group_name in $_GROUP_NAMES
+        set -l mangled (string replace - _ -- "$group_name")
+        set -l var_name "_GROUP_$mangled"
+        set -a listed $$var_name
+    end
     set listed (printf '%s\n' $listed | awk '!seen[$0]++')
     set -l actual $_PACKAGE_IDS
     set -l unlisted
@@ -1919,7 +1937,7 @@ function audit_workspace
 
     # Toolchain lint (2026-09-25 ABI-skew incident): a recipe that compiles
     # with cargo/rustc only survives a coupled LLVM batch when rust-git
-    # rebuilds BEFORE it, so its dependencies.conf edge record must name
+    # rebuilds BEFORE it, so its topology record's edges field must name
     # rust-git explicitly. rust-git is the toolchain itself and cannot depend
     # on its own output, so it is excepted. "Invokes" = any non-comment line
     # (first non-blank character is not '#') naming cargo or rustc as a bare
@@ -2760,7 +2778,7 @@ end
 function _suggest_option -a given
     string match -qr '^--' -- "$given"; or return 0
     set -l options --install --forceinstall --clean --skip --no-sync --lanes --jobs --intensity \
-        --allow-broken-rustc --no-deps --dry-run --list --group --help \
+        --allow-broken-rustc --no-deps --dry-run --list --group --help --topology \
         --installall --cleanup --nuclear --link-sources --audit
     set -l hit (printf '%s\n' $options | _nearest_lines "$given" 2 \
         | sort -n | head -1 | cut -d' ' -f2-)
@@ -3103,6 +3121,68 @@ function deps_of -a pkg
                 string split ',' $parts[2]
             end
             return
+        end
+    end
+end
+
+# ─── Coupled-batch tags (the topology record's tags field) ───────────────────
+# The vocabulary is closed and loader-validated: abi=must (batch anchor or
+# mandatory member) and abi=should (same-pass candidate). These helpers turn
+# the tags + edge graph into the batch relation; the gate in main consumes it.
+# package_abi_severity PKG → must | should | none
+function package_abi_severity -a pkg
+    for entry in $_TAGS
+        set -l parts (string split '|' -- "$entry")
+        test "$parts[1]" = "$pkg"; or continue
+        set -l tags (string split ',' -- "$parts[2]")
+        if contains abi=must $tags
+            echo must
+        else if contains abi=should $tags
+            echo should
+        end
+        return
+    end
+    echo none
+end
+
+# has_abi_tagged_dependency PKG → 0 when any transitive dependency carries an
+# abi tag. Such a package is a batch MEMBER (its rebuild is obligated by its
+# anchor), never an anchor — which is why a leaf `--no-deps qt6-svg` or
+# `--no-deps rust-git` is never gated, while llvm-git/qt*-base-git (untagged
+# ancestors) are. The graph is acyclic (the loader's topo check proved it),
+# so the recursion terminates.
+function has_abi_tagged_dependency -a pkg
+    for dep in (deps_of $pkg)
+        if test (package_abi_severity $dep) != none
+            return 0
+        end
+        if has_abi_tagged_dependency $dep
+            return 0
+        end
+    end
+    return 1
+end
+
+# abi_depends_on PKG TARGET → 0 when PKG transitively depends on TARGET.
+function abi_depends_on -a pkg target
+    for dep in (deps_of $pkg)
+        test "$dep" = "$target"; and return 0
+        if abi_depends_on $dep $target
+            return 0
+        end
+    end
+    return 1
+end
+
+# abi_batch_dependents ANCHOR → every abi-tagged package that transitively
+# depends on ANCHOR (the reverse closure the edge file cannot express), one
+# per line, in map order.
+function abi_batch_dependents -a anchor
+    for candidate in $_PACKAGE_IDS
+        test (package_abi_severity $candidate) = none; and continue
+        test "$candidate" = "$anchor"; and continue
+        if abi_depends_on $candidate $anchor
+            echo $candidate
         end
     end
 end
@@ -5031,6 +5111,41 @@ function print_run_record -a outcome run_rc
 end
 
 # ─── Usage ───────────────────────────────────────────────────────────────────
+# --topology: the resolved topology as machine-readable records. One line per
+# package in map order, ALWAYS five pipe fields:
+#   id|path|groups|edges|tags
+# (comma-joined fields; empty = none). This is the data channel for
+# tests/srcinfo-freshness.sh and the per-recipe registration fixtures: they
+# consume THIS instead of parsing config/ themselves — one reader, one truth.
+# Read-only: load_project_config has already validated every record.
+function print_topology
+    echo "# id|path|groups|edges|tags"
+    for entry in $_PACKAGE_MAP
+        set -l fields (string split '|' -- "$entry")
+        set -l id "$fields[1]"
+        set -l group_values
+        for group_name in $_GROUP_NAMES
+            set -l mangled (string replace - _ -- "$group_name")
+            set -l var_name "_GROUP_$mangled"
+            if contains "$id" $$var_name
+                set -a group_values "$group_name"
+            end
+        end
+        set -l edge_values (deps_of $id)
+        set -l tag_values
+        switch (package_abi_severity $id)
+            case must
+                set tag_values abi=must
+            case should
+                set tag_values abi=should
+        end
+        set -l groups_str (string join ',' $group_values)
+        set -l edges_str (string join ',' $edge_values)
+        set -l tags_str (string join ',' $tag_values)
+        printf '%s|%s|%s|%s|%s\n' "$id" "$fields[2]" "$groups_str" "$edges_str" "$tags_str"
+    end
+end
+
 function usage
     echo "Usage: build-all.fish [MAIN OPTIONS] [PACKAGE|RANGE...]"
     echo ""
@@ -5038,7 +5153,7 @@ function usage
     echo ""
     echo "Main options:"
     echo "  -g, --group GRP   Build package group(s) — A SELECTION IS REQUIRED:"
-    echo "                    git, stable, core, misc, third-party, app (or package names)."
+    echo "                    "(string join ', ' $_GROUP_NAMES)" (or package names)."
     echo "                    Multiple groups: repeat the flag or comma-separate,"
     echo "                    e.g. -g git -g core  /  -g git,core"
     echo "                    core = heavyweight, source-heavy, ABI-critical, and ROCm packages;"
@@ -5069,6 +5184,11 @@ function usage
     echo "                    with no rust-git edge, and installed PGO packages"
     echo "                    still carrying -fprofile-generate or"
     echo "                    -Cprofile-generate payloads"
+    echo "  --topology        Print the resolved topology as machine-readable"
+    echo "                    records, one per package:"
+    echo "                      id|path|groups|edges|tags"
+    echo "                    (comma-joined fields, empty = none; the data channel"
+    echo "                    for tooling. The source of record is config/topology.conf)"
     echo "  -ln, --link-sources"
     echo "                    Dedup git source clones: symlink twins to one"
     echo "                    canonical mirror; repair origin/refspec; asks first"
@@ -5172,14 +5292,27 @@ function usage
     echo "  build-all.fish -ln                  Dedup git clones into shared mirrors"
     echo ""
     echo "Package groups:"
-    echo "  git       Top-level -git packages ("(count $_GROUP_git)" packages)"
-    echo "  stable    Stable/version-synchronized packages ("(count $_GROUP_stable)" packages)"
-    echo "  core      Heavyweight, source-heavy, ABI-critical, and ROCm packages ("(count $_GROUP_core)" packages;"
-    echo "            auto-installs and runs core builds solo)"
-    echo "  misc      Auxiliary packages ("(count $_GROUP_misc)" packages)"
-    echo "  third-party  Additional package recipes ("(count $_GROUP_third_party)" packages)"
-    echo "  app       Optional applications ("(count $_GROUP_app)" packages; leaf builds —"
-    echo "            dependency chain is never expanded, no auto -i)"
+    for group_name in $_GROUP_NAMES
+        set -l mangled (string replace - _ -- "$group_name")
+        set -l var_name "_GROUP_$mangled"
+        set -l members $$var_name
+        set -l desc ""
+        switch "$group_name"
+            case git
+                set desc "Top-level -git packages"
+            case stable
+                set desc "Stable/version-synchronized packages"
+            case core
+                set desc "Heavyweight, source-heavy, ABI-critical, and ROCm packages — auto-installs and runs core builds solo"
+            case misc
+                set desc "Auxiliary packages"
+            case third-party
+                set desc "Additional package recipes"
+            case app
+                set desc "Optional applications — leaf builds: dependency chain is never expanded, no auto -i"
+        end
+        printf '  %-12s %s (%s packages)\n' "$group_name" "$desc" (count $members)
+    end
 end
 
 # ─── List packages ───────────────────────────────────────────────────────────
@@ -5207,12 +5340,12 @@ function list_packages -a all_flag
         return 0
     end
     echo "Groups:"
-    echo "  git:      "(count $_GROUP_git)" packages"
-    echo "  stable:   "(count $_GROUP_stable)" packages"
-    echo "  core:     "(count $_GROUP_core)" packages"
-    echo "  misc:     "(count $_GROUP_misc)" packages"
-    echo "  third-party: "(count $_GROUP_third_party)" packages"
-    echo "  app:      "(count $_GROUP_app)" packages"
+    for group_name in $_GROUP_NAMES
+        set -l mangled (string replace - _ -- "$group_name")
+        set -l var_name "_GROUP_$mangled"
+        set -l members $$var_name
+        printf '  %-12s %s packages\n' "$group_name:" (count $members)
+    end
 end
 
 # ─── Resolve one group name to its package list ──────────────────────────────
@@ -5220,35 +5353,33 @@ end
 # additionally auto-enables -i in the caller (rule 11 — core rebuilds are
 # only sound with immediate installs).
 function resolve_group -a grp
-    switch $grp
-        case git
-            printf '%s\n' $_GROUP_git
-        case stable
-            printf '%s\n' $_GROUP_stable
-        case core
-            printf '%s\n' $_GROUP_core
-        case misc
-            printf '%s\n' $_GROUP_misc
-        case third-party third_party 3rdp
-            printf '%s\n' $_GROUP_third_party
-        case app
-            # printf with no arguments still runs the format once, printing a
-            # lone newline — an empty app.list would then yield one phantom
-            # empty member that topo_sort flags as a blocked package. Print
-            # only when there is something to print.
-            if test (count $_GROUP_app) -gt 0
-                printf '%s\n' $_GROUP_app
-            end
-        case '*'
-            # This function's stdout is a data channel — the caller captures it
-            # with a command substitution — so diagnostics must go to stderr or
-            # they vanish silently (they did: `-g gti` exited 1 saying nothing).
-            ui_error "unknown group '$grp'" >&2
-            set -l near (printf '%s\n' git stable core misc third-party app \
-                | _nearest_lines "$grp" 2 | sort -n | head -1 | cut -d' ' -f2-)
-            test -n "$near"; and echo "  Did you mean '$near'?" >&2
-            echo "Available groups: git, stable, core, misc, third-party, app" >&2
-            return 1
+    set -l name "$grp"
+    # Historical aliases for third-party; every other name matches exactly —
+    # a typo is never auto-corrected into a different group.
+    switch "$name"
+        case third_party 3rdp
+            set name third-party
+    end
+    if not contains "$name" $_GROUP_NAMES
+        # This function's stdout is a data channel — the caller captures it
+        # with a command substitution — so diagnostics must go to stderr or
+        # they vanish silently (they did: `-g gti` exited 1 saying nothing).
+        ui_error "unknown group '$grp'" >&2
+        set -l near (printf '%s\n' $_GROUP_NAMES \
+            | _nearest_lines "$grp" 2 | sort -n | head -1 | cut -d' ' -f2-)
+        test -n "$near"; and echo "  Did you mean '$near'?" >&2
+        echo "Available groups: "(string join ', ' $_GROUP_NAMES) >&2
+        return 1
+    end
+    set -l mangled (string replace - _ -- "$name")
+    set -l var_name "_GROUP_$mangled"
+    set -l members $$var_name
+    # printf with no arguments still runs the format once, printing a lone
+    # newline — an empty group would then yield one phantom member that
+    # topo_sort flags as a blocked package. Print only when there is
+    # something to print.
+    if test (count $members) -gt 0
+        printf '%s\n' $members
     end
     return 0
 end
@@ -5480,6 +5611,9 @@ function main
             case --audit
                 audit_workspace
                 return
+            case --topology
+                print_topology
+                return
             case '-*'
                 ui_error "unknown option: $args[1]"
                 _suggest_option "$args[1]"
@@ -5530,7 +5664,7 @@ function main
             # the unchanged pipeline below) ──────────────────────────────
             if test "$g" = app
                 if test (count $gl) -eq 0
-                    ui_warning "-g app: the app list is empty — populate config/groups/app.list"
+                    ui_warning "-g app: the app list is empty — populate config/topology.conf (an app entry in some record's groups field)"
                 else if test "$list_flag" = 1
                     # -l lists the whole group, no prompt.
                 else if test -t 0
@@ -5601,12 +5735,16 @@ function main
     else if test "$list_flag" = 1 -o "$dry_run" = 1
         # Read-only action with no selection: cover the whole set rather than
         # demanding one (see the header above).
-        set build_list $_GROUP_git $_GROUP_stable $_GROUP_core \
-            $_GROUP_misc $_GROUP_third_party $_GROUP_app
-        set build_list (printf '%s\n' $build_list | awk '!seen[$0]++')
+        set -l all_members
+        for group_name in $_GROUP_NAMES
+            set -l mangled (string replace - _ -- "$group_name")
+            set -l var_name "_GROUP_$mangled"
+            set -a all_members $$var_name
+        end
+        set build_list (printf '%s\n' $all_members | awk '!seen[$0]++')
     else
         ui_error "no packages selected — pass -g GROUP and/or package names"
-        echo "Groups: git, stable, core, misc, third-party, app   (see -h for examples)"
+        echo "Groups: "(string join ', ' $_GROUP_NAMES)"   (see -h for examples)"
         echo "Read-only: -l lists packages, -n shows the build order without building."
         return 1
     end
@@ -5685,23 +5823,58 @@ function main
         return 1
     end
 
-    # ABI-batch refusal (2026-09-25 incident): an llvm-git install changes the
-    # LLVM C++ ABI, and every consumer of that ABI — rust-git first — is stale
-    # the moment the archive lands (the installed rustc breaks on any input).
-    # A REAL build must therefore carry rust-git in the same selection;
-    # -n/-l are read-only and build nothing, so they are exempt.
+    # Generic coupled-batch gate (2026-09-25 llvm/rust incident, generalized:
+    # the hard-coded llvm-git/rust-git pair was one instance of this rule, and
+    # its Qt private-API siblings lived only in prose). Tags are topology data
+    # in the record's tags field:
+    #   abi=must    batch anchor or mandatory member
+    #   abi=should  same-pass candidate (noted, never gated)
+    # A batch ANCHOR is a selected abi=must package with no abi-tagged
+    # dependency — the origin whose rebuild moves the batch ABI (llvm-git,
+    # qt6-base-git, qt5-base-git). Its batch is the reverse closure the edge
+    # file cannot express: every abi-tagged package that transitively depends
+    # on it. On a REAL build (-n/-l are read-only and exempt), an installed
+    # abi=must member omitted from the selection is refused — installing the
+    # anchor's new ABI beside it would leave it stale the moment the archive
+    # lands. An installed abi=should member is listed as a same-pass candidate.
+    # A member that is not installed has nothing to protect and never gates.
     if test $dry_run -eq 0; and test $list_flag -eq 0
-        if contains llvm-git $sorted; and not contains rust-git $sorted
-            if pacman -Q rust-git >/dev/null 2>&1
-                ui_error "refusing to build llvm-git without rust-git — llvm-git changes the LLVM C++ ABI"
-                echo "  Every consumer — rust-git first — must rebuild in the same selection:"
-                echo "  installing a new llvm-git beside the installed rust-git breaks rustc"
-                echo "  the moment the archive lands (LLVM snapshots have no stable C++ ABI)."
-                echo "  Recovery: rebuild rust-git in the same run (add rust-git to the selection);"
-                echo "  if rustc is already broken, follow the check_rustc_sanity recovery text"
-                echo "  (downgrade-rebuild llvm-libs at the snapshot rust-git was built against)."
-                return 1
+        set -l batch_missing
+        set -l batch_candidates
+        for anchor in $sorted
+            test (package_abi_severity $anchor) = must; or continue
+            has_abi_tagged_dependency $anchor; and continue
+            for member in (abi_batch_dependents $anchor)
+                contains $member $sorted; and continue
+                pacman -Q $member >/dev/null 2>&1; or continue
+                switch (package_abi_severity $member)
+                    case must
+                        set -a batch_missing (printf '%s %s' $anchor $member)
+                    case should
+                        set -a batch_candidates $member
+                end
             end
+        end
+        if test (count $batch_missing) -gt 0
+            set batch_missing (printf '%s\n' $batch_missing | sort -u)
+            set -l first_pair (string split ' ' -- $batch_missing[1])
+            ui_error "refusing to build $first_pair[1] without $first_pair[2] — the abi=must batch must rebuild in the same selection"
+            echo "  $first_pair[1] is an abi=must batch anchor: rebuilding it moves the batch ABI,"
+            echo "  and an omitted installed abi=must member is left stale against it."
+            for entry in $batch_missing
+                set -l pair (string split ' ' -- $entry)
+                echo "  missing: $pair[2] — rebuild $pair[2] in the same run (add $pair[2] to the selection);"
+            end
+            echo "  if a toolchain is already broken, follow the check_rustc_sanity recovery text"
+            echo "  (downgrade-rebuild the anchor's ABI packages to the snapshot the members"
+            echo "  were built against)."
+            return 1
+        end
+        if test (count $batch_candidates) -gt 0
+            set batch_candidates (printf '%s\n' $batch_candidates | sort -u)
+            ui_warning "same-pass candidates not in this selection: "(string join ', ' $batch_candidates)
+            echo "  this run rebuilds an abi=must batch anchor; the packages above are installed"
+            echo "  abi=should members whose ABI can be left stale against it."
         end
     end
 

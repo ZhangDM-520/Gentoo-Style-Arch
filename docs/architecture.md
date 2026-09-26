@@ -9,12 +9,20 @@ Gentoo_Style_Arch has four deliberately separate modules:
    `REUSE.toml` where upstream provides it), and optional maintenance metadata
    (`.nvchecker.toml`, `BUILDING`). A new local asset must survive the recipe's
    ignore rules — most recipes default-deny, see `CONTRIBUTING.md`.
-2. **Topology** under `config/` maps package IDs to recipe paths
-   (`packages.map`, exactly `package-id|recipe-path` per record), defines
-   logical groups (`groups/{git,stable,core,misc,third-party,app}.list`), and
-   records local dependency edges (`dependencies.conf`). It is declarative so
-   maintainers can review graph changes without editing scheduler
-   implementation.
+2. **Topology** is one declarative file, `config/topology.conf`: one record
+   per package, `id|path|groups|edges[|tags]`. The `id|path` pair binds the
+   package ID to its recipe path — the only place that binding exists —
+   `groups` states group membership as a comma list over the six logical
+   groups (`git, stable, core, misc, third-party, app`; the roster is stated
+   once, in the builder), `edges` is the comma list of local build-order
+   dependencies (a lone `id|path|groups|` is a deliberate no-edge record),
+   and `tags` carries coupled-batch policy (`abi=must` / `abi=should`).
+   `config/build-defaults.conf` stays separate: lanes/jobs/intensity and the
+   memory budgets are knobs, not topology. The loader resolves every record
+   on EVERY invocation and one malformed record breaks every command; the
+   builder also exposes the resolved records through `--topology`, so tooling
+   never parses `config/` itself. It is declarative so maintainers can review
+   graph changes without editing scheduler implementation.
 3. **Builder** in `build-all.fish` is the operational interface. It resolves
    package IDs, expands and sorts dependencies, dispatches isolated lanes,
    serializes pacman transactions, owns the interactive dashboard, and

@@ -320,7 +320,8 @@ printf 'dashboard fixture: PASS\n'
     for id in p1 p2 p3; do
         add_package "$ws" "$id" "$gsa_meta_any"
     done
-    printf 'p2:p1\np3:p2\n' >"$ws/config/dependencies.conf"
+    set_topology_record "$ws" p2 git 'p1'
+    set_topology_record "$ws" p3 git 'p2'
     stub_makepkg "$ws"
     stub_sudo "$ws"
     stub_pacman "$ws"

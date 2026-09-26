@@ -218,8 +218,7 @@ printf '2.0.0-1\n' >"$ws/fake/repo_version"
 # → anchor_sums_from_official refuses, the lane parks it with rc 99 and the
 # record row must say `deferred 99 … anchoring-refused` — not a failed build.
 # The sync/anchor flow keys on the physical packages/stable/ path (the same
-# inline recipe+map layout tests/anchor-defer.sh uses), and the map record is
-# written first to keep the map order.
+# inline recipe+record layout tests/anchor-defer.sh uses).
 mkdir -p "$ws/packages/stable/a-stable"
 {
     printf 'pkgname=a-stable\n'
@@ -229,11 +228,11 @@ mkdir -p "$ws/packages/stable/a-stable"
     printf 'source=("https://example.invalid/a-$pkgver.tar.gz")\n'
     printf "sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')\n"
 } >"$ws/packages/stable/a-stable/PKGBUILD"
-printf 'a-stable|packages/stable/a-stable\n' >"$ws/config/packages.map"
-printf 'a-stable\n' >"$ws/config/groups/stable.list"
-printf 'b-dep:a-stable\n' >"$ws/config/dependencies.conf"
+printf 'a-stable|packages/stable/a-stable|stable|\n' >>"$ws/config/topology.conf"
+# b-dep is parked when a-stable defers: its edge is the reason.
 add_package "$ws" b-dep "$gsa_meta_any"
 add_package "$ws" c-plain "$gsa_meta_any"
+set_topology_record "$ws" b-dep git 'a-stable'
 
 cat >"$ws/bin/pacman" <<'EOF'
 #!/usr/bin/env bash

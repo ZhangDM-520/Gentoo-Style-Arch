@@ -38,8 +38,10 @@ live under `packages/core/`, while `autofdo-git`, `libclc-git` come from
 | `third-party` | 2 | Additional application recipes |
 | `app` | 0 | Optional applications; a TTY build/`-n` run prompts to multi-select (all unchecked = build all), leaf builds with no dependency expansion |
 
-The package map, group membership, and local dependency graph are declarative
-files under `config/`; do not infer build order from directory names.
+Package records — the ID-to-path binding, group membership, the local
+dependency graph, and coupled-batch tags — are declarative, one record per
+package in `config/topology.conf` (`id|path|groups|edges[|tags]`); do not
+infer build order from directory names.
 
 ## Fresh checkout
 

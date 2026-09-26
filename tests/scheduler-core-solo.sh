@@ -57,7 +57,8 @@ selection=(n1 n2 n3 c1 n4)
 for id in "${normal_ids[@]}" "$core_id"; do
     add_package "$fixture" "$id" "$gsa_meta_any"
 done
-printf '%s\n' "$core_id" >>"$fixture/config/groups/core.list"
+# c1 is in git AND core: group membership is the record's comma-joined field.
+set_topology_record "$fixture" "$core_id" 'git,core' ''
 
 # Each stub records when it started and stopped, plus the per-lane budget it
 # was handed, so concurrency can be reconstructed afterwards.

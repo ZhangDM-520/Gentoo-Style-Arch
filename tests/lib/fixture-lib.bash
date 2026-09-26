@@ -98,17 +98,17 @@ gsa_repo_root=$(cd "$_gsa_lib_dir/../.." && pwd)
 gsa_meta_any=$'pkgver=1.0.0\npkgrel=1\narch=(any)'
 
 # make_workspace DIR [lanes [jobs [intensity]]]
-# Minimal but fully valid workspace skeleton: the loader validates map, groups,
-# deps and a full topological sort on EVERY invocation (--list, --audit, --help),
-# so a fixture workspace must be complete or every run fails in the loader.
-# Creates config/build-defaults.conf (lanes/jobs/intensity parameterised; the
-# memory numbers are the fixtures' shared constants), an empty
-# config/dependencies.conf, an empty config/packages.map, the six group lists,
-# plus packages/ and bin/ for the fixture to fill. Fixture-specific dependency
-# edges and anything after that belong to the fixture.
+# Minimal but fully valid workspace skeleton: the loader validates every
+# topology record and a full topological sort on EVERY invocation (--list,
+# --audit, --help), so a fixture workspace must be complete or every run fails
+# in the loader. Creates config/build-defaults.conf (lanes/jobs/intensity
+# parameterised; the memory numbers are the fixtures' shared constants) and an
+# empty config/topology.conf (the header comment only — a valid empty
+# topology), plus packages/ and bin/ for the fixture to fill.
+# Fixture-specific records and anything after that belong to the fixture.
 make_workspace() {
     local dir=$1 lanes=${2:-auto} jobs=${3:-auto} intensity=${4:-xhigh}
-    mkdir -p "$dir/config/groups" "$dir/packages" "$dir/bin"
+    mkdir -p "$dir/config" "$dir/packages" "$dir/bin"
     cp "$gsa_repo_root/build-all.fish" "$dir/build-all.fish"
     cat >"$dir/config/build-defaults.conf" <<EOF
 lanes=$lanes
@@ -119,22 +119,20 @@ core_memory_per_job_gib=4
 reserved_memory_gib=2
 state_dir=auto
 EOF
-    : >"$dir/config/dependencies.conf"
-    : >"$dir/config/packages.map"
-    local group
-    for group in git stable core misc third-party app; do
-        : >"$dir/config/groups/$group.list"
-    done
+    cat >"$dir/config/topology.conf" <<'EOF'
+# One record per package: id|path|groups|edges[|tags]
+# (a lone id|path|groups| is a deliberate no-edge record)
+EOF
 }
 
 # add_package DIR ID [extra-pkglines [group]]
 # One synthetic package: a one-line PKGBUILD (`pkgname=ID`) — the shape most
-# stub-driven fixtures need — plus its packages.map record and one group-list
-# entry (default group: git). extra-pkglines are appended to the PKGBUILD
-# verbatim, so a fixture reproduces whatever metadata its own stubs key on
-# (pkgver/pkgrel/arch for archive names, build() bodies, ...) without the
-# helper guessing. A package in several groups: call for one, append the rest
-# to the other group lists in the fixture.
+# stub-driven fixtures need — plus its topology record (default group: git).
+# extra-pkglines are appended to the PKGBUILD verbatim, so a fixture reproduces
+# whatever metadata its own stubs key on (pkgver/pkgrel/arch for archive names,
+# build() bodies, ...) without the helper guessing. A package in several groups
+# or with edges/tags: rewrite the record with set_topology_record (appending
+# group lists no longer exists — one record, one row).
 add_package() {
     local dir=$1 id=$2 extra=${3:-} group=${4:-git}
     mkdir -p "$dir/packages/$id"
@@ -144,8 +142,26 @@ add_package() {
             printf '%s\n' "$extra"
         fi
     } >"$dir/packages/$id/PKGBUILD"
-    printf '%s|packages/%s\n' "$id" "$id" >>"$dir/config/packages.map"
-    printf '%s\n' "$id" >>"$dir/config/groups/$group.list"
+    printf '%s|packages/%s|%s|\n' "$id" "$id" "$group" >>"$dir/config/topology.conf"
+}
+
+# set_topology_record DIR ID GROUPS [EDGES [TAGS]]
+# Replace-or-append one package's topology record — the single writer for
+# fixtures that grow a record beyond add_package's one-group no-edge shape
+# (multi-group members, dependency edges, coupled-batch tags). GROUPS, EDGES
+# and TAGS are comma lists; '' for EDGES is a deliberate no-edge record; omit
+# TAGS (or pass '') for no tags. Record order is irrelevant to the loader, so
+# a fresh record is simply appended.
+set_topology_record() {
+    local dir=$1 id=$2 groups=$3 edges=${4:-} tags=${5:-}
+    local file=$dir/config/topology.conf tmp=$dir/config/topology.conf.tmp
+    local record="$id|packages/$id|$groups|$edges"
+    if [[ -n $tags ]]; then
+        record="$record|$tags"
+    fi
+    awk -v id="$id" 'index($0, id "|") != 1' "$file" >"$tmp"
+    printf '%s\n' "$record" >>"$tmp"
+    mv "$tmp" "$file"
 }
 
 # stub_sudo DIR — the sudo passthrough stub: strips the builder's
