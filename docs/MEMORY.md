@@ -646,6 +646,27 @@ recipe).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
+- **The resume suggestion must include the failed package** (2026-09-26,
+  full-rebuild campaign): the failure summary's "To resume, run:" line AND
+  its "Remaining" count both EXCLUDED the failed package itself (near-miss
+  confirmed twice — cycle-1 libreoffice, cycle-10 qt5-base-git), so copying
+  the suggested command left the failed package stale while its dependents
+  built against stale *installed* copies. The builder now includes the
+  failed package in both; `tests/resume-command.sh` pins it — if a future
+  change regresses the list, that fixture is the tripwire. Never hand-trim a
+  failed package out of a resume command either.
+
+- **mtime alone over-reports recipe staleness** (2026-09-26, freshness
+  audit): a raw PKGBUILD-vs-archive mtime comparison flagged much of the
+  tree after a bulk content-identical rewrite touched 36 PKGBUILDs at 06:25
+  and version-line bookkeeping commits post-dated their builds. The
+  content-aware audit — last commit touching the PKGBUILD vs the newest
+  archive's build time, plus pkgver-vs-archive-name — showed **0 genuinely
+  stale recipes** (every "stale" recipe's newest archive name matched its
+  current pkgver exactly). Judge freshness by content/commit time and
+  version lines, never by mtime; `linux-cachyos` is the single documented
+  rebuild exclusion (user decision, 2026-09-26).
+
 - **A run can create the skew its own preflight just cleared** (2026-09-25,
   llvm/rust ABI skew): `check_rustc_sanity` passed at 19:31; the run's own
   `llvm-git` install at 20:50:26 broke system rustc 3 s later — LLVM trunk
@@ -749,6 +770,15 @@ recipe).
   before being trusted — reverting the sum map, the `name::` rule, the source
   diff, the VCS branch, the tag fallback, the refresh-only branch or the
   defer switch each makes scenarios fail exactly where they should.
+  The same sync OWNS `pkgver`/`pkgrel` on `packages/stable` recipes: it
+  rewrites them to the repo's values EXACTLY and in BOTH directions on every
+  loader run (2026-09-26 campaign: `openshadinglanguage` was rewritten
+  1.2→1.1 *down* to the repo's 1.15.3.0-1.1, `wireplumber` 0.5.17-1.1→2.1),
+  so a local `pkgrel` bump on a stable recipe is clobbered before it can
+  even be built. The standing convention is to align committed values to the
+  repo (campaign decision: OSL `pkgrel=1.1`, wireplumber `0.5.17-2.1`)
+  rather than fight the sync; a deliberate local bump needs `--no-sync` and
+  should expect the mismatch to stay visible until the repo catches up.
 
 - **Sources and checksums in a .SRCINFO line up only within one algorithm**
   (2026-09-20, same work): Arch publishes the same file list once *per*
@@ -1028,7 +1058,13 @@ recipe).
   `pacman -Qdt` empty ≠ no cruft; `pacman -U --noconfirm --ask 4` for
   conflict-replace installs; transcript jsonl is a reliable crash-recovery
   source; transient `curl 56 SSL_read` on huge fetches → resume with
-  `git -C src/<repo> submodule update <path>`.
+  `git -C src/<repo> submodule update <path>`. Fetch flakes are usually
+  transient (2026-09-26 campaign): TLS `unexpected eof` hit four hosts
+  (documentfoundation, its mirror — which also 404'd —, code.qt.io,
+  invent.kde.org) and plain retry worked every time, and a failed `git
+  clone` self-cleans its partial directory. But a REPO package 404ing on
+  ALL mirrors means a stale local pacman db, not a vanished upstream —
+  `sudo pacman -Sy`, then retry (plasma-wayland-protocols, 2026-09-26).
 - **A signal storm corrupts what it kills** (2026-09-23): `stop_lane_process`
   used to TERMed every lane PID every 50 ms with SIGKILL at 0.5 s; a pacman
   caught mid-unlock never removed `db.lck`, so every later install hard-failed

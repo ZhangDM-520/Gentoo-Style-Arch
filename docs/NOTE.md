@@ -35,6 +35,134 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-26 (full-rebuild campaign) — 6 root-caused fixes, batch close-out, and the version-refresh port
+
+Campaign close-out for the full workspace rebuild across all groups, run in
+the `~/Workspace/gentoo-style-arch` scratch clone (build workspace; canonical
+edits landed in this repository). The individual incidents have their own
+entries below (2026-09-25 "toolchain drift recipes" and "abi batch policy";
+2026-09-26 "qt6 spec-type unpin") — this entry carries the campaign shape,
+the per-fix index with commit hashes, the ops findings no incident entry
+covers, and the close-out numbers. Session totals: **9 commits pushed, 6 real
+bugs root-caused and fixed**. (`588055e`, the vulkan pair, is the lead-in fix
+of the same session and is journaled at 2026-09-25 (vulkan pair) — not
+repeated here.)
+
+### Campaign shape and batch close-out
+
+Final batch of 17 packages finished **17/17 green at 11:39**: qt5-base-git
+6m59s, blender-git 53m47s, krita-git 52m14s, onlyoffice-git 122m53s, the
+rest of the Qt5/Qt6 modules ≤5m each. Close-out also carried the
+version-refresh port: 17 version-line-only PKGBUILD refreshes plus the 2
+stable pkgrel alignments below, each with a regenerated `.SRCINFO`.
+
+### The six root-caused fixes (one commit each in this repository's log)
+
+1. **`677d93c` "Fix llvm/rust ABI skew: toolchain edges, batch policy, probe
+   re-run"** — Symptom: `rustc: symbol lookup error … librustc_driver-…so:
+   undefined symbol … version LLVM_24.0` (exit 127). Root cause: the llvm-git
+   snapshot bump (LLVM 24, 20:50 on 2026-09-25) has no stable C++ ABI and the
+   installed rustc driver was linked against the old LLVM — rust, mesa, spirv
+   and libclc consumers must move as one batch. Fix: toolchain dependency
+   edges in `config/dependencies.conf`, batch policy, probe re-run. Incident
+   detail: 2026-09-25 (abi batch policy).
+2. **`a019000` "fish: fix install(SCRIPT CODE) rejection by cmake-git 4.4
+   snapshots" + `e7e6011` "blender-git: drop invalid DEPENDS from
+   install(CODE) for cmake-git 4.4"** (one bug, two recipes) — Symptom: the
+   cmake-git 4.4 snapshot rejected fish's `install(SCRIPT … CODE …)` form and
+   blender-git's `DEPENDS` on `install(CODE …)`. Root cause: cmake 4.4
+   tightened `install()` argument parsing and both forms were deprecated
+   looseness. Fix: fish migrated to canonical `install(CODE …)`, blender
+   dropped the invalid `DEPENDS`. Both verified past the error at configure
+   and `cmake --install`; blender's was a full 53m47s build. Detail:
+   2026-09-25 (toolchain drift recipes).
+3. **`0721777` "xwayland-satellite-git: rebase round-half-up patch onto
+   63cdf17"** — Symptom: the local patch no longer applied. Root cause:
+   upstream main moved to 63cdf17 and rewrote the patched height code. Fix:
+   patch rebased onto 63cdf17, still needed (issue #479 open). Detail:
+   2026-09-25 (toolchain drift recipes).
+4. **`0824f97` "openshadinglanguage: guard removed llvm 24 TargetOptions
+   fields"** — Symptom: `llvm_util.cpp` compile errors on
+   `llvm::FPOpFusion`/`HonorSignDependentRoundingFPMathOption`. Root cause:
+   the llvm 24 snapshot removed those TargetOptions fields and upstream OSL
+   has not caught up. Fix: version guards in the recipe's existing
+   `osl-llvm-compat.patch`. Detail: 2026-09-25 (toolchain drift recipes).
+5. **`5fd636f` "autofdo-git: work around gcc PR 127395 constexpr brace-init
+   ICE"** — Symptom: compile dies in bundled abseil under the GCC 17
+   snapshot. Root cause: upstream GCC ICE (PR 127395, constexpr
+   brace-init). Fix: worked around in the recipe. Detail: 2026-09-25
+   (toolchain drift recipes).
+6. **`089b897` "qt6-languageserver: unpin LSP-3.18 spec types; drop
+   qt6-declarative shim"** — Symptom: qmlls compile failures from
+   qtlanguageserver↔qtdeclarative LSP-3.18 spec type skew. Root cause: the
+   deliberate qtlanguageserver pin hit its documented exit condition once
+   qtdeclarative adapted. Fix: unpin plus deletion of the now-stale
+   qt6-declarative skew shim. Detail: 2026-09-26 (qt6 spec-type unpin).
+
+### Transient and ops findings
+
+- **4 transient network fetch flakes** (TLS `unexpected eof`):
+  documentfoundation, documentfoundation-mirror (which also served 404s),
+  code.qt.io, invent.kde.org. The retry idiom works every time, and `git
+  clone` self-cleans its partial directory on a failed clone (verified) —
+  these are transient, never a recipe fault.
+- **1 stale pacman-db incident**: `plasma-wayland-protocols` 404'd on all
+  mirrors — a repo package missing everywhere means the local pacman db is
+  stale, not that upstream deleted it; `sudo pacman -Sy` fixed it.
+- **Builder UX trap (near-miss, confirmed twice — cycle-1 libreoffice and
+  cycle-10 qt5-base-git)**: the failure summary's "To resume, run:"
+  suggestion AND its "Remaining" count EXCLUDE the failed package itself.
+  Copying the suggested command verbatim therefore leaves the failed package
+  stale while its dependents build against stale installed copies. Fixed in
+  this campaign (builder workstream, commits separately): the resume list
+  now includes the failed package, and `tests/resume-command.sh` pins it
+  against regression.
+- **Stable-version sync semantics (verified)**: the builder rewrites stable
+  recipes' `pkgver`/`pkgrel` to match the official repo EXACTLY on every
+  load, and in BOTH directions — `openshadinglanguage` was rewritten
+  1.2→1.1 (down) to match the repo's 1.15.3.0-1.1, `wireplumber`
+  0.5.17-1.1→2.1. A local `pkgrel` bump on a stable recipe is therefore
+  clobbered on the next load. Decision taken: align committed values to the
+  repo (OSL `pkgrel=1.1`, wireplumber `0.5.17-2.1`) rather than fight the
+  sync; a deliberate local bump needs `--no-sync` and should expect the
+  mismatch to be visible.
+- **Freshness-audit semantics**: a raw PKGBUILD-vs-archive mtime comparison
+  over-reports staleness — a bulk content-identical rewrite touched 36
+  PKGBUILDs at 06:25, and version-line bookkeeping commits post-date their
+  builds. The content-aware audit (last commit touching the PKGBUILD vs the
+  newest archive's build time, plus pkgver-vs-archive-name comparison)
+  showed **0 genuinely stale recipes**: every "stale" recipe's newest archive
+  name matched its current pkgver exactly. `linux-cachyos` is the single
+  documented exclusion (its rebuild was deliberately dropped by the user at
+  06:31; the running 7.3.rc4 kernel stays).
+
+### Validation record
+
+Final batch 17/17 green (timings above); freshness audit 0 stale
+(content-aware); the version-refresh port (17 version-line-only PKGBUILD
+refreshes + 2 stable pkgrel alignments) landed with `.SRCINFO`
+regenerations; `--audit`/`--list`/dry-run sweep and the full fixture battery
+green.
+
+### Durable rules
+
+- **Rule**: a failure summary's resume suggestion and remaining count must
+  include the failed package itself — dependents compile against *installed*
+  copies, so a resume that omits it builds on stale foundations.
+  `tests/resume-command.sh` is the regression pin.
+- **Rule**: the stable sync owns `pkgver`/`pkgrel` of `packages/stable`
+  recipes and rewrites them to the repo's values in both directions on every
+  load. Do not hand-bump `pkgrel` on a stable recipe without `--no-sync`;
+  the standing convention is to align committed values to the repo.
+- **Rule**: TLS `unexpected eof` (and single-host 404s) on fetches are
+  transient — retry before touching a recipe; `git clone` leaves no partial
+  dir to clean. But a repo package 404ing on ALL mirrors is a stale local
+  pacman db: `sudo pacman -Sy`, then retry.
+- **Rule**: judge recipe freshness by content, not mtime — compare the last
+  commit touching the PKGBUILD and pkgver against the newest archive name;
+  a bulk rewrite or a bookkeeping commit otherwise flags half the tree as
+  stale.
+
 ## 2026-09-26 (qt6 spec-type unpin) — qtdeclarative adapted to the LSP-3.18 regeneration, so the qtlanguageserver pin hit its exit condition
 
 - **Symptom**: `qt6-declarative` fails compiling qmlls —
