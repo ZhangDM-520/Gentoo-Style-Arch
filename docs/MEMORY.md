@@ -83,7 +83,9 @@
 8. **Purged tools stay purged** (system-wide): po4a, python-sphinx,
    python-myst-parser, lvm2, libblockdev-lvm, systemd-tests, cuda, gcc15.
    Never reintroduce via makedepends — makepkg reinstalls them silently;
-   grep remaining makedeps after every trim.
+   grep remaining makedeps after every trim. Since 2026-09-26 `--audit`
+   enforces this with an exact-name lint over makedepends/checkdepends of
+   every committed `.SRCINFO` (seam: `--audit-lint purged`).
 9. **IgnorePkg closure**: every workspace pkgname must be in /etc/pacman.conf
    IgnorePkg (cumulative repeated `IgnorePkg =` lines, all inside
    `[options]` — a line in a repo section is silently dropped). Verify by
@@ -91,7 +93,11 @@
    read `.SRCINFO`, never grep the PKGBUILD (the kernel's
    `pkgbase="linux-$_pkgsuffix"` hides the real names) — and diffing with
    `comm -23` against `pacman-conf IgnorePkg | sort -u` (empty = covered;
-   `pacman-conf` reads the file directly and needs no database lock).
+   `pacman-conf` reads the file directly and needs no database lock). Since
+   2026-09-26 `--audit` carries a report-only closure gate that reads
+   /etc/pacman.conf directly with the same [options]-cumulative semantics
+   and skips only when the conf is unreadable (seam: `--audit-lint ignorepkg
+   [conf]`; it informs, never blocks a build).
 10. **Logs**: append one `## YYYY-MM-DD — topic` section per incident to
     NOTE.md: symptom → root cause → fix → rule.
 11. **Install-before-dependents-compile**: never build-then-install-collectively.

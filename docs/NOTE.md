@@ -35,6 +35,34 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-26 — audit lints: provides versioning, purged tools, IgnorePkg (architecture-deepening wave-4)
+
+Symptom — three rules lived only in prose and rotted: the IgnorePkg closure
+once lost 62 names unnoticed, purged tools crept back through makedepends
+(makepkg reinstalls them silently), and an unversioned toolchain provide
+silently failed a `>=N` makedepend by letting pacman fall back to the repo
+package. Fix (`af84810`) — C9's three-tier mapping: deterministic form rules
+become `--audit` lints (provides versioning with a 15-entry ratchet for the
+known hand-versioned soname provides; exact-name purged-tools denylist over
+makedepends/checkdepends), host-state rules become a report-only IgnorePkg
+closure gate that reads /etc/pacman.conf directly with [options]-scoped
+cumulative semantics and skips only when unreadable, and the heavy ELF rule
+becomes `tools/provides-audit.sh` paired with its reduced-scale fixture.
+Per-recipe exceptions are data now: `packages/stable/bash/FETCHED-ONLY`
+(source-basename globs) excuses fetched-at-build-time names from both the
+missing and untracked checks in `tests/recipe-sources.sh`, replacing a
+name-matched branch in the repo-wide walker. run-all's filter guard exits 2
+on a typo instead of passing an empty battery.
+
+Validation — `fish -n`/`bash -n`; `--audit` rc 0 with three new report-only
+sections (15 ratchet findings printed by design; purged + IgnorePkg clean on
+this host, 224 names covered); seam probes (clean on the real conf, Q17 skip
+on an unreadable one); battery PASS (40 fixture(s)).
+
+Durable rule — per-recipe exceptions are data (FETCHED-ONLY markers), never
+name-matched branches in repo-wide fixtures, and the marker excuses both the
+missing and untracked checks.
+
 ## 2026-09-26 — topology: one record per package (architecture-deepening wave-3)
 
 Symptom — declaring "this package is in core and builds after llvm" took

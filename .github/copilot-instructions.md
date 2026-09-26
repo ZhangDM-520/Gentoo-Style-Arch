@@ -84,8 +84,8 @@ regardless of completion order. The
 filter is a plain substring of the filename, so `pgo` runs the whole PGO
 family; `texlive`, `recipe`, `project`, `scheduler` and `sudo` each
 narrow to one area, and `mkinitcpio`/`bpftune` isolate the two single-recipe
-hook fixtures. A filter that matches nothing still exits 0 with
-`PASS (0 fixture(s))` — check that count before trusting a green run.
+hook fixtures. A mistyped filter exits 2 with `matched no fixtures — typo?`
+rather than silently passing an empty battery.
 
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
