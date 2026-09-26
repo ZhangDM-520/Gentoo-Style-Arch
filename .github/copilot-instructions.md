@@ -90,7 +90,7 @@ hook fixtures. A filter that matches nothing still exits 0 with
 Fixtures are bash scripts that exit non-zero on failure, are non-mutating
 (they build scratch trees under `$TMPDIR`, diff committed metadata, and assert
 on builder output), and print a reason to stderr. **Run the whole battery, not
-just the fixture near your change** — a `config/packages.map` format change
+just the fixture near your change** — a `config/topology.conf` format change
 was once caught by an unrelated recipe fixture.
 
 Three harness conventions worth copying rather than reinventing: a fixture that
@@ -107,8 +107,8 @@ implementation, so nothing there runs standalone.
 
 Scheduler, install and cleanup fixtures never exercise the real repository.
 They build a synthetic workspace under `$TMPDIR` — copy `build-all.fish`, then
-write a minimal `config/` (all six group files, an empty `dependencies.conf`,
-a hand-written `packages.map`, one-line `PKGBUILD`s) — and prefix `PATH` with
+write a minimal `config/` (a hand-written `topology.conf` and
+`build-defaults.conf`, one-line `PKGBUILD`s) — and prefix `PATH` with
 stub `makepkg`/`sudo`/`pacman` executables. The fixture drives those stubs
 through variables the *stub* defines, not the builder: `GSA_FAKE_SUDO_MODE`,
 `GSA_FAKE_SUDO_STATE`, `GSA_FAKE_SUDO_LOG`, `GSA_FAKE_BUILD_SECONDS`,
@@ -230,18 +230,21 @@ Four modules, deliberately separated (`docs/architecture.md`):
 1. **Recipes** — `packages/<category>/<package-id>/` with `PKGBUILD`,
    committed `.SRCINFO`, local patches/hooks/install scripts/desktop assets,
    upstream license material, and optional `.nvchecker.toml` / `BUILDING`.
-2. **Topology** — declarative, under `config/`. `packages.map` binds a package
-   ID to a recipe path and is *the only* place that does so; the loader
-   rejects any record that is not exactly `package-id|recipe-path`.
-   `groups/{git,stable,core,misc,third-party,app}.list` define logical groups, and
-   `dependencies.conf` records local build-order edges as
-   `package-id:dependency-id,dependency-id` (a lone `package-id:` is a
-   deliberate no-edge record). `build-defaults.conf` holds the GiB-per-job
+2. **Topology** — declarative, under `config/`. `topology.conf` holds one
+   record per package, `id|path|groups|edges[|tags]`, and is *the only* place
+   that binds a package ID to a recipe path; the loader rejects malformed
+   records by naming the offender and line. Group membership (comma list ⊂
+   `git,stable,core,misc,third-party,app`, roster stated once) and local
+   build-order edges (a trailing empty `edges` field is a deliberate no-edge
+   record) live in the same record, as do optional `abi=must`/`abi=should`
+   coupled-batch tags consumed by the generic batch gate. Tooling reads
+   topology through the builder's `--topology` data channel, never by parsing
+   `config/` directly. `build-defaults.conf` holds the GiB-per-job
    baselines (`memory_per_job_gib`, `core_memory_per_job_gib`,
    `reserved_memory_gib`) and the default `lanes`/`jobs`/`intensity`/`state_dir`.
-   Only those six group names are ever read, so any other file in
-   `config/groups/` is unreachable state that silently goes stale —
-   `tests/project.sh` fails on it.
+   The six group names are stated once (`_GROUP_NAMES`) and nothing outside
+   that roster is readable; any other file in `config/` is unreachable state
+   that silently goes stale — `tests/project.sh` fails on it.
 3. **Builder** — `build-all.fish` resolves IDs, expands and topologically sorts
    dependencies, dispatches isolated fish child processes as lanes, serializes
    pacman transactions, owns the dashboard, and reports per-package logs.
@@ -252,9 +255,10 @@ Four modules, deliberately separated (`docs/architecture.md`):
 
 Consequences worth internalising:
 
-- The loader validates the map, all six group files, the dependency graph, and
-  a complete topological sort on **every** invocation. One malformed record
-  breaks `--list`, `--help`, and every build, not just the affected package.
+- The loader validates every topology record, the group roster, the dependency
+  graph, and a complete topological sort on **every** invocation. One malformed
+  record breaks `--list`, `--help`, and every build, not just the affected
+  package.
 - Do not infer build order or group membership from directory names. `core` is
   a logical group that deliberately overlaps the physical categories:
   `autofdo-git` and `libclc-git` are `packages/git/` recipes, while
@@ -280,8 +284,8 @@ Consequences worth internalising:
 ## Conventions
 
 **Recipe registration.** Adding a recipe means: put it under the physical
-category, add one `packages.map` record, add the ID to the right group
-file(s), and add a `dependencies.conf` edge only after verifying the dependency
+category and add one topology record (`id|path|groups|edges[|tags]` in
+`config/topology.conf`); add an `edges` entry only after verifying the dependency
 against package metadata and a build-order reason. Every workspace `pkgname`
 must also appear in the host's `/etc/pacman.conf` `IgnorePkg` closure —
 cumulative repeated `IgnorePkg =` lines, all inside `[options]` (a line inside

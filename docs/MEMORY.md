@@ -134,8 +134,9 @@
     pin `#commit=` in PKGBUILD source, unpin after install — BPF target is
     build config, survives the snapshot change). Enforced by the builder since
     2026-09-25: `--audit` lints every cargo/rustc recipe for a `rust-git` edge
-    in its `dependencies.conf` record; a real build whose selection contains
-    llvm-git but not rust-git is refused while rust-git is installed; and an
+    in its topology record; the generic abi-batch gate refuses a real build
+    whose selection omits an installed `abi=must` batch member (llvm-git
+    without rust-git is the canonical case; the tag data drives it); and an
     `-i` run re-runs `check_rustc_sanity` right after its own
     llvm-git/llvm-libs-git install and stops dispatch on failure (the
     `--allow-broken-rustc` escape hatch does not cover that mid-run probe).
@@ -256,10 +257,16 @@
 
 - The public tree is `Gentoo_Style_Arch/`; recipes live under
   `packages/{git,stable,core,misc,third-party}/`.
-- `config/packages.map` maps package IDs to recipe paths, two fields per
-  record (`package-id|recipe-path`; the loader rejects any other shape —
-  2026-09-17). Group files and `config/dependencies.conf` are the scheduler's
-  source of truth.
+- `config/topology.conf` is the ONE topology source: one record per package,
+  `id|path|groups|edges[|tags]` — the only id→path binding, group membership
+  (comma list ⊂ the six names, roster stated once in `_GROUP_NAMES`), local
+  build-order edges (a trailing empty `edges` field is the deliberate no-edge
+  statement; records ALWAYS exist, so the old map⊆deps asymmetry is gone),
+  and optional `abi=must`/`abi=should` coupled-batch tags. The loader rejects
+  malformed records by naming the offender and line (duplicate ids included)
+  and validates records, roster, graph and a full topological sort on EVERY
+  invocation. Tooling reads topology through the `--topology` data channel,
+  never by parsing `config/` directly.
 - `.state/` (or `GSA_STATE_DIR`) holds builder-owned state only: `logs/`, the
   per-package logs inside it, the pacman mutex, the lane result files, and —
   since 2026-09-23 — `dispatcher.log` (timestamped `[DEBUG-gsa-term]` signal
@@ -361,12 +368,14 @@ OpenShadingLanguage -> blender.
 
 - `tests/lib/fixture-lib.bash` is the ONE synthesis/interface helper —
   sourced, never executed. `make_workspace DIR [lanes [jobs [intensity]]]`
-  builds the complete workspace skeleton (the loader validates map, groups,
-  deps and a full topological sort on EVERY invocation, so a fixture workspace
-  must be complete or every run dies in the loader); `add_package DIR ID
-  [extra-pkglines [group]]` adds one synthetic package (one-line PKGBUILD,
-  packages.map record, group entry; extra PKGBUILD lines are passed verbatim,
-  never guessed); `stub_sudo`/`stub_pacman`/`stub_makepkg` write the trivial
+  builds the complete workspace skeleton (the loader validates records, the
+  roster, the graph and a full topological sort on EVERY invocation, so a
+  fixture workspace must be complete or every run dies in the loader);
+  `add_package DIR ID [extra-pkglines [group]]` adds one synthetic package
+  (one-line PKGBUILD + its topology record `ID|packages/ID|GROUP|`; extra
+  PKGBUILD lines are passed verbatim, never guessed); `set_topology_record DIR
+  ID GROUPS [EDGES [TAGS]]` is the single writer for records that need
+  multiple groups, edges or tags (replace-or-append); `stub_sudo`/`stub_pacman`/`stub_makepkg` write the trivial
   byte-identical PATH stubs. `stub_sudo` is a passthrough that strips the
   builder's non-interactive flags (`-n`, `-v`, `--`) **and `--preserve-env`** —
   some hosts wrap `sudo` in a fish function that re-execs it as `command sudo
@@ -676,9 +685,9 @@ constant, not a baked path).
   whose selection installs llvm-git MUST rebuild rust-git in the same
   selection — a start-of-run probe cannot see a skew the run itself creates
   mid-run (enforcement in rule 13). Companion rule: every recipe invoking
-  `cargo`/`rustc` in ANY phase needs a `rust-git` edge in its
-  `config/dependencies.conf` record — `mold-git`'s deliberate no-edge record
-  `mold-git:` was valid syntax but a wrong declaration once its cargo-based
+  `cargo`/`rustc` in ANY phase needs a `rust-git` edge in its topology
+  record — `mold-git`'s deliberate empty-edges record
+  was valid syntax but a wrong declaration once its cargo-based
   Rust-PGO rework made it a system rustc consumer, so the scheduler dispatched
   mold before rust-git exactly as declared and mold died on the skewed `rustc`
   one llvm-snapshot bump later. `--audit`'s toolchain lint now flags
@@ -888,7 +897,7 @@ constant, not a baked path).
   silently. bettbox's PKGBUILD was 1.19.2 while `.SRCINFO` was 1.19.1 with the
   previous hash. Several per-recipe fixtures used to re-check their own copy;
   `tests/srcinfo-freshness.sh` is now the single owner: it regenerates and diffs
-  every recipe listed in `config/packages.map` (one job per hardware thread,
+  every recipe the `--topology` channel lists (one job per hardware thread,
   `GSA_SRCINFO_JOBS` to override).
 - **The kernel patch set is version-scoped, and `updpkgsums` prefers a cached
   copy over the URL** (2026-09-19, `linux-cachyos`): `_patchsource` is

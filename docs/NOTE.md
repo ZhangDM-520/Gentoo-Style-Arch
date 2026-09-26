@@ -35,6 +35,47 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-26 — topology: one record per package (architecture-deepening wave-3)
+
+Symptom — declaring "this package is in core and builds after llvm" took
+three records in three files in three syntaxes (`packages.map`,
+`groups/core.list`, `dependencies.conf`), adding a recipe was a
+four-touchpoint dance, and coupled-batch membership lived in prose that
+drifted from the code (the mold-git `rust-git`-edge incident was exactly a
+package's prose outliving its record). Root cause: the topology was split by
+data shape, not by concern.
+
+Fix (`db09690`) — `config/topology.conf` carries one record per package,
+`id|path|groups|edges[|tags]`: the id→path binding stays explicit, group
+membership is a comma list against a roster stated once (`_GROUP_NAMES`), a
+trailing empty `edges` field is the deliberate no-edge statement (records
+always exist — the old map⊆deps asymmetry where four packages had no dep
+record is gone), and `abi=must`/`abi=should` tags carry coupled-batch
+membership as data (25 must: llvm/rust + the qt6/qt5 module sets; 21 should:
+mesa, spirv, libclc, OSL, mold-git and other consumers). The duplicate-id
+path that used to fail with a bare `return 1` now names the offender and
+line. A GENERIC batch gate replaces the hard-coded llvm/rust literals: the
+anchor is a selected `abi=must` package with no abi-tagged transitive dep;
+on a real build (`-n`/`-l` exempt) an installed `abi=must` member omitted
+from the selection refuses before dispatch with per-member recovery lines,
+`abi=should` members get one same-pass note, and leaf rebuilds of members
+(`--no-deps rust-git`, `qt6-svg`, …) stay legal. The `--topology` data
+channel is now the only way tooling reads topology — `tests/srcinfo-freshness.sh`
+dropped its own awk parser and the per-recipe registration greps consume the
+channel. Fixture synthesis writes records (`make_workspace`/`add_package`,
+plus the `set_topology_record` writer); `config-diagnostics.sh` re-pins its
+rejection cases against the new grammar including the new duplicate-id case.
+
+Validation — `fish -n`; `--audit`/`--list` (128/128); dry-runs
+git(58)/stable(29)/core(41) rc 0; full battery
+`fish_function_path=/nonexistent-fp bash tests/run-all.sh` → PASS (38
+fixture(s)); reference resolution (path, case-variant, pkgname) smoke-checked
+unchanged.
+
+Durable rules — one record per package; the record is the ONLY id→path
+binding (never infer topology from directory names); batch membership is
+data, never prose; tooling reads `--topology`, never `config/` directly.
+
 ## 2026-09-26 (architecture-deepening wave-2) — install plan/executor split, lane outcome vocabulary, run-record fixtures
 
 Feature record, wave 2 of the same refactor (two commits):
