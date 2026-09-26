@@ -128,8 +128,6 @@ fi
 mapfile -t consumers < <(grep -l 'lib/pgo\.sh' "$root"/packages/*/*/PKGBUILD | sort)
 test "${#consumers[@]}" -gt 0 || fail "no recipe consumes lib/pgo.sh"
 
-commit_pending=
-
 for pkgbuild in "${consumers[@]}"; do
     rel=${pkgbuild#"$root"/}
 
@@ -144,10 +142,10 @@ for pkgbuild in "${consumers[@]}"; do
 
     # Resolve exactly as makepkg does: $startdir is the recipe directory.
     # git must be able to carry the resolved file into a clean checkout: it
-    # has to exist and escape both ignore layers, and it must be visible to
-    # `git ls-files` — tracked, or a pending addition of the current change
-    # set while the change is still uncommitted (the pending state is only
-    # possible before the commit that introduces the source line lands).
+    # has to exist, escape both ignore layers, and be TRACKED. An untracked
+    # (even if added-pending) helper hard-fails: the module is committed, and
+    # a helper only staged in the working tree would leave every clean
+    # checkout broken.
     recipe_dir=$(dirname "$pkgbuild")
     target=$(realpath -m "$recipe_dir/$relpath")
     rel_target=${target#"$root"/}
@@ -156,15 +154,8 @@ for pkgbuild in "${consumers[@]}"; do
     if git -C "$root" check-ignore -q -- "$rel_target"; then
         fail "$rel: $rel_target is git-ignored — a clean checkout would fail to build"
     fi
-    if ! git -C "$root" ls-files --error-unmatch -- "$rel_target" >/dev/null 2>&1; then
-        git -C "$root" ls-files --others --exclude-standard -- "$rel_target" |
-            grep -q . ||
-            fail "$rel: $rel_target is not visible to git — a clean checkout would fail to build"
-        case " $commit_pending " in
-            *" $rel_target "*) ;;
-            *) commit_pending="$commit_pending $rel_target" ;;
-        esac
-    fi
+    git -C "$root" ls-files --error-unmatch -- "$rel_target" >/dev/null 2>&1 ||
+        fail "$rel: $rel_target is not tracked — a clean checkout would fail to build"
 
     # Sourcing the PKGBUILD must define the interface through the module.
     (
@@ -185,10 +176,5 @@ done
 while IFS= read -r pkgbuild; do
     fail "${pkgbuild#"$root"/}: defines verify_no_profile_instrumentation inline — source lib/pgo.sh instead"
 done < <(grep -lE '^[[:space:]]*verify_no_profile_instrumentation\(\)' "$root"/packages/*/*/PKGBUILD)
-
-if test -n "$commit_pending"; then
-    printf 'pgo-lib: note: commit-pending helper (tracked only once committed):%s\n' \
-        "$commit_pending" >&2
-fi
 
 printf 'PGO shared gate fixture: PASS (%d consuming recipe(s))\n' "${#consumers[@]}"
