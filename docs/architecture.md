@@ -35,7 +35,27 @@ The scheduler's interface includes more than its flags: package selection is
 mandatory, dependency order is meaningful, `--install` installs before a
 dependent build starts, core packages run alone, and failures stop new
 dispatches while draining existing lanes. These invariants are part of the
-maintainer contract.
+maintainer contract. The failure-stop invariant has one named amendment: a
+recipe whose checksum anchoring is refused is *deferred*, not failed — its
+lane exits with rc 99 (`_ANCHOR_DEFER_RC`, the only path that emits it), the
+run record gives the package the `deferred` status (rc 99, reason
+`anchoring-refused`), dispatch continues while its dependents are held back as
+`blocked` (reason `waits-on-deferred`), and the run still exits non-zero with
+the parked recipes in the resume command. A run stopped by a signal classifies
+what it started as `interrupted` (reason `interrupted-mid-build`) and what
+never launched as `never-started` (reason `interrupted-before-start`); it
+prints the same summary, run record and continuation suggestion any completed
+run prints, then exits 130.
+
+Reporting has one seam too: one run record — the run's plan plus one outcome
+row per package — is computed once inside the builder and rendered three ways:
+the interactive dashboard (live), the plain output a pipe sees (the prose
+summary), and a machine-readable block on stdout between
+`--- run record begin ---` and `--- run record end ---` (one
+`pkg status rc dur reason` row per package). One seam with three renderings
+means no drift between what a human sees and what a script parses: the
+dashboard, the summary and the machine block are views of the same rows, not
+three parallel accounts of the run.
 
 The install path also owns one payload invariant: a package built from a
 recipe that instruments with `-fprofile-generate` is refused if its archive

@@ -246,6 +246,62 @@ confirmation from stdin and prints the same target list to a pipe as to a
 terminal, so `printf 'n\n' | fish build-all.fish -ccc` lists what it would
 delete and then aborts — answering `y` deletes it.
 
+## Builder output contract
+
+One run record per run — plan plus one outcome row per package — is rendered
+three ways: the interactive dashboard (live), the prose summary, and the
+machine block below. The machine block is default-on, printed to stdout after
+the dashboard has finished (so its ANSI renderer cannot garble it), and on the
+interrupt and sudo-preflight paths too:
+
+```
+--- run record begin ---
+format: 1
+selection-source: groups=… packages=… ranges=…
+order: <the selection, topological>
+lanes: …
+normal-jobs: …
+core-jobs: …
+intensity: …
+outcome: success|failed|interrupted
+rc: <run exit code>
+<pkg> <status> <rc> <dur> <reason>
+--- run record end ---
+```
+
+Rows are full, never exceptions-only, one per package in topological order,
+space-separated `pkg status rc dur reason` (the reason is the remainder of the
+line). `rc` and `dur` are integers (`dur` in seconds) or `-` when the package
+never produced one. The status enum, with its reasons:
+
+- `succeeded` — `ok`.
+- `failed` — `build-failed` (lane ran, rc is in the row), `lane-lost` (reap
+  anomaly, rc 125), `log-unwritable` (dispatch refused: log not openable).
+- `deferred` — rc **99**, reason `anchoring-refused`: checksum anchoring was
+  impossible, the recipe is parked rather than failed, dispatch continues and
+  its dependents wait. Not a failed build.
+- `blocked` — `waits-on-deferred` (dependent of a parked recipe) or
+  `never-ready` (dependency cycle / missing dep).
+- `never-started` — `dispatch-stopped`, `preflight-refused`, or
+  `interrupted-before-start`.
+- `interrupted` — `interrupted-mid-build`: started and in flight when the run
+  was interrupted.
+
+An interrupted or partial run always ends with a continuation suggestion under
+"To resume, run:" — a command rendered from the builder's single
+continuation-flag table: the plan values (`--lanes`/`--jobs`/`--intensity`),
+the install flavour (`-i` → `--install`, `-fi` → `--forceinstall`), the
+semantics flags (`--no-deps`/`--no-sync`/`--allow-broken-rustc`), and the
+remaining package list in place of the original selection (failed packages
+included — they must rebuild before their dependents). `-c`/`--clean` and
+`-s`/`--skip` are deliberately not mirrored (`-c` would wipe the archives a
+resume needs; `-s` is the user's call — the printed tip says to add it), and
+one-shot actions (`-n`, `-l`, `-ia`, `-cc`, `-ccc`, `-ln`, `--audit`,
+`--help`) are never mirrored. Ambient environment inputs (`GSA_TARGET_CPU`,
+`GSA_STATE_DIR`) are warned about, never baked into the command. The interrupt
+path prints the summary, the machine block and this suggestion before exiting
+130, so a Ctrl-C run leaves the same three artifacts as a completed one.
+
 ## Troubleshooting
 
 Read the per-package log named in a failure message. A stale system pacman

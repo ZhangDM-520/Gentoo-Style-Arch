@@ -35,6 +35,85 @@ So `.Static/qt6-base` and `packages/stable/qt6-base` are the same recipe family,
 and `.Heavy/llvm-git` is today's `packages/core/llvm-git`. Package IDs,
 dependency edges, and incident root causes are unaffected by the renames.
 
+## 2026-09-26 (architecture-deepening wave-1) — run record, shared PGO gate, one fixture helper, and the ADR set
+
+Feature record rather than an incident: the first wave of the
+architecture-deepening refactor landed as five commits. Symptom it removes —
+three seams each carried two or more parallel truths: outcome/continuation
+knowledge was re-derived in the dispatcher, the `_RL_*` globals and the
+summary; seven per-recipe copies of the instrumentation check had drifted;
+17 fixture scripts each hand-rolled their own workspace/stub synthesis.
+Root cause — no single owner for any of the three facts, so copies drifted by
+construction (and the copy-paste mandate was the recurrence engine of the
+instrumented-archive incidents of 2026-09-16/2026-09-19 — four guard call
+sites were decorative and silently packaged instrumented payloads until
+2026-09-20). Fix — settle the design first, then replace each duplicated
+truth with one owner, one commit per phase.
+
+### The design settled (three ADRs, `docs/adr/`)
+
+- `0001-pgo-shared-gate.md` — one shared PGO payload gate (`lib/pgo.sh`) with
+  fatal semantics, per-recipe *calls* kept (the symbol predicate is only
+  reachable pre-strip), both verification seams stay.
+- `0002-topology-one-record.md` — collapse the four topology syntaxes into
+  one per-package record (`id|path|groups|edges`, coupled batches as tags),
+  with the rejected options recorded so they stop being rediscovered.
+- `0003-run-record.md` — one builder-internal run record rendered three ways
+  (dashboard, prose, default-on machine block), continuation arguments from
+  one flag-rule table, ambient env knobs warned about rather than mirrored.
+
+### Wave-1 phases (five commits, one line each)
+
+1. `0490b00` docs — CONTEXT.md glossary + `docs/adr/0001..0003`: the
+   vocabulary and the three decisions, with the options each one rejected.
+2. `b470843` builder — `run_record_row/field/plan/finalize` + the
+   `print_run_record` machine block + one `continuation_args` mirror behind
+   `_CONTINUATION_RULES`, and the interrupt path now prints summary + record +
+   continuation then exits 130: one record replaces the parallel truths, and
+   the 2026-09-26 failed-package drop from a resume suggestion cannot recur
+   because both mirrors render from the same table.
+3. `820e645` tests — `tests/lib/fixture-lib.bash` (the one synthesis helper)
+   with 17 synthesizers migrated onto it, the `GSA_FAKE_*` stub-knob family
+   renamed in one pass (12 names), `run-all.sh` excludes `./lib/*`, and
+   `project.sh` pins its self-scan with `expected_invocations=20`: the
+   hand-rolled copies had drifted slightly in 17 places.
+4. `975c126` recipes — `lib/pgo.sh` shared fatal gate and the 7 consumers
+   converted (`|| return 1` lint deleted as unenforceable),
+   `tests/pgo-lib.sh` pins the module, `tests/pgo-transition.sh` gained the
+   below-threshold fallback branch, and cmake-git dropped `--sphinx-man`/
+   python-sphinx so a purged host package cannot re-enter via makedepends.
+5. `9c9ec80` tests — `tests/pgo-lib.sh` hard-fails on a shared module that is
+   visible to git but untracked: the commit-pending tolerance would have left
+   every clean checkout broken.
+
+### Validation record
+
+Merged wave-1 tree: `fish_function_path=/nonexistent-fp bash tests/run-all.sh`
+→ **PASS (37 fixtures)** (the prefix keeps user fish wrapper functions from
+intercepting the fixtures' PATH stubs); the PGO fixture families are green —
+`tests/pgo-lib.sh` across the 7 consumers and `tests/pgo-transition.sh` across
+its five pairs including the new fallback branches; negative test for the
+untracked-module rule: `git rm --cached lib/pgo.sh` in a scratch export makes
+`tests/pgo-lib.sh` exit non-zero with "lib/pgo.sh is not tracked", as
+intended. `fish -n build-all.fish` clean; the run-record change needed zero
+fixture edits.
+
+### Durable rules
+
+- **Fatal gate over `|| return 1`**: a check inside a bash function whose
+  failure must stop the build is one shared `exit 1` gate called LAST — bash
+  returns the last command's status, so a mid-body `|| return 1` call is
+  silently discarded (the four decorative guards). Recipes call the shared
+  gate; they never copy its implementation.
+- **One synthesis helper**: fixtures build their workspaces and trivial stubs
+  through `tests/lib/fixture-lib.bash`; a second synthesizer copy is drift by
+  construction (17 copies already had). Oracle-shaped stubs stay inline in the
+  fixture that gives them meaning.
+- **The run record is the single reporting seam**: dashboard, prose summary
+  and machine block are three renderings of one record — never a second
+  account of the run — and every continuation command renders from the one
+  flag-rule table.
+
 ## 2026-09-26 (full-rebuild campaign) — 6 root-caused fixes, batch close-out, and the version-refresh port
 
 Campaign close-out for the full workspace rebuild across all groups, run in

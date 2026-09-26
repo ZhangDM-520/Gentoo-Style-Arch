@@ -343,6 +343,55 @@ OpenShadingLanguage -> blender.
   `rm -rf src`. It also needs ~38 GB on disk, not the ~3.5 GB of data, because
   each SVN working copy keeps a 9.1 GB `.svn/pristine` shadow.
 
+### Fixture conventions
+
+- `tests/lib/fixture-lib.bash` is the ONE synthesis/interface helper —
+  sourced, never executed. `make_workspace DIR [lanes [jobs [intensity]]]`
+  builds the complete workspace skeleton (the loader validates map, groups,
+  deps and a full topological sort on EVERY invocation, so a fixture workspace
+  must be complete or every run dies in the loader); `add_package DIR ID
+  [extra-pkglines [group]]` adds one synthetic package (one-line PKGBUILD,
+  packages.map record, group entry; extra PKGBUILD lines are passed verbatim,
+  never guessed); `stub_sudo`/`stub_pacman`/`stub_makepkg` write the trivial
+  byte-identical PATH stubs. `stub_sudo` is a passthrough that strips the
+  builder's non-interactive flags (`-n`, `-v`, `--`) **and `--preserve-env`** —
+  some hosts wrap `sudo` in a fish function that re-execs it as `command sudo
+  --preserve-env …`, and a stub that chokes on that flag would fail every `-i`
+  fixture in the preflight probe. Oracle-shaped stubs (fake `date`, marker
+  flipping, `-Qp`/`-Qi` answers, signal loggers) stay inline in the fixture
+  that gives them meaning, as do assertions, `fail()` prefixes and the
+  `( subshell )` section structure of multi-subject fixtures.
+- `run_builder CMD…` is the capture helper: combined stdout+stderr in
+  `FIXTURE_OUTPUT`, exit status in `FIXTURE_RC`, and it ALWAYS returns 0 — a
+  failing builder is the fixture's data, not a reason to trip the fixture's
+  own `set -e` — so assert on `$FIXTURE_RC` explicitly.
+  `makepkg_printsrcinfo DIR` is `makepkg --printsrcinfo --dir` carrying
+  `GIT_CONFIG_COUNT=0` (agent shells inject git config that breaks makepkg VCS
+  operations). Both are plain bash functions and do not cross a process
+  boundary on their own: a fixture running them inside `bash -c` workers must
+  `export -f` them (`tests/srcinfo-freshness.sh` exports `check_recipe` and
+  `makepkg_printsrcinfo` for exactly that reason).
+- Every stub knob is named `GSA_FAKE_*` and is fixture-side only: read by the
+  stub script, never by the builder, which honours exactly the seven `GSA_*`
+  inputs `--help` lists — `GSA_LANES`, `GSA_JOBS`, `GSA_INTENSITY`,
+  `GSA_CPU_THREADS`, `GSA_MEMORY_GIB`, `GSA_STATE_DIR`, `GSA_TARGET_CPU`.
+  `GSA_BUILD_JOBS` is the builder's OUTPUT to recipes, not an input. A new
+  fixture knob keeps the `GSA_FAKE_*` prefix (full table in the helper's
+  header).
+- `tests/run-all.sh` discovers fixtures recursively (`find . -name '*.sh'`)
+  and excludes `tests/assets/` (frozen reference material, never runs
+  standalone) and `./lib/*`; the helper is `fixture-lib.bash` (`.bash`, not
+  `.sh`) so discovery can never match it, and the `lib/` exclusion is defence
+  in depth against a future `tests/lib/anything.sh` becoming a phantom
+  fixture. Sibling subjects merge into ONE file as `( subshell )` sections
+  rather than growing another top-level script.
+- `tests/project.sh` pins its own topology-command inventory:
+  `expected_invocations=20` is the count of column-0 `run`/`run_split` calls
+  the fixture scrapes out of itself and pre-executes (the call syntax is
+  load-bearing — a call indented off column 0 is never pre-executed and its
+  replay fails). A change to the topology commands the fixture drives must
+  update the pin in the same change, or the self-scan fails.
+
 ## 3. Stack facts
 
 Durable shape of the stack, re-verified 2026-09-17. Deliberately no version
@@ -419,7 +468,19 @@ install history lives in `NOTE.md`.
   sway); lz4/zstd CLI (profiles OUTSIDE build dir); mimalloc (test suite +
   `-fprofile-update=atomic`); mold (links itself); rust/niri LLVM-style
   (LLVM_PROFILE_FILE + llvm-profdata, unset sccache). Verify:
-  `find <profile-dir> -name '*.gcda'` count > threshold.
+  `find <profile-dir> -name '*.gcda'` count > threshold. The threshold is a
+  per-recipe `local` — `pgo_min_gcda`, or `pgo_min_profraw` for mold-git's
+  Rust `.profraw` profiles; it is NOT a `lib/pgo.sh` knob — and its comment
+  contract is "≈ the minimum distinct translation units the training must
+  touch before a profile is worth trusting": at or below it the profile is too
+  thin and the recipe falls back to a non-PGO (LTO-only) build rather than
+  shipping one. Values today: 0 (`cmake-git`, `mold-git` — any profile data at
+  all suffices; zero files means training never ran and phase 2 is skipped),
+  50 (`glib2-git`, `cairo-git`, `xorg-xwayland-git`), 100 (`gtk3-git`,
+  `gtk4-git`). A threshold change is a behavioural change — it decides whether
+  the recipe ships a profile-used build at all — and belongs in a NOTE.md
+  entry with the reason; if the thresholds are ever lifted into `lib/pgo.sh`,
+  a change there is a behavioural change to every consuming recipe at once.
 - **Autotools PGO**: CFLAGS bake at ./configure time — every phase must
   re-run ./configure; `make clean` is NOT enough.
 - **Special cases**: rust-git (bootstrap.toml flags, 5 patches, and
@@ -961,14 +1022,32 @@ constant, not a baked path).
   itself and re-creates the whole tree on every run, so check a shipped binary
   with `strings -a <bin> | grep -c '\.gcda'` — `readelf -sW` alone is a **false
   negative** on anything makepkg has stripped (2026-09-19);
-  the payload gate lives in `build-all.fish` (`verify_pgo_payload`, gated on
-  the recipe containing `-fprofile-generate`) because 21 recipes instrument
-  and only 6 carry a recipe-level guard — per-recipe verification produced two
-  separate recurrences, so it is the wrong seam for a whole-set invariant;
-  four of those guard call sites were also **decorative** until 2026-09-20
-  (mid-`package()`, no `|| return 1`, so bash discarded the status and the
-  build succeeded with the instrumentation in it — every `verify_*` call
-  belongs either last or with `|| return 1`);
+  the payload gate lives in `build-all.fish` (`verify_pgo_payload`, the
+  fail-closed whole-set backstop: strings-only, post-strip, whole-archive,
+  gated on the sibling PKGBUILD matching `-fprofile-generate|-C
+  ?profile-generate`) because per-recipe verification produced two separate
+  recurrences and is the wrong seam for a whole-set invariant;
+  the per-recipe check is ONE shared fatal gate: a PGO recipe sources
+  `lib/pgo.sh` via `$startdir` (`source "$startdir/../../../lib/pgo.sh"`) and
+  calls `verify_no_profile_instrumentation "$pkgdir"` as the LAST statement of
+  `package()` — of each `package_*` split function, against that function's own
+  `$pkgdir`. The gate is fatal (`exit 1` kills makepkg's function subshell)
+  precisely because bash returns a function's LAST command status, so a
+  mid-function call's failure was silently discarded — the mechanism that left
+  four guard call sites **decorative** and silently packaged instrumented
+  payloads until 2026-09-20. The `|| return 1` convention is dead (its lint is
+  deleted): never reintroduce it for a check that must stop a build. Recipes
+  call the gate and never copy its implementation (the per-recipe copies had
+  drifted — mold-git's predicates were stricter than the rest);
+  counts (2026-09-26, two different predicates on purpose — do not conflate
+  them): **23** recipes are PGO-instrumenting (predicate: a
+  `packages/*/*/PKGBUILD` containing `profile-generate` in any spelling —
+  `-fprofile-generate`, `-Cprofile-generate`, `--enable-profile-generate` —
+  or `profiler=true`; the last matches zero recipes today) versus **7**
+  recipes calling the shared gate (`grep -l 'lib/pgo\.sh'
+  packages/*/*/PKGBUILD`). The builder's own gate predicate covers 22 of the
+  23; the earlier "21 instrument / 6 guard" figures are superseded by the two
+  predicates above (re-measured 2026-09-26);
   that scan is **whole-archive** (subtree scoping embeds an install-location
   assumption and misses a `usr/libexec` leak, while `.PKGINFO`/`.BUILDINFO`/
   prose each pass the standalone-path predicate) and
@@ -1080,3 +1159,13 @@ constant, not a baked path).
   `_LANE_STOP_GRACE_S` is an env-overridable *internal* seam (default stays 30,
   pinned by `signal-abort-lock.sh`; not an eighth public `GSA_*` input), and
   `.SRCINFO` freshness has exactly one owner, `tests/srcinfo-freshness.sh`.
+- **User-level fish wrapper functions intercept the battery's PATH stubs**
+  (2026-09-26, harness): the builder runs under fish, and fish autoloads
+  functions from `$fish_function_path` before any PATH lookup — so a
+  user-level `sudo` wrapper shadows the `sudo` stub a fixture placed in front
+  of `$PATH`, and that wrapper re-execs the real sudo with `--preserve-env`
+  added (a flag the builder never passed; this is why `stub_sudo` in
+  `tests/lib/fixture-lib.bash` strips it). Run the battery as
+  `fish_function_path=/nonexistent-fp bash tests/run-all.sh` so no fish
+  function can intercept a stub. A fixture failure that disappears under that
+  prefix is a host-shell artefact, not a builder regression.
