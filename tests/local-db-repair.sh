@@ -22,8 +22,9 @@ set -uo pipefail
 #      on a healthy box: measured 1754/1754), removed when idle; rc 0.
 #   5. empty/absent dir → rc 0, no output noise about removals.
 #   6. static: the --local-db-check seam exists and check_pacman_db_health is
-#      wired at all four sites (preflight, install_all, interrupt teardown,
-#      run_pacman_locked failure path).
+#      wired at all three sites (the shared install preflight that serves
+#      both -i's preflight and -ia's entry, the interrupt teardown, and
+#      run_pacman_locked's failure path).
 #
 # Lock isolation: the stub `pgrep` is a fixture-side oracle (GSA_FAKE_PGREP_
 # HOLDER), so a real pacman elsewhere on the host cannot make this fixture
@@ -144,16 +145,21 @@ run_check "$fixture/var/pacman/absent-local" "$out5" ; rc=$?
 [[ $rc -eq 0 ]] || fail "absent local dir rc=$rc, want 0"
 
 # ── 6. static wiring pins ───────────────────────────────────────────────────
-echo "phase 6: seam + four call sites present"
+echo "phase 6: seam + three call sites present"
 grep -q -- '--local-db-check' "$fixture/build-all.fish" ||
     fail "--local-db-check seam missing from build-all.fish"
 grep -q 'function check_pacman_db_health' "$fixture/build-all.fish" ||
     fail "check_pacman_db_health function missing"
+# Three direct wires after the 2026-09-26 install_preflight consolidation:
+# the shared install preflight (called by check_runtime_prereqs for -i and by
+# install_all for -ia), the interrupt teardown, and run_pacman_locked's
+# failure path. (Was four sites before -i's preflight and -ia's entry were
+# merged into install_preflight.)
 wires=$(grep -c 'check_pacman_db_health (pacman_db_local_path)' \
     "$fixture/build-all.fish")
-[[ "$wires" -ge 4 ]] ||
-    fail "check_pacman_db_health wired at $wires site(s), want >=4" \
-        "(preflight, install_all, interrupt teardown, run_pacman_locked)"
+[[ "$wires" -ge 3 ]] ||
+    fail "check_pacman_db_health wired at $wires site(s), want >=3" \
+        "(shared install preflight, interrupt teardown, run_pacman_locked)"
 grep -q 'function pacman_db_local_path' "$fixture/build-all.fish" ||
     fail "pacman_db_local_path helper missing (DBPath seam)"
 

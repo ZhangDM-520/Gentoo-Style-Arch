@@ -51,12 +51,9 @@ if test -z "$_BUILD_HOME"
     exit 1
 end
 # 1 = background lane job — suppress human-facing echoes (the parent renderer
-# owns live output). Set per-build_package call, read by install_pkgs_now.
+# owns live output). Set per-build_package call; the install pipeline does NOT
+# read it — install_pkgs_now receives its sink/mode as arguments.
 set -g _BUILD_QUIET 0
-# 1 = -fi/--forceinstall: install_pkgs_now skips the same-version sanity
-# check and always runs pacman -U. Set per-build_package call (same hand-off
-# as _BUILD_QUIET); the default keeps any other entry point on the checked path.
-set -g _INSTALL_FORCE 0
 
 # Output is rendered by the parent dispatcher only. Fish's set_color emits
 # ANSI sequences even when stdout is a pipe, so wrap the builtin and make
@@ -104,10 +101,11 @@ set -g _DOWNLOAD_ARCHIVE_EXTS tar 'tar.*' tgz zip jar ttf whl
 # the lane installs (`sudo -n`, lane children have no tty) never need a
 # password. The interval sits well inside the 5-min sudo timeout so a slow poll
 # iteration under heavy CPU load cannot overshoot it (2026-09-07 llvm incident:
-# a 70-min build whose keepalive prompt timed out). The prompt bound keeps an
-# unattended run from hanging on a password nobody can type.
+# a 70-min build whose keepalive prompt timed out). The builder NEVER prompts
+# for a password (any privilege escalation is `sudo -n`): a dead credential
+# fails fast instead of hanging an unattended run on a password nobody can
+# type.
 set -g _SUDO_KEEPALIVE_S 150
-set -g _SUDO_PROMPT_S 120
 
 function ui_heading
     set -l prefix (set_color cyan)
@@ -156,12 +154,60 @@ set -g _DASHBOARD_SPINNER_FRAMES '-' "\\" '|' '/'
 set -g _DASHBOARD_SPINNER_INDEX 1
 set -g _RL_BLOCKED 0
 set -g _RL_DEFERRED
-# Lane rc meaning "this recipe's anchoring was refused — PARK it, do not stop
-# the dispatch": build_package returns it only from the anchor branch (before
-# makepkg ever runs), and run_lanes' reap turns it into a deferral instead of
-# a failed build (2026-09-24). 99 is clear of flock's 75 and the lane-spawn
-# anomaly's 125; no other path emits it.
-set -g _ANCHOR_DEFER_RC 99
+# ─── Lane outcome vocabulary (the result protocol's rc field) ───────────────
+# The COMPLETE set of values a lane result's rc field may carry, and the only
+# names code should ever compare against. lane_result_encode/decode (the codec
+# pair beside write_lane_result) carry them across the process boundary; the
+# dispatcher classifies with lane_outcome_name instead of re-deriving the
+# numbers at every site. Two further numbers exist but are NOT outcomes: the
+# --lane-job handler exits 2 on an invalid invocation (process rc only, no
+# result row), and flock(1) surfaces 75 for a mutex timeout inside an install
+# failure (which collapses to lane_outcome_failed like every other non-zero).
+#   ok      0    build (and requested install) succeeded
+#   failed  1    build or install failed — build_package collapses makepkg's
+#                own rc to 1, so the compiler's number lives only in the log
+#   defer   99   anchoring was refused: PARK the recipe, keep dispatching
+#                (build_package returns it only from the anchor branch, before
+#                makepkg ever runs; run_lanes turns it into a deferral instead
+#                of a failed build — 2026-09-24). Clear of flock's 75 and the
+#                lane-lost 125; no other path emits it.
+#   lost    125  lane supervisor produced no valid result (reap anomaly, or a
+#                result write that failed)
+#   hup     129  lane child killed by SIGHUP (honest result written first)
+#   int     130  lane child killed by SIGINT
+#   term    143  lane child killed by SIGTERM
+set -g lane_outcome_ok 0
+set -g lane_outcome_failed 1
+set -g lane_outcome_defer 99
+set -g lane_outcome_lost 125
+set -g lane_outcome_hup 129
+set -g lane_outcome_int 130
+set -g lane_outcome_term 143
+# Historical name kept as an alias: docs/MEMORY.md and the run-record cluster
+# speak of "the _ANCHOR_DEFER_RC amendment"; the value has one home above.
+set -g _ANCHOR_DEFER_RC $lane_outcome_defer
+
+# lane_outcome_name RC → the enum's name for RC. Any number outside the
+# vocabulary decodes as `failed` — the failure branch is the conservative
+# default, never a silent success.
+function lane_outcome_name -a rc
+    switch "$rc"
+        case "$lane_outcome_ok"
+            echo ok
+        case "$lane_outcome_defer"
+            echo defer
+        case "$lane_outcome_lost"
+            echo lost
+        case "$lane_outcome_hup"
+            echo signal-hup
+        case "$lane_outcome_int"
+            echo signal-int
+        case "$lane_outcome_term"
+            echo signal-term
+        case '*'
+            echo failed
+    end
+end
 set -g _INTERRUPT_HANDLED 0
 # Signal forensics (2026-09-23 mass-TERM incident): which signal arrived, in
 # which mode the handler ran, and how long lane teardown may grace before the
@@ -1352,33 +1398,33 @@ end
 # -ia / --installall: install everything already built in ONE pacman
 # transaction (inter-package deps resolve within the transaction).
 # Extra args are forwarded to pacman, e.g.: build-all.fish -ia --overwrite '*'
+# This entry is FORCE mode: it deliberately has NO same-version skip (2026-09-26
+# decision) but shares the one install pipeline — the same install_plan +
+# install_execute the -i path uses, so there is no second implementation of
+# the PGO gate, the transaction, or the transcript rules.
 function install_all
     if not require_command flock; or not require_command pacman
         return 1
     end
     # -ia returns before run_lanes, so check_runtime_prereqs never runs for it.
-    # verify_pgo_payload needs both: tar unrolls the archive, strings reads it.
+    # The PGO gate needs both: tar unrolls the archive, strings reads it.
     if not require_command tar; or not require_command strings
         return 1
     end
     if test "$_ROOT_MODE" != "1"; and not require_command sudo
         return 1
     end
-    # Same lock preflight as -i: a busy db.lck would hard-fail the whole
-    # single-transaction install anyway — refuse up front with recovery text.
-    if not check_pacman_lock (pacman_db_lock_path)
-        ui_error "refusing -ia while the pacman database lock is busy (recovery hint above)"
-        return 1
-    end
-    # Same integrity preflight as -ia's sibling -i path: a broken entry would
-    # hard-fail the whole single transaction with "invalid or corrupted
-    # package"; the probe removes it loudly when provably idle.
-    if not check_pacman_db_health (pacman_db_local_path)
-        ui_error "refusing -ia while broken local package database entries exist (recovery hint above)"
+    # ONE preflight shared with -i (install_preflight): a busy db.lck or a
+    # broken local entry would hard-fail the whole single transaction anyway —
+    # refuse up front with the recovery text.
+    if not install_preflight refuse "start -ia"
         return 1
     end
     set -l pkgs (find_built_pkgs)
     if test (count $pkgs) -eq 0
+        # Entry-level UX: -ia installs "whatever exists", so nothing built is
+        # a no-op, not the refusal -i's empty list is (there, silence was the
+        # 2026-09-20 bug — install_plan still refuses an empty checked plan).
         ui_warning "No built packages found."
         return 0
     end
@@ -1387,32 +1433,17 @@ function install_all
         echo "  $p"
     end
     # $pkgs are absolute (find_pkg_dirs → $SCRIPT_DIR) — safe under any cwd.
-    # Explicit if/else: fish rejects an all-variable command with empty $pre.
     if not ensure_state_dirs
         return 1
     end
-    # Passed for call-site symmetry only: run_pacman_locked never opens its
-    # log_file argument, so install-all output goes to the terminal and this
-    # path never creates a file that could go root-owned.
     set -l install_log "$LOG_DIR/install-all.log"
-    # Single-transaction escape hatch: the payload check still has to hold —
-    # this path never passes through install_pkgs_now.
-    if not verify_pgo_payload $pkgs
-        return 1
-    end
-    if test "$_ROOT_MODE" = "1"
-        run_pacman_locked "$install_log" pacman -U --noconfirm --ask 4 $argv $pkgs
-    else
-        run_pacman_locked "$install_log" sudo pacman -U --noconfirm --ask 4 $argv $pkgs
-    end
-    set -l irc $status
-    if test $irc -ne 0
-        ui_error "Install failed (rc=$irc)"
-        return 1
-    end
+    # The plan is computed once and consumed by the executor (silent: the
+    # heading above is the only plan rendering this entry adds).
+    set -l plan (install_plan force $pkgs)
+    install_execute "$install_log" loud (count $argv) $argv $plan
 end
 
-# ─── PGO payload verification ────────────────────────────────────────────────
+# ─── PGO payload gate (an install-plan step) ─────────────────────────────────
 # An installed PGO *phase-1* binary bakes absolute profile destinations into
 # `.rodata` — `.gcda` for C/C++ `-fprofile-generate`, `.profraw` for Rust's
 # `-Cprofile-generate` — and its runtime recreates that entire tree on every
@@ -1447,10 +1478,19 @@ end
 # correctly rebuilt cmake-git is refused at install, which is how the 2026-09-20
 # rebuild of cmake-git failed *after* its payload came out clean.
 #
-# Returns 0 for every archive that is clean or not applicable, 1 after naming
-# the offending members. Callers abort: an instrumented payload must never be
-# installed, and under `-i` every later package would compile against it.
-function verify_pgo_payload
+# This is the DECISION half: it emits install-plan rows and stays silent —
+# install_execute renders the refusal messages from these rows, and the
+# --install-decide fixture seam prints them verbatim. Row shapes (fields are
+# space-separated; a member name containing a space would truncate its row,
+# which still refuses correctly):
+#   refuse pgo-temp <archive>
+#   refuse pgo-unreadable <archive> <tar-rc> <extracted-files>
+#   refuse pgo-hit <archive> <member>          (one per offending member)
+#   refuse pgo-instrumented <archive>          (the verdict for that archive)
+# Returns 0 for every archive that is clean or not applicable, 1 after any
+# refusal row. Callers abort: an instrumented payload must never be installed,
+# and under `-i` every later package would compile against it.
+function pgo_payload_refusals
     set -l failed 0
     for archive in $argv
         set -l recipe_dir (dirname -- "$archive")
@@ -1463,8 +1503,9 @@ function verify_pgo_payload
         end
         set -l work (mktemp -d "$tmp_root/gsa-pgo-verify.XXXXXX" 2>/dev/null)
         if test -z "$work"
-            ui_error "cannot create a temp dir to verify "(basename "$archive")
-            return 1
+            echo "refuse pgo-temp $archive"
+            set failed 1
+            continue
         end
         # GNU tar restores the whole archive — nothing is filtered out. A
         # non-zero status, or an archive that yields no files at all, means the
@@ -1476,7 +1517,7 @@ function verify_pgo_payload
         set -l extracted (count (find "$work" -type f 2>/dev/null))
         if test "$tar_rc" -ne 0; or test "$extracted" -eq 0
             rm -rf -- "$work"
-            ui_error "refusing to install "(basename "$archive")": its payload could not be read (tar rc=$tar_rc, $extracted files), so PGO instrumentation cannot be ruled out"
+            echo "refuse pgo-unreadable $archive $tar_rc $extracted"
             set failed 1
             continue
         end
@@ -1489,10 +1530,9 @@ function verify_pgo_payload
         rm -rf -- "$work"
         if test (count $hits) -gt 0
             for hit in $hits
-                ui_error (basename "$archive")": profile-instrumented payload — "$hit
+                echo "refuse pgo-hit $archive $hit"
             end
-            ui_error "refusing to install "(basename "$archive")": a phase-1 PGO binary is packaged, so libgcov would recreate its build tree on every run"
-            ui_error "rebuild the recipe so phase 2 really replaces the profiled flags (docs/build-guide.md: PGO)"
+            echo "refuse pgo-instrumented $archive"
             set failed 1
         end
     end
@@ -1942,7 +1982,8 @@ function audit_workspace
     # -Cprofile-generate is the one
     # PGO defect the recipe-level check cannot see: it fails only on machines
     # that do not have the instrumenting build's directory tree.  The builder
-    # refuses such an archive at install time (verify_pgo_payload), but an
+    # refuses such an archive at install time (the install plan's PGO gate,
+    # pgo_payload_refusals), but an
     # install made *before* that gate existed stays broken until rebuilt, so
     # the audit reports it.  Every file is scanned rather than the obvious
     # usr/bin+usr/lib pair, because scoping to those embeds an assumption
@@ -2326,113 +2367,229 @@ function install_skip_reason -a archive
     return 0
 end
 
-# ─── Unattended install of built package files ───────────────────────────────
+# ─── Install decision plan & one executor ────────────────────────────────────
+# ONE install pipeline: the decision half (install_plan) computes the
+# transaction plan ONCE and SILENTLY — which archives to install, which to
+# skip and why, or which refusal stops the whole thing — and one executor
+# (install_execute) renders that plan and runs the single pacman transaction.
+# Both entries are thin wrappers over the pair: -i (install_pkgs_now, checked
+# mode) and -ia (install_all, FORCE mode — deliberately no same-version skip).
+# The hidden --install-decide fixture seam prints the plan verbatim. Decisions
+# never render, so "what would happen" (the seam) and "what happened" (the
+# executor) cannot drift apart — the interface IS the test surface.
+#
+# Plan rows (fields space-separated; a path containing a space would truncate
+# its row, which still decides correctly — no such path exists here):
+#   install <archive>                   → run pacman -U for it
+#   skip <archive> <installed-version>  → exact version, installed fresher
+#   refuse empty-list                   → nothing to install (checked mode)
+#   noop empty-list                     → nothing to do (force mode: mirrors -ia)
+#   refuse pgo-*                        → see pgo_payload_refusals
+# A refusal row aborts the whole transaction; skip and install rows may mix.
+function install_plan -a mode
+    set -l archives $argv[2..-1]
+    if test (count $archives) -eq 0
+        # An empty list is NOT success on the -i path. It means discovery
+        # found no archive for the current pkgver-pkgrel, and returning 0
+        # here is what let `-i` print "All builds succeeded!" without pacman
+        # ever running (2026-09-20: a trailing comment on pkgver= made
+        # list_split_pkgs return nothing). Installing nothing also leaves the
+        # system on the old version while later packages compile against it —
+        # precisely the failure the -i ordering exists to prevent.
+        # tests/install-archive-guard.sh pins both halves.
+        if test "$mode" = force
+            echo 'noop empty-list'
+            return 0
+        end
+        echo 'refuse empty-list'
+        return 1
+    end
+    # Never plan a PGO phase-1 payload: libgcov would recreate its build tree
+    # on every run, and under -i every later package would build against it.
+    set -l pgo_rows (pgo_payload_refusals $archives)
+    if test $status -ne 0
+        printf '%s\n' $pgo_rows
+        return 1
+    end
+    if test "$mode" = force
+        # -fi / -ia: the same-version sanity check is bypassed ENTIRELY —
+        # install_skip_reason is never even consulted, so there is no second
+        # implementation of the skip decision to drift.
+        for archive in $archives
+            echo "install $archive"
+        end
+        return 0
+    end
+    # Same-version sanity check (2026-09-25): drop every archive whose exact
+    # version is already installed with an install date not older than the
+    # archive; if nothing is left, there is no transaction to run. Doubt
+    # installs: a failed query keeps the archive in the set, so the
+    # conservative direction is always pacman -U, never silence.
+    # tests/install-archive-guard.sh pins both directions plus the force
+    # bypass.
+    for archive in $archives
+        set -l iver (install_skip_reason "$archive")
+        if test $status -eq 0
+            echo "skip $archive $iver"
+        else
+            echo "install $archive"
+        end
+    end
+    return 0
+end
+
+# install_emit SINK LOG_FILE LEVEL TEXT — the ONE rendering seam of the
+# install pipeline. quiet: append to the transcript (lane children must never
+# write to the terminal — the dispatcher owns all progress rendering). loud:
+# print with the usual icon. LEVEL is error or info.
+function install_emit -a sink log_file level text
+    if test "$sink" = quiet
+        switch $level
+            case error
+                printf '%s %s\n' "$_UI_ICON_ERROR" "$text" >>"$log_file"
+            case '*'
+                printf '%s %s\n' "$_UI_ICON_INFO" "$text" >>"$log_file"
+        end
+    else
+        switch $level
+            case error
+                ui_error "$text"
+            case '*'
+                ui_info "$text"
+        end
+    end
+end
+
+# install_execute LOG_FILE SINK N_EXTRA EXTRA... PLAN_ROW... — the ONE
+# executor: renders the plan (refusals abort before anything else, then the
+# skip note) and runs the single pacman transaction for its install set.
+# SINK is quiet | loud. The N_EXTRA argv after it are forwarded to pacman
+# verbatim (-ia's `--overwrite …`); everything past them is plan rows.
 # One pacman transaction per call. --ask 4 auto-accepts removal of conflicting
 # (e.g. stock) packages — the stock→-git swap prompt — so a run never blocks on
-# a prompt. Returns 1 on failure so callers abort the chain: a package that
-# failed to install means every later package would compile against the WRONG
-# system state (the 2026-09-06 rust-git/minimal-llvm-git incident class).
-function install_pkgs_now -a log_file
-    # log_file: the package's build log — install output is appended there so
-    # quiet (lane) mode keeps install forensics in the per-package log.
-    set -l pkgs $argv[2..-1]
+# a prompt. Returns 1 on refusal or transaction failure so callers abort the
+# chain: a package that failed to install means every later package would
+# compile against the WRONG system state (the 2026-09-06 rust-git/minimal-
+# llvm-git incident class).
+function install_execute -a log_file sink n_extra
+    set -l rest $argv[4..-1]
+    set -l extra
+    set -l rows
+    if test "$n_extra" -gt 0
+        set extra $rest[1..$n_extra]
+        set rows $rest[(math $n_extra + 1)..-1]
+    else
+        set rows $rest
+    end
     # The transcript must be writable BEFORE pacman runs: appending rule-11
     # forensics into an unopenable log would swallow the record of exactly the
     # failure this function exists to make loud. Refusing here aborts the run.
+    # (Straight to the terminal: the transcript is the thing that is broken.)
     if not ensure_log_writable "$log_file"
         ui_error "install transcript not writable: $log_file — refusing to install without a record"
         return 1
     end
-    # An empty list is NOT success. It means discovery found no archive for the
-    # current pkgver-pkgrel, and returning 0 here is what let `-i` print "All
-    # builds succeeded!" without pacman ever running (2026-09-20: a trailing
-    # comment on pkgver= made list_split_pkgs return nothing). Installing
-    # nothing also leaves the system on the old version while later packages
-    # compile against it — precisely the failure the -i ordering exists to
-    # prevent. tests/install-archive-guard.sh pins both halves.
-    if test (count $pkgs) -eq 0
-        if test "$_BUILD_QUIET" = "1"
-            printf '%s Install requested but no built package archive matched the current pkgver-pkgrel — refusing to report success\n' "$_UI_ICON_ERROR" >>"$log_file"
-        else
-            ui_error "install requested but no built package archive was found for the current pkgver-pkgrel"
+    set -l installs
+    set -l skips
+    set -l skip_version ""
+    set -l refusals
+    for row in $rows
+        set -l fields (string split ' ' -- "$row")
+        switch $fields[1]
+            case install
+                set -a installs $fields[2]
+            case skip
+                set -a skips $fields[2]
+                set skip_version $fields[3]
+            case noop
+                # force mode with nothing to do — no message, no transaction.
+            case '*'
+                set -a refusals $row
+        end
+    end
+    if test (count $refusals) -gt 0
+        for row in $refusals
+            set -l fields (string split ' ' -- "$row")
+            switch $fields[2]
+                case empty-list
+                    if test "$sink" = quiet
+                        printf '%s Install requested but no built package archive matched the current pkgver-pkgrel — refusing to report success\n' "$_UI_ICON_ERROR" >>"$log_file"
+                    else
+                        ui_error "install requested but no built package archive was found for the current pkgver-pkgrel"
+                    end
+                case pgo-temp
+                    install_emit "$sink" "$log_file" error "cannot create a temp dir to verify "(basename "$fields[3]")
+                case pgo-unreadable
+                    install_emit "$sink" "$log_file" error "refusing to install "(basename "$fields[3]")": its payload could not be read (tar rc=$fields[4], $fields[5] files), so PGO instrumentation cannot be ruled out"
+                case pgo-hit
+                    install_emit "$sink" "$log_file" error (basename "$fields[3]")": profile-instrumented payload — "$fields[4]
+                case pgo-instrumented
+                    install_emit "$sink" "$log_file" error "refusing to install "(basename "$fields[3]")": a phase-1 PGO binary is packaged, so libgcov would recreate its build tree on every run"
+                    install_emit "$sink" "$log_file" error "rebuild the recipe so phase 2 really replaces the profiled flags (docs/build-guide.md: PGO)"
+                case '*'
+                    install_emit "$sink" "$log_file" error "unrecognized install-plan refusal: $row"
+            end
         end
         return 1
     end
-    # Never install a PGO phase-1 payload: libgcov would recreate its build tree
-    # on every run, and under -i every later package would build against it.
-    if not verify_pgo_payload $pkgs
-        return 1
+    if test (count $skips) -gt 0
+        install_emit "$sink" "$log_file" info (count $skips)" of "(math (count $skips) + (count $installs))" package(s) already installed at $skip_version — skipping their install"
     end
-    # Same-version sanity check (2026-09-25) — skipped entirely under
-    # -fi/_INSTALL_FORCE: drop every archive whose exact version is already
-    # installed with an install date not older than the archive; if nothing
-    # is left, there is no transaction to run. Doubt installs: a failed query
-    # keeps the archive in the set, so the conservative direction is always
-    # pacman -U, never silence. tests/install-archive-guard.sh pins both
-    # directions plus the force bypass.
-    if test "$_INSTALL_FORCE" != "1"
-        set -l to_install
-        set -l kept_count 0
-        set -l kept_version ""
-        for pkg in $pkgs
-            set -l iver (install_skip_reason "$pkg")
-            if test $status -eq 0
-                set kept_count (math $kept_count + 1)
-                set kept_version "$iver"
-            else
-                set -a to_install $pkg
-            end
-        end
-        if test $kept_count -gt 0
-            if test "$_BUILD_QUIET" = "1"
-                printf '%s %s of %s package(s) already installed at %s — skipping their install\n' \
-                    "$_UI_ICON_INFO" "$kept_count" (count $pkgs) "$kept_version" >>"$log_file"
-            else
-                ui_info "$kept_count of "(count $pkgs)" package(s) already installed at $kept_version — skipping their install"
-            end
-        end
-        if test (count $to_install) -eq 0
-            return 0
-        end
-        set pkgs $to_install
+    if test (count $installs) -eq 0
+        return 0
+    end
+    # Install: root mode runs pacman directly (no timestamp to expire);
+    # unprivileged mode escalates with `sudo -n` — the builder NEVER prompts
+    # (a lane has no tty, and an unattended run must fail fast, not hang).
+    # Explicit if/else: fish REJECTS `$pre pacman` when $pre expands to
+    # nothing ("expanded command was empty") — no empty-prefix tricks.
+    set -l cmd
+    if test "$_ROOT_MODE" = "1"
+        set cmd pacman
+    else
+        set cmd sudo -n pacman
     end
     set -l irc 1
-    # Install: root mode runs pacman directly (no timestamp to expire);
-    # unprivileged quiet (lane) mode uses -n to fail fast — a background lane
-    # has no tty, so a prompt would hang ~2 min and fail anyway. Explicit
-    # if/else: fish REJECTS `$pre pacman` when $pre expands to nothing
-    # ("expanded command was empty") — no empty-prefix tricks.
-    if test "$_ROOT_MODE" = "1"
-        if test "$_BUILD_QUIET" = "1"
-            # Lane children must never write to the terminal; the dispatcher
-            # owns all progress rendering. Keep pacman hooks and transactions
-            # in the package log instead of tailing a line to stdout.
-            run_pacman_locked "$log_file" pacman -U --noconfirm --ask 4 $pkgs >>"$log_file" 2>&1
-            set irc $status
-        else
-            echo "  Installing: "(string join ' ' $pkgs)
-            run_pacman_locked "$log_file" pacman -U --noconfirm --ask 4 $pkgs 2>&1 | tee -a "$log_file" | tail -3
-            set irc $pipestatus[1]
-        end
-    else if test "$_BUILD_QUIET" = "1"
-        # See the root quiet branch: no child output may race the dispatcher.
-        run_pacman_locked "$log_file" sudo -n pacman -U --noconfirm --ask 4 $pkgs >>"$log_file" 2>&1
+    if test "$sink" = quiet
+        # Lane children must never write to the terminal; the dispatcher owns
+        # all progress rendering. Keep pacman hooks and transactions in the
+        # package log instead of tailing a line to stdout.
+        run_pacman_locked "$log_file" $cmd -U --noconfirm --ask 4 $extra $installs >>"$log_file" 2>&1
         set irc $status
     else
-        echo "  Installing: "(string join ' ' $pkgs)
-        run_pacman_locked "$log_file" sudo pacman -U --noconfirm --ask 4 $pkgs 2>&1 | tee -a "$log_file" | tail -3
+        echo "  Installing: "(string join ' ' $installs)
+        run_pacman_locked "$log_file" $cmd -U --noconfirm --ask 4 $extra $installs 2>&1 | tee -a "$log_file" | tail -3
         set irc $pipestatus[1]
     end
     if test $irc -ne 0
-        if test "$_BUILD_QUIET" = "1"
+        if test "$sink" = quiet
             printf '%s Install failed (rc=%s) — stopping: later packages would build against the wrong system state\n' "$_UI_ICON_ERROR" "$irc" >>"$log_file"
             printf '  NOTE: with -i the BUILD may still have succeeded (archive exists); install later with -ia or resume with -s -i\n' >>"$log_file"
         else
-            ui_error "Install failed (rc=$irc) — stopping: later packages would build against the wrong system state"
+            ui_error "Install failed (rc=$irc)"
         end
         return 1
     end
     return 0
+end
+
+# install_pkgs_now LOG_FILE QUIET_FLAG FORCE_FLAG ARCHIVE... — the -i entry:
+# one package's install inside a build chain. QUIET_FLAG 1 = lane mode
+# (transcript only, no terminal); FORCE_FLAG 1 = -fi (plan in force mode).
+# The mode/sink ride as ARGUMENTS, not globals — the pipeline reads nothing
+# hidden. The plan is computed once here and consumed by the executor.
+function install_pkgs_now -a log_file quiet_flag force_install_flag
+    set -l pkgs $argv[4..-1]
+    set -l mode checked
+    if test "$force_install_flag" = "1"
+        set mode force
+    end
+    set -l sink loud
+    if test "$quiet_flag" = "1"
+        set sink quiet
+    end
+    set -l plan (install_plan $mode $pkgs)
+    install_execute "$log_file" $sink 0 $plan
 end
 
 function sanitize_log_stream
@@ -2675,9 +2832,9 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
     # quiet_flag=1: background lane mode — no human echoes; everything goes to
     # the per-package log; the parent dispatcher renders lane state.
     set -g _BUILD_QUIET (test "$quiet_flag" = "1"; and echo 1; or echo 0)
-    # -fi/--forceinstall hand-off to install_pkgs_now (same pattern as
-    # _BUILD_QUIET): the installer reads the global, not this argv.
-    set -g _INSTALL_FORCE (test "$force_install_flag" = "1"; and echo 1; or echo 0)
+    # -fi/--forceinstall now rides as the FORCE_FLAG argument to
+    # install_pkgs_now alongside this one — the install pipeline reads its
+    # mode/sink from arguments, never from a hidden global.
     # Absolute path consolidation: never depend on the ambient cwd
     set -l pkg_path (package_path "$package_id" | string collect)
     set -l pkg_name "$package_id"
@@ -2723,7 +2880,7 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
                 # for already-built packages just the same.
                 # ($log_file isn't defined yet here — use the canonical path.)
                 if test "$install_flag" = "1"
-                    install_pkgs_now (package_log_file "$package_id") (list_split_pkgs "$pkg_path"); or return 1
+                    install_pkgs_now (package_log_file "$package_id") 1 $force_install_flag (list_split_pkgs "$pkg_path"); or return 1
                 end
                 return 0
             end
@@ -2822,10 +2979,11 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
                 # Anchoring is impossible right now (2: fetch/tool/refresh
                 # failure, recipe restored; 3: no official document at our
                 # version, recipe untouched). Defer instead of draining the
-                # dispatch: the lane result protocol is unchanged — the defer
-                # code rides in the same rc field — and the dispatcher parks
-                # the recipe with a named marker while the rest continues.
-                return $_ANCHOR_DEFER_RC
+                # dispatch: the lane result protocol is unchanged — the
+                # lane_outcome_defer value rides in the same rc field — and
+                # the dispatcher parks the recipe with a named marker while
+                # the rest continues.
+                return $lane_outcome_defer
         end
     end
 
@@ -2905,7 +3063,7 @@ function build_package -a package_id install_flag clean_flag skip_flag no_sync_f
     # before its dependents compile, or they build/link against the old
     # system version (2026-09-06 rust-git vs minimal llvm-git incident).
     if test "$install_flag" = "1"
-        if not install_pkgs_now "$log_file" (list_split_pkgs "$pkg_path")
+        if not install_pkgs_now "$log_file" 1 $force_install_flag (list_split_pkgs "$pkg_path")
             return 1
         end
     end
@@ -2924,9 +3082,9 @@ end
 #   core count, never paired with another build (RAM contention).
 # - Non-solo lanes share a CPU/RAM-derived per-lane job limit.
 # - pacman installs happen inside background jobs (no tty): the dispatcher
-#   keeps the sudo timestamp warm with a `sudo -v` keepalive, and a
-#   builder-owned flock serializes transactions before pacman can contend on
-#   its database lock.
+#   keeps the sudo timestamp warm with a `sudo -n -v` keepalive (escalation
+#   never prompts), and a builder-owned flock serializes transactions before
+#   pacman can contend on its database lock.
 # - Lane supervisors use isolated sessions and redirect their complete
 #   stdout/stderr stream to the package log; only the parent renders status.
 # - Result protocol: each lane job writes "pkgdir rc seconds" to its result
@@ -3256,6 +3414,54 @@ function check_pacman_db_health -a local_dir
     return 1
 end
 
+# install_preflight MODE LABEL — the ONE shared install preflight: the db.lck
+# probe and the local-db integrity probe as a single call, so every site that
+# must know "can a pacman transaction right now" asks the same question.
+#   refuse — fatal for an installing run: ui_error "refusing to LABEL while ..."
+#            plus the one-line reason, rc 1. LABEL reads into the message
+#            ("start an -i run", "start -ia").
+#   warn   — build-only runs: non-fatal ui_warning "... building anyway;
+#            -i/-ia would be refused until ..."
+# Both probes self-heal (guarded stale removal) and print their own diagnostics
+# — this layer only decides. Callers: check_runtime_prereqs (-i/-ia preflight),
+# install_all (-ia entry). The post-mortem sites (run_pacman_locked's failure
+# path, the interrupt teardown) call the probes directly: they always run both,
+# report-only, and have no decision to make.
+function install_preflight -a mode label
+    set -l ok 1
+    # db.lck preflight (2026-09-23 lock storm): a stale or held lock only
+    # matters when this run will install — busy → refuse up front with the
+    # recovery text; build-only runs just warn and keep building.
+    if not check_pacman_lock (pacman_db_lock_path)
+        switch $mode
+            case refuse
+                ui_error "refusing to $label while the pacman database lock is busy"
+                echo "  Builds would succeed but every install would hard-fail on the held lock."
+                set ok 0
+            case warn
+                ui_warning "pacman database lock is busy — building anyway; -i/-ia would be refused until it clears"
+        end
+    end
+    # Local-db integrity preflight (2026-09-24 vscodium): a desc/files-less
+    # entry makes every install fail with the misleading "invalid or
+    # corrupted package" — busy holder → report and refuse up front;
+    # provably idle → the probe removes it loudly so -s -i self-heals.
+    if not check_pacman_db_health (pacman_db_local_path)
+        switch $mode
+            case refuse
+                ui_error "refusing to $label while broken local package database entries exist (recovery hint above)"
+                echo "  Builds would succeed but every install would hard-fail on the broken entry."
+                set ok 0
+            case warn
+                ui_warning "broken local package database entries present — building anyway; -i/-ia would be refused until they are repaired"
+        end
+    end
+    if test $ok -eq 0
+        return 1
+    end
+    return 0
+end
+
 function check_runtime_prereqs -a install_flag needs_stable_sync
     set -l required fish makepkg nproc ps awk tail sed getent
     if test "$install_flag" = "1"; or test "$needs_stable_sync" = "1"
@@ -3263,7 +3469,7 @@ function check_runtime_prereqs -a install_flag needs_stable_sync
     end
     if test "$install_flag" = "1"
         set -a required flock pacman
-        # verify_pgo_payload unrolls the archive to inspect its payload.
+        # pgo_payload_refusals unrolls the archive to inspect its payload.
         set -a required tar strings
         if test "$_ROOT_MODE" != "1"
             set -a required sudo
@@ -3274,28 +3480,10 @@ function check_runtime_prereqs -a install_flag needs_stable_sync
             return 1
         end
     end
-    # db.lck preflight (2026-09-23 lock storm): a stale or held lock only
-    # matters when this run will install — busy → refuse -i up front with the
-    # recovery text above; build-only runs just warn and keep building.
-    if not check_pacman_lock (pacman_db_lock_path)
-        if test "$install_flag" = "1"
-            ui_error "refusing to start an -i run while the pacman database lock is busy"
-            echo "  Builds would succeed but every install would hard-fail on the held lock."
-            return 1
-        end
-        ui_warning "pacman database lock is busy — building anyway; -i/-ia would be refused until it clears"
-    end
-    # Local-db integrity preflight (2026-09-24 vscodium): a desc/files-less
-    # entry makes every install fail with the misleading "invalid or
-    # corrupted package" — busy holder → report and refuse -i up front;
-    # provably idle → the probe removes it loudly so -s -i self-heals.
-    if not check_pacman_db_health (pacman_db_local_path)
-        if test "$install_flag" = "1"
-            ui_error "refusing to start an -i run while broken local package database entries exist (recovery hint above)"
-            echo "  Builds would succeed but every install would hard-fail on the broken entry."
-            return 1
-        end
-        ui_warning "broken local package database entries present — building anyway; -i/-ia would be refused until they are repaired"
+    if test "$install_flag" = "1"
+        install_preflight refuse "start an -i run"; or return 1
+    else
+        install_preflight warn ""
     end
     return 0
 end
@@ -3326,43 +3514,39 @@ function sudo_probe
     return 1
 end
 
-# Last resort when a credential dies mid-run: the dispatcher still owns the
-# terminal (lane children never do), so it can ask for the password itself and
-# keep the run going. Only when a human is plausibly present (stdin is a
-# terminal) and always bounded by `timeout` — a prompt nobody can answer must
-# never hang an unattended run.
-function sudo_elevate_interactively
-    test -t 0; or return 1
-    command -q timeout; or return 1
-    printf '\n'
-    ui_warning "sudo needs a password — asking now (installs themselves stay non-interactive)"
-    timeout "$_SUDO_PROMPT_S" sudo -v
-    return $status
+# Last resort when a credential dies mid-run: there is none. Every privilege
+# escalation is `sudo -n` (2026-09-26 decision) — the builder never prompts,
+# so a dead credential fails fast instead of hanging an unattended run.
+
+# ─── Lane result codec: the process boundary's one format ────────────────────
+# One wire line: `pkg rc dur`, three space-separated fields. encode/decode are
+# THE pair that defines it — the producer (write_lane_result) and the consumer
+# (run_lanes' reap) both go through them, so the format has one home and one
+# test surface. decode enforces shape AND identity (field 1 must equal the
+# expected package), so a stale result file from another child can never be
+# misread as this one's outcome. The rc field carries the lane_outcome_*
+# vocabulary (see its block at the top of this file).
+
+# lane_result_encode PKG RC DUR → the wire line on stdout; fails on an empty
+# pkg (identity is mandatory) or a non-numeric rc/dur (the outcome vocabulary
+# is numeric by construction).
+function lane_result_encode -a pkg rc dur
+    if test -z "$pkg"
+        return 1
+    end
+    if not string match -qr '^[0-9]+$' -- "$rc"
+        return 1
+    end
+    if not string match -qr '^[0-9]+$' -- "$dur"
+        return 1
+    end
+    printf '%s %s %s\n' "$pkg" "$rc" "$dur"
 end
 
-function write_lane_result -a result_file pkg rc dur
-    set -l tmp_result "$result_file.tmp.$fish_pid"
-    if not printf '%s %s %s\n' "$pkg" "$rc" "$dur" >"$tmp_result"
-        rm -f -- "$tmp_result"
-        return 1
-    end
-    # Write-time ownership: in root mode the lane child creates this tmp as
-    # root, so hand it to the build user BEFORE the atomic publish — the
-    # published result must never be root-owned. The `pkg rc seconds` line
-    # and the atomic mv contract are unchanged; a SIGKILL between printf and
-    # chown strands only the tmp (next run rm -f's by directory permission).
-    if test "$_ROOT_MODE" = "1"; and not chown "$_BUILD_USER": "$tmp_result" 2>/dev/null
-        rm -f -- "$tmp_result"
-        return 1
-    end
-    if not mv -f -- "$tmp_result" "$result_file"
-        rm -f -- "$tmp_result"
-        return 1
-    end
-    return 0
-end
-
-function lane_result_valid -a expected_pkg result_line
+# lane_result_decode EXPECTED_PKG LINE → three lines (pkg, rc, dur) for fish
+# command substitution, which splits on newlines only; fails on any shape,
+# identity or numeric mismatch. Callers treat failure as "no valid result".
+function lane_result_decode -a expected_pkg result_line
     set -l fields
     for field in (string split ' ' -- "$result_line")
         if test -n "$field"
@@ -3379,6 +3563,34 @@ function lane_result_valid -a expected_pkg result_line
         return 1
     end
     if not string match -qr '^[0-9]+$' -- "$fields[3]"
+        return 1
+    end
+    printf '%s\n' "$fields[1]" "$fields[2]" "$fields[3]"
+end
+
+# write_lane_result RESULT_FILE PKG RC DUR — the producer side of the codec:
+# encode, then publish atomically. The `pkg rc dur` line and the atomic mv
+# contract are unchanged.
+function write_lane_result -a result_file pkg rc dur
+    set -l line (lane_result_encode "$pkg" "$rc" "$dur")
+    if test (count $line) -ne 1
+        return 1
+    end
+    set -l tmp_result "$result_file.tmp.$fish_pid"
+    if not printf '%s\n' "$line" >"$tmp_result"
+        rm -f -- "$tmp_result"
+        return 1
+    end
+    # Write-time ownership: in root mode the lane child creates this tmp as
+    # root, so hand it to the build user BEFORE the atomic publish — the
+    # published result must never be root-owned. A SIGKILL between printf and
+    # chown strands only the tmp (next run rm -f's by directory permission).
+    if test "$_ROOT_MODE" = "1"; and not chown "$_BUILD_USER": "$tmp_result" 2>/dev/null
+        rm -f -- "$tmp_result"
+        return 1
+    end
+    if not mv -f -- "$tmp_result" "$result_file"
+        rm -f -- "$tmp_result"
         return 1
     end
     return 0
@@ -3749,7 +3961,48 @@ function pick_next_ready -a solo_ok
     return 1
 end
 
-function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip_flag no_sync_flag force_install_flag
+# ─── Lane invocation: one description of the process-boundary argv ───────────
+# The seam stays the PROCESS BOUNDARY: `--lane-job` + 8 positional payload
+# args (pkg, result file, jobs, five 0|1 flags), unchanged. But the shape now
+# has one home: lane_argv builds the payload (the spawn) and lane_argv_check
+# validates exactly that shape (the handler). Adding a lane flag is a two-line
+# edit here plus the lane_job signature — never argv archaeology through a
+# count check at the call site.
+
+# lane_argv PKG RESULT_FILE JOBS INSTALL CLEAN SKIP NO_SYNC FORCE → the eight
+# payload args, one per line (fish command substitution splits on newlines).
+function lane_argv -a pkg result_file jobs install_flag clean_flag skip_flag no_sync_flag force_install_flag
+    printf '%s\n' "$pkg" "$result_file" "$jobs" "$install_flag" "$clean_flag" "$skip_flag" "$no_sync_flag" "$force_install_flag"
+end
+
+# lane_argv_check ARGS... — validate the payload shape lane_argv builds.
+# Silent and rc 0 when valid; prints the error and returns 2 on an invalid
+# invocation. 2 is invocation error: outside the lane_outcome_* vocabulary,
+# never written to a result file.
+function lane_argv_check
+    if test (count $argv) -ne 8
+        echo "Error: --lane-job expects package, result file, job count, and five flags" >&2
+        return 2
+    end
+    if not string match -qr '^[1-9][0-9]*$' -- "$argv[3]"
+        echo "Error: --lane-job received an invalid job count: $argv[3]" >&2
+        return 2
+    end
+    for flag in $argv[4..8]
+        if not string match -qr '^[01]$' -- "$flag"
+            echo "Error: --lane-job received an invalid flag: $flag" >&2
+            return 2
+        end
+    end
+    return 0
+end
+
+# lane_job PKG_ID RESULT_FILE TOTAL_JOBS INSTALL CLEAN SKIP NO_SYNC FORCE —
+# the lane child's body. PKG_ID is the package ID (the misnomer `pkg_dir` was
+# renamed: this has always received the ID, which is also the result line's
+# identity field). Result protocol: build, then ONE honest `pkg rc dur` line
+# through the codec.
+function lane_job -a pkg_id result_file total_jobs install_flag clean_flag skip_flag no_sync_flag force_install_flag
     # Runs in a separate fish process with its stdout/stderr redirected by the
     # parent: no tty for sudo, no shared mutable state — communicates by result file.
     # Route this lane's makepkg -s dep installs through the builder mutex
@@ -3789,12 +4042,13 @@ function lane_job -a pkg_dir result_file total_jobs install_flag clean_flag skip
     # See MAKEFLAGS above: `string join` cannot take a "-jN" argument.
     set -gx NINJAFLAGS "$ninja_flags"
     set -l start_s (date +%s)
-    build_package $pkg_dir $install_flag $clean_flag $skip_flag $no_sync_flag 1 $force_install_flag
+    build_package $pkg_id $install_flag $clean_flag $skip_flag $no_sync_flag 1 $force_install_flag
     set -l rc $status
     set -l dur (math (date +%s) - $start_s)
-    if not write_lane_result "$result_file" "$pkg_dir" "$rc" "$dur"
+    if not write_lane_result "$result_file" "$pkg_id" "$rc" "$dur"
         echo "✗ lane result write failed: $result_file" >&2
-        exit 125
+        # No valid result ⇒ the dispatcher classifies this lane as lost.
+        exit $lane_outcome_lost
     end
     return $rc
 end
@@ -3923,9 +4177,11 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
     set -l sudo_stopped 0
     set -l probe_stopped 0
     # -i preflight: decide whether installs are possible BEFORE the first hour
-    # of building is spent on packages that could never be installed. A prompt
-    # belongs here — the human just started the run — so this is the one place
-    # we may ask for a password; the old code found out 150 s into dispatch.
+    # of building is spent on packages that could never be installed. No prompt
+    # belongs here or anywhere: every privilege escalation is `sudo -n`, so a
+    # cold credential refuses the run immediately (the old code asked for a
+    # password here; the 2026-09-26 decision is fail fast — rerun under
+    # `sudo fish` or prime the credential with `sudo -v` first).
     set -l sudo_state up
     if test $install_flag -eq 1; and test "$_ROOT_MODE" != "1"
         switch (sudo_probe)
@@ -3933,12 +4189,10 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 # Nothing to keep warm: probing again would only be noise.
                 set sudo_state nopasswd
             case cold
-                if not sudo_elevate_interactively
-                    set -g _RL_SUDO_NOTE "no install rights: nothing was built"
-                    ui_error "sudo cannot install non-interactively — refusing to start an -i run"
-                    echo "  Prefer 'sudo fish $SCRIPT_DIR/build-all.fish ...' for long runs: installs run as root and never expire."
-                    return 1
-                end
+                set -g _RL_SUDO_NOTE "no install rights: nothing was built"
+                ui_error "sudo cannot install non-interactively — refusing to start an -i run"
+                echo "  Prefer 'sudo fish $SCRIPT_DIR/build-all.fish ...' for long runs: installs run as root and never expire."
+                return 1
         end
     end
     set -l last_sudo (date +%s)
@@ -4005,11 +4259,14 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 set -l expected_pkg "$lane_pkg[$i]"
                 set -l result_ready 0
                 set -l result_malformed 0
-                if test (count $res_raw) -gt 0; and \
-                    lane_result_valid "$expected_pkg" "$res_raw[1]"
-                    set result_ready 1
-                else if test (count $res_raw) -gt 0
-                    set result_malformed 1
+                set -l decoded
+                if test (count $res_raw) -gt 0
+                    set decoded (lane_result_decode "$expected_pkg" "$res_raw[1]")
+                    if test (count $decoded) -eq 3
+                        set result_ready 1
+                    else
+                        set result_malformed 1
+                    end
                 end
                 if test $result_ready -eq 0; and test $result_malformed -eq 0; and \
                     lane_pid_alive "$lane_pid[$i]"
@@ -4028,24 +4285,25 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                     # the result exists NOW — re-read once. A genuinely
                     # missing write stays empty and falls through unchanged.
                     set res_raw (cat "$rf" 2>/dev/null)
-                    if test (count $res_raw) -gt 0; and \
-                        lane_result_valid "$expected_pkg" "$res_raw[1]"
-                        set result_ready 1
-                    else if test (count $res_raw) -gt 0
-                        set result_malformed 1
+                    if test (count $res_raw) -gt 0
+                        set decoded (lane_result_decode "$expected_pkg" "$res_raw[1]")
+                        if test (count $decoded) -eq 3
+                            set result_ready 1
+                        else
+                            set result_malformed 1
+                        end
                     end
                 end
 
                 set -l p "$expected_pkg"
-                set -l rc 125
+                set -l rc $lane_outcome_lost
                 set -l dur (math (date +%s) - $lane_start[$i])
                 if test $result_ready -eq 1
-                    # fish splits command substitution on NEWLINES only; the
-                    # validated result line is explicitly split on spaces.
-                    set -l res (string split ' ' "$res_raw[1]")
-                    set p $res[1]
-                    set rc $res[2]
-                    set dur $res[3]
+                    # The codec's decode splits the wire line on newlines
+                    # (fish command substitution splits on newlines only).
+                    set p $decoded[1]
+                    set rc $decoded[2]
+                    set dur $decoded[3]
                 else
                     set -l log_file (package_log_file "$p")
                     # Reap forensics (2026-09-23: the raw symptom was a bare
@@ -4093,88 +4351,97 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 end
 
                 set -a _lane_done $p
-                if test $rc -eq 0
-                    set -a succeeded $p
-                    run_record_row "$p" succeeded 0 $dur ok
-                    set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_OK completed $p"
-                    # Mid-run ABI-skew probe (2026-09-25 incident): the
-                    # preflight passed at run START, and this run's own
-                    # llvm install can break the system rustc after that.
-                    # Re-probe after a successful -i lane for llvm-git /
-                    # llvm-libs-git, BEFORE anything else dispatches. Failure
-                    # is a real ABI mismatch — even --allow-broken-rustc is
-                    # documented as "not a way past" one — so it takes the
-                    # stop-dispatch contract: stop starting lanes, drain the
-                    # in-flight ones, exit non-zero. Once, not per package.
-                    if test $install_flag -eq 1; and test $probe_stopped -eq 0
-                        if contains "$p" llvm-git llvm-libs-git
-                            if not check_rustc_sanity
-                                ui_error "rustc sanity probe failed after $p was installed — this run's own llvm install broke rustc"
-                                echo "  The selection must rebuild rust-git in the same pass before anything"
-                                echo "  else compiles with rustc — stopping dispatch, draining in-flight lanes."
-                                echo "  Recovery: rebuild rust-git in the same run (add rust-git to the selection"
-                                echo "  and resume with -s -i), or follow the check_rustc_sanity recovery text"
-                                echo "  above (downgrade-rebuild llvm-libs at the snapshot rust-git was built"
-                                echo "  against)."
-                                set probe_stopped 1
-                                set stop_starting 1
-                                set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR rustc probe failed after $p"
+                # Classify through the lane_outcome_* vocabulary — one switch
+                # on the codec's rc: the enum names decide, the wire's raw
+                # number never leaks a decision. The default carries every
+                # non-success outcome (failed, lost, signal-*) down the same
+                # failure contract.
+                switch (lane_outcome_name $rc)
+                    case ok
+                        set -a succeeded $p
+                        run_record_row "$p" succeeded 0 $dur ok
+                        set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_OK completed $p"
+                        # Mid-run ABI-skew probe (2026-09-25 incident): the
+                        # preflight passed at run START, and this run's own
+                        # llvm install can break the system rustc after that.
+                        # Re-probe after a successful -i lane for llvm-git /
+                        # llvm-libs-git, BEFORE anything else dispatches. Failure
+                        # is a real ABI mismatch — even --allow-broken-rustc is
+                        # documented as "not a way past" one — so it takes the
+                        # stop-dispatch contract: stop starting lanes, drain the
+                        # in-flight ones, exit non-zero. Once, not per package.
+                        if test $install_flag -eq 1; and test $probe_stopped -eq 0
+                            if contains "$p" llvm-git llvm-libs-git
+                                if not check_rustc_sanity
+                                    ui_error "rustc sanity probe failed after $p was installed — this run's own llvm install broke rustc"
+                                    echo "  The selection must rebuild rust-git in the same pass before anything"
+                                    echo "  else compiles with rustc — stopping dispatch, draining in-flight lanes."
+                                    echo "  Recovery: rebuild rust-git in the same run (add rust-git to the selection"
+                                    echo "  and resume with -s -i), or follow the check_rustc_sanity recovery text"
+                                    echo "  above (downgrade-rebuild llvm-libs at the snapshot rust-git was built"
+                                    echo "  against)."
+                                    set probe_stopped 1
+                                    set stop_starting 1
+                                    set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR rustc probe failed after $p"
+                                end
                             end
                         end
-                    end
-                else if test $rc -eq $_ANCHOR_DEFER_RC
-                    # Anchoring refused and build_package parked the recipe:
-                    # NOT a failed build. Dispatch keeps going; dependents of
-                    # $p are held back by pick_next_ready; $p stays out of
-                    # succeeded+failed so it lands in the resume command.
-                    set -a deferred $p
-                    set -a _lane_deferred $p
-                    run_record_row "$p" deferred $rc $dur anchoring-refused
-                    set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_WARN deferred $p"
-                else
-                    set -a failed $p
-                    set stop_starting 1
-                    # A reaped row exists for an honest lane result; a reap
-                    # anomaly (rc=125, no valid result) is the lane being lost.
-                    if test "$result_ready" = "1"
-                        run_record_row "$p" failed $rc $dur build-failed
-                    else
-                        run_record_row "$p" failed $rc $dur lane-lost
-                    end
-                    if test "$result_ready" = "1"
-                        set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR failed $p"
-                    end
+                    case defer
+                        # Anchoring refused and build_package parked the recipe:
+                        # NOT a failed build. Dispatch keeps going; dependents of
+                        # $p are held back by pick_next_ready; $p stays out of
+                        # succeeded+failed so it lands in the resume command.
+                        set -a deferred $p
+                        set -a _lane_deferred $p
+                        run_record_row "$p" deferred $rc $dur anchoring-refused
+                        set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_WARN deferred $p"
+                    case '*'
+                        set -a failed $p
+                        set stop_starting 1
+                        # A reaped row exists for an honest lane result; a reap
+                        # anomaly (lane_outcome_lost, no valid result) is the
+                        # lane being lost.
+                        if test "$result_ready" = "1"
+                            run_record_row "$p" failed $rc $dur build-failed
+                        else
+                            run_record_row "$p" failed $rc $dur lane-lost
+                        end
+                        if test "$result_ready" = "1"
+                            set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_ERROR failed $p"
+                        end
                 end
                 set -g _DASHBOARD_LANE_BUSY $lane_busy
                 set -g _DASHBOARD_LANE_PKG $lane_pkg
                 set -g _DASHBOARD_LANE_START $lane_start
                 render_dashboard $total $disp_count (count $succeeded) (count $failed) $stop_starting
                 if test "$_OUTPUT_INTERACTIVE" != "1"
-                    if test $rc -eq 0
-                        printf "  %s %s (%s)\n" "$_UI_ICON_OK" $p (fmt_dur $dur)
-                    else if test $rc -eq $_ANCHOR_DEFER_RC
-                        # The named error and its recovery lines live in the
-                        # log; the run summary tails it — this line only has
-                        # to park the recipe visibly without breaking pipes.
-                        printf "  %s %s: DEFERRED (anchoring refused) — log: %s\n" \
-                            "$_UI_ICON_WARN" $p (package_log_file "$p")
-                    else
-                        set -l log_file (package_log_file "$p")
-                        printf "  %s %s: BUILD FAILED (rc=%s, %s) — log: %s\n" \
-                            "$_UI_ICON_ERROR" $p $rc (fmt_dur $dur) "$log_file"
-                        ui_warning "Last lines:"
-                        print_log_tail "$log_file"
-                        if test $install_flag -eq 1
-                            ui_warning "(with -i the failure may be the INSTALL, not the build — check the log tail above; if the archive exists, install later with -ia or resume with -s -i)"
-                        end
+                    switch (lane_outcome_name $rc)
+                        case ok
+                            printf "  %s %s (%s)\n" "$_UI_ICON_OK" $p (fmt_dur $dur)
+                        case defer
+                            # The named error and its recovery lines live in the
+                            # log; the run summary tails it — this line only has
+                            # to park the recipe visibly without breaking pipes.
+                            printf "  %s %s: DEFERRED (anchoring refused) — log: %s\n" \
+                                "$_UI_ICON_WARN" $p (package_log_file "$p")
+                        case '*'
+                            set -l log_file (package_log_file "$p")
+                            printf "  %s %s: BUILD FAILED (rc=%s, %s) — log: %s\n" \
+                                "$_UI_ICON_ERROR" $p $rc (fmt_dur $dur) "$log_file"
+                            ui_warning "Last lines:"
+                            print_log_tail "$log_file"
+                            if test $install_flag -eq 1
+                                ui_warning "(with -i the failure may be the INSTALL, not the build — check the log tail above; if the archive exists, install later with -ia or resume with -s -i)"
+                            end
                     end
                 end
             end
         end
 
-        # Keep the sudo credential warm so background installs never hit a
-        # password prompt (lane children have no tty). Root mode needs none of
-        # this — installs are direct pacman calls.
+        # Keep the sudo credential warm so background installs never need a
+        # password (escalation is `sudo -n` and never prompts; lane children
+        # have no tty). Root mode needs none of this — installs are direct
+        # pacman calls.
         if test $install_flag -eq 1; and test "$_ROOT_MODE" != "1"; and test "$sudo_state" = up
             set -l now (date +%s)
             if test (math $now - $last_sudo) -gt $_SUDO_KEEPALIVE_S
@@ -4189,22 +4456,18 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                         set -g _DASHBOARD_LAST_EVENT "$_UI_ICON_INFO sudo: installs need no password"
                     case cold
                         abort_dashboard
-                        if sudo_elevate_interactively
-                            set last_sudo (date +%s)
-                            ui_success "sudo refreshed — dispatch continues"
-                        else
-                            # Latch: every later probe would fail and re-print.
-                            # Say it ONCE, stop dispatch, and let in-flight lanes
-                            # finish (their own installs fail fast, no hang).
-                            set sudo_state down
-                            if test (count $_lane_started) -lt $total
-                                set sudo_stopped 1
-                                set -g _RL_SUDO_NOTE "sudo credential lost: some packages were never started"
-                            end
-                            ui_error "sudo credential expired and cannot be refreshed — stopping dispatch"
-                            echo "  Install later with 'build-all.fish -ia', or resume with 'build-all.fish -s -i'."
-                            set stop_starting 1
+                        # Latch: every later probe would fail and re-print.
+                        # Say it ONCE, stop dispatch, and let in-flight lanes
+                        # finish (their own installs fail fast, no hang).
+                        # Never prompt: escalation is `sudo -n` only.
+                        set sudo_state down
+                        if test (count $_lane_started) -lt $total
+                            set sudo_stopped 1
+                            set -g _RL_SUDO_NOTE "sudo credential lost: some packages were never started"
                         end
+                        ui_error "sudo credential expired and cannot be refreshed — stopping dispatch"
+                        echo "  Install later with 'build-all.fish -ia', or resume with 'build-all.fish -s -i'."
+                        set stop_starting 1
                 end
             end
         end
@@ -4276,9 +4539,11 @@ function run_lanes -a lanes jobs_override intensity_level install_flag clean_fla
                 # dispatch loop can continue filling idle lanes immediately.
                 # Capture the complete child process boundary, not only the
                 # makepkg call, so hooks/signals can never corrupt the dashboard.
+                # The payload shape is lane_argv's (the handler validates the
+                # same description via lane_argv_check).
                 setsid --wait fish "$SCRIPT_DIR/build-all.fish" --lane-job \
-                    "$next" "$rf" $jobs $install_flag $clean_flag \
-                    $skip_flag $no_sync_flag $force_install_flag >>"$child_log" 2>&1 &
+                    (lane_argv "$next" "$rf" $jobs $install_flag $clean_flag \
+                        $skip_flag $no_sync_flag $force_install_flag) >>"$child_log" 2>&1 &
                 set lane_pid[$i] $last_pid
                 set -a _ACTIVE_LANE_PIDS $last_pid
                 set -a _ACTIVE_LANE_PKGS $next
@@ -4814,8 +5079,8 @@ function usage
     echo "                    in dependency order (pacman -U --noconfirm --ask 4 —"
     echo "                    unattended). Install failure aborts the run."
     echo "                    Lane installs run as 'sudo -n': the dispatcher keeps"
-    echo "                    the cached credential warm, asks for your password"
-    echo "                    itself if it expired, and refuses to start when"
+    echo "                    the cached credential warm (never prompts — an expired"
+    echo "                    credential fails fast), and refuses to start when"
     echo "                    installs are impossible (instead of building for an"
     echo "                    hour first)."
     echo "                    This is the same behaviour the old -si/--sepinstall"
@@ -5679,11 +5944,17 @@ function gsa_handle_signal -a sig rc binder
                 # handler itself into a failure — skip only if the log is
                 # unwritable even after quarantine/repair.
                 if ensure_log_writable "$pkg_log"
-                    printf '%s lane child received %s (rc=%s, pid=%s) — honest signal result recorded\n' \
-                        "$_UI_ICON_WARN" "$sig" "$rc" "$fish_pid" >>"$pkg_log"
+                    printf '%s lane child received %s (rc=%s, pid=%s) — honest signal result recorded (outcome %s)\n' \
+                        "$_UI_ICON_WARN" "$sig" "$rc" "$fish_pid" (lane_outcome_name "$rc") >>"$pkg_log"
                 end
             else
-                write_lane_result "$_LANE_JOB_RESULT" unknown "$rc" "$dur"
+                # Package identity never landed (argv never parsed): writing
+                # a result under a fabricated identity (the old literal
+                # `unknown` pkg) would put a non-package on the result wire
+                # and make the reap's identity check a lie. Write NOTHING:
+                # the dispatcher classifies a missing result as lane-lost and
+                # names the lane — honest without inventing a pkg.
+                echo "lane child received $sig before its identity was known — writing no result file" >&2
             end
         end
         # Die NOW: erase this handler, re-raise, then a best-effort exit
@@ -5699,15 +5970,15 @@ function gsa_handle_signal -a sig rc binder
 end
 
 function gsa_on_int --on-signal INT
-    gsa_handle_signal INT 130 gsa_on_int
+    gsa_handle_signal INT $lane_outcome_int gsa_on_int
 end
 
 function gsa_on_term --on-signal TERM
-    gsa_handle_signal TERM 143 gsa_on_term
+    gsa_handle_signal TERM $lane_outcome_term gsa_on_term
 end
 
 function gsa_on_hup --on-signal HUP
-    gsa_handle_signal HUP 129 gsa_on_hup
+    gsa_handle_signal HUP $lane_outcome_hup gsa_on_hup
 end
 
 if test (count $argv) -gt 0; and test "$argv[1]" = --lane-job
@@ -5720,21 +5991,16 @@ if test (count $argv) -gt 0; and test "$argv[1]" = --lane-job
         set -g _LANE_JOB_RESULT "$argv[3]"
         set -g _LANE_JOB_START (date +%s)
     end
-    if test (count $argv) -ne 9
-        echo "Error: --lane-job expects package, result file, job count, and five flags" >&2
+    # The invocation shape lives in lane_argv_check (built by lane_argv on the
+    # dispatcher side): an invalid invocation exits 2 — invocation error,
+    # outside the lane_outcome_* vocabulary and never written to a result file.
+    # UNQUOTED slice: fish keeps each element its own argument (no word
+    # splitting), while "$argv[2..-1]" collapses a slice to ONE argument.
+    lane_argv_check $argv[2..-1]
+    if test $status -ne 0
         exit 2
     end
-    if not string match -qr '^[1-9][0-9]*$' -- "$argv[4]"
-        echo "Error: --lane-job received an invalid job count: $argv[4]" >&2
-        exit 2
-    end
-    for flag in $argv[5..9]
-        if not string match -qr '^[01]$' -- "$flag"
-            echo "Error: --lane-job received an invalid flag: $flag" >&2
-            exit 2
-        end
-    end
-    lane_job "$argv[2]" "$argv[3]" "$argv[4]" "$argv[5]" "$argv[6]" "$argv[7]" "$argv[8]" "$argv[9]"
+    lane_job $argv[2..-1]
     exit $status
 end
 
@@ -5760,6 +6026,29 @@ if test (count $argv) -gt 1; and test "$argv[1]" = --local-db-check
         exit 2
     end
     check_pacman_db_health "$argv[2]"
+    exit $status
+end
+
+# Hidden fixture seam (same precedent as --stale-lock-check/--local-db-check):
+# ask the install pipeline what it would DECIDE without executing anything —
+# no pacman transaction, no sudo, no flock, no makepkg. The read-only
+# `pacman -Qp/-Qi` probes still run through PATH (fixtures stub pacman), since
+# the same-version skip decision fundamentally reads the installed database.
+#   fish build-all.fish --install-decide <checked|force> [archive...]
+# Output: the plan rows install_plan computed (its row grammar), one per line.
+# rc 0 = executable plan (install/skip/noop rows), 1 = refusal rows, 2 = bad
+# mode/usage. The plan is SILENT by design: this seam prints it verbatim and
+# install_execute renders the same rows — one decision, two consumers.
+if test (count $argv) -gt 0; and test "$argv[1]" = --install-decide
+    if test (count $argv) -lt 2
+        echo "Error: --install-decide expects <checked|force> and optional archives" >&2
+        exit 2
+    end
+    if not contains -- "$argv[2]" checked force
+        echo "Error: --install-decide mode must be checked or force" >&2
+        exit 2
+    end
+    install_plan "$argv[2]" $argv[3..-1]
     exit $status
 end
 

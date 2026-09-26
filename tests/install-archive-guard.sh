@@ -301,4 +301,111 @@ if [[ "$h_runs" != 1 ]]; then
 fi
 assert_u "$dir_h" 'case H'
 
+# ─── The --install-decide seam: decisions without execution ──────────────────
+# 2026-09-26 plan+executor split: install_plan computes the transaction plan
+# SILENTLY (install / skip / refuse / noop rows) and install_execute renders
+# and runs it. The hidden --install-decide seam prints the plan verbatim
+# without executing anything — no pacman -U, no sudo, no makepkg — so a
+# fixture can pin decision sets directly. Force mode (-fi/-ia's shared
+# pipeline) must NEVER consult the same-version check: its seam run leaves the
+# pacman stub entirely untouched (the "one code path, no second
+# implementation" pin). Exact-output matching doubles as the silence pin: any
+# mid-decision chatter breaks the whole-plan equality.
+
+decide() { # $1 = dir, $2 = mode, $3 = label, rest = archives; env via decide_env
+    local dir=$1 mode=$2 label=$3
+    shift 3
+    : >"$dir/pacman.log"
+    rm -f "$dir/sudo.log"
+    # Streams split deliberately: the seam's PLAN is stdout and gets an exact
+    # match below; fish startup noise (vendor conf.d on a bare function path)
+    # lands on stderr where it cannot blur the plan (run_builder's combined
+    # capture would).
+    DECIDE_RC=0
+    env PATH="$dir/bin:$PATH" \
+        GSA_FAKE_PACMAN_LOG="$dir/pacman.log" \
+        GSA_FAKE_SUDO_LOG="$dir/sudo.log" \
+        "${decide_env[@]}" \
+        fish "$dir/build-all.fish" --install-decide "$mode" "$@" \
+        >"$dir/decide.out" 2>"$dir/decide.err" || DECIDE_RC=$?
+    DECIDE_OUT=$(cat "$dir/decide.out")
+    if grep -q -- 'pacman -U' "$dir/pacman.log" 2>/dev/null; then
+        printf '%s: the seam EXECUTED a transaction:\n%s\n' "$label" \
+            "$(cat "$dir/pacman.log")" >&2
+        exit 1
+    fi
+    if [[ -s "$dir/sudo.log" ]]; then
+        printf '%s: the seam escalated via sudo:\n%s\n' "$label" \
+            "$(cat "$dir/sudo.log")" >&2
+        exit 1
+    fi
+}
+
+decide_assert() { # $1 = label, $2 = want rc, $3 = want full output (one row/line)
+    if [[ "$DECIDE_RC" != "$2" || "$DECIDE_OUT" != "$3" ]]; then
+        printf '%s: seam rc=%s want=%s; plan mismatch.\nwant: %s\ngot:\n%s\n' \
+            "$1" "$DECIDE_RC" "$2" "$3" "$DECIDE_OUT" >&2
+        exit 1
+    fi
+}
+
+dir_i="$fixture/decide"
+make_case_workspace "$dir_i" "pkgver=1.0.0"
+# A LOGGING sudo stub: the seam must never escalate at all, so even a
+# successful sudo call fails the phase.
+cat >"$dir_i/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf 'sudo %s\n' "$*" >>"${GSA_FAKE_SUDO_LOG:?}"
+exit 0
+EOF
+chmod +x "$dir_i/bin/sudo"
+arch="$dir_i/decide-archives/p1-1.0.0-1-any.pkg.tar.zst"
+mkdir -p "$(dirname "$arch")"
+: >"$arch"
+
+# I1: checked + exact version installed, install fresher than the archive
+# → the one positive-evidence skip.
+decide_env=(GSA_FAKE_QP='p1 1.0.0-1' "GSA_FAKE_QI=$(fresh_qi 1.0.0-1)")
+decide "$dir_i" checked 'decide I1' "$arch"
+decide_assert 'decide I1 (checked, fresh install)' 0 "skip $arch 1.0.0-1"
+
+# I2: version mismatch → install (doubt installs).
+decide_env=(GSA_FAKE_QP='p1 1.0.0-1' "GSA_FAKE_QI=$(fresh_qi 0.9.0-1)")
+decide "$dir_i" checked 'decide I2' "$arch"
+decide_assert 'decide I2 (checked, version mismatch)' 0 "install $arch"
+
+# I3: same version but install date older than the archive (a same-version
+# rebuild) → install.
+decide_env=(GSA_FAKE_QP='p1 1.0.0-1' "GSA_FAKE_QI=$(stale_qi 1.0.0-1)")
+decide "$dir_i" checked 'decide I3' "$arch"
+decide_assert 'decide I3 (checked, stale install date)' 0 "install $arch"
+
+# I4: neither query answers (doubt) → install.
+decide_env=()
+decide "$dir_i" checked 'decide I4' "$arch"
+decide_assert 'decide I4 (checked, no query answers)' 0 "install $arch"
+
+# I5: force mode over a perfectly fresh install → install anyway, and the
+# pacman stub is never consulted at all: force bypasses install_skip_reason
+# entirely (-ia shares this path; no second implementation).
+decide_env=(GSA_FAKE_QP='p1 1.0.0-1' "GSA_FAKE_QI=$(fresh_qi 1.0.0-1)")
+decide "$dir_i" force 'decide I5' "$arch"
+decide_assert 'decide I5 (force bypasses the skip check)' 0 "install $arch"
+if [[ -s "$dir_i/pacman.log" ]]; then
+    printf 'decide I5: force mode consulted the installed database:\n%s\n' \
+        "$(cat "$dir_i/pacman.log")" >&2
+    exit 1
+fi
+
+# I6: checked + nothing to install → refusal (the 2026-09-20 silence bug).
+decide_env=()
+decide "$dir_i" checked 'decide I6'
+decide_assert 'decide I6 (checked, empty list)' 1 'refuse empty-list'
+
+# I7: force + nothing to install → a no-op plan, not a refusal (-ia on a
+# workspace with nothing built is a no-op success).
+decide "$dir_i" force 'decide I7'
+decide_assert 'decide I7 (force, empty list)' 0 'noop empty-list'
+
 printf 'install archive guard fixture: PASS\n'

@@ -25,6 +25,10 @@ set -uo pipefail
 #      build-only run warns and builds anyway.
 #   6. static: grace constant 30 s, one TERM, KILL strictly after the grace.
 #   7. direct shim invocation: stub flock proves "$@" pass-through.
+#   8. unknown result-pkg edge (2026-09-26 lane codec): a lane whose package
+#      identity never landed writes NO result file (the old code fabricated
+#      the identity `unknown`, which put a non-package on the result wire);
+#      the encode side refuses an empty pkg, so the lane exits 125 loudly.
 #
 # Lock isolation: the PATH-stub `pacman-conf` answers DBPath with a fixture
 # directory, so the host's real /var/lib/pacman/db.lck is never probed; the
@@ -406,6 +410,33 @@ env PATH="$fixture/bin:$PATH" \
     fail "shim invocation failed"
 [[ $(cat "$stub_log") == '--frobnicate arg with space wild*card' ]] ||
     fail "shim did not pass \$@ through verbatim: '$(cat "$stub_log")'"
+
+# ── 8. unknown result-pkg edge: identity-less lane writes NOTHING ──────────
+# gsa_handle_signal used to fabricate a result identity `unknown` when the
+# signal arrived before the pkg was known — a non-package on the result wire
+# that the reap's identity check could not honestly classify. Now it writes
+# nothing (the dispatcher classifies the missing result as lane-lost and names
+# the lane). The codec's encode side enforces the same identity rule — an
+# empty pkg can never reach the wire — so the lane's result write fails loudly
+# and the process exits lane_outcome_lost (125), not some silent zero.
+echo "phase 8: identity-less lane result writes nothing"
+state="$fixture/state-unknown"
+mk_env "$state" 0.5
+mkdir -p "$state/logs"
+res="$state/logs/.lane-unknown.result"
+rc=0
+env "${RUN_ENV[@]}" fish "$fixture/build-all.fish" \
+    --lane-job "" "$res" 1 0 0 0 1 0 >"$state/unknown.out" 2>&1 || rc=$?
+[[ $rc -eq 125 ]] ||
+    fail "empty-pkg --lane-job rc=$rc, want 125 (lane_outcome_lost)" \
+        "$(cat "$state/unknown.out")"
+grep -q 'lane result write failed' "$state/unknown.out" ||
+    fail "no loud result-write failure for the identity-less lane:" \
+        "$(cat "$state/unknown.out")"
+[[ ! -e $res ]] ||
+    fail "identity-less lane published a result file: '$(cat "$res")'"
+grep -qF 'write_lane_result "$_LANE_JOB_RESULT" unknown' "$gf" &&
+    fail "gsa_handle_signal still fabricates an 'unknown' result identity"
 
 if ps -eo args= | grep -F "$fixture" | grep -v grep >/dev/null; then
     fail "a fixture process survived:" \
