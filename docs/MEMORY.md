@@ -87,8 +87,11 @@
 9. **IgnorePkg closure**: every workspace pkgname must be in /etc/pacman.conf
    IgnorePkg (cumulative repeated `IgnorePkg =` lines, all inside
    `[options]` — a line in a repo section is silently dropped). Verify by
-   sourcing each PKGBUILD, unioning pkgbase+pkgname[], `comm -23` vs
-   `pacman-conf IgnorePkg | sort -u` (empty = covered).
+   unioning pkgbase+pkgname[] from each committed `.SRCINFO` — the audit must
+   read `.SRCINFO`, never grep the PKGBUILD (the kernel's
+   `pkgbase="linux-$_pkgsuffix"` hides the real names) — and diffing with
+   `comm -23` against `pacman-conf IgnorePkg | sort -u` (empty = covered;
+   `pacman-conf` reads the file directly and needs no database lock).
 10. **Logs**: append one `## YYYY-MM-DD — topic` section per incident to
     NOTE.md: symptom → root cause → fix → rule.
 11. **Install-before-dependents-compile**: never build-then-install-collectively.
@@ -267,11 +270,13 @@
   recipe** (`SRCDEST`/`PKGDEST` default to `$startdir`), which is why the
   recipe directories carry ignore rules; both classes are ignored runtime
   state.
-- The current logical groups are `git` (58), `stable` (29), `core` (41),
-  `misc` (1), `third-party` (2), and `app` (0 — optional applications; on a
-  TTY a build/`-n` run prompts to multi-select them, non-TTY runs take the
-  whole list, and app members are leaf builds whose dependency chain is never
-  expanded). `core` intentionally overlaps stable
+- The logical groups are `git`, `stable`, `core`, `misc`, `third-party` and
+  `app` (the optional-applications group: on a TTY a build/`-n` run prompts to
+  multi-select them, non-TTY runs take the whole list, and app members are
+  leaf builds whose dependency chain is never expanded). Membership counts are
+  deliberately not recorded here — they are hand-maintained and the first
+  thing a batch invalidates — so `fish build-all.fish --list` is the source
+  of truth. `core` intentionally overlaps stable
   packages whose ABI must be rebuilt and installed as one batch.
 - No upstream checkout, package archive, downloaded signature, PGP cache,
   encrypted CI artifact, or host profile belongs in the public tree.
@@ -297,7 +302,12 @@ have no terminal, so the dispatcher probes whether an install can actually
 run, refreshes the credential, asks for the password itself when a human is
 attached, and stops dispatch exactly once — with a non-zero exit — when
 nothing can restore it. A system pacman database lock is never deleted
-automatically.
+automatically. The dispatch invariant is failure-shaped with one amendment
+(2026-09-24): a failure stops new dispatches and drains in-flight lanes,
+while a *deferral* (lane exit 99, `_ANCHOR_DEFER_RC`) is not a failure — the
+reap parks the package instead of calling `stop_starting`, its dependents
+wait (`waits on a deferred package`), dispatch continues, and the run still
+exits non-zero.
 
 `--no-deps` is a deliberate leaf rebuild. `--audit` checks active topology and
 runtime drift, including cargo/rustc recipes that declare no `rust-git` edge.
@@ -465,67 +475,11 @@ install history lives in `NOTE.md`.
 
 ## 5. Pending tasks
 
-Re-verified against the host on 2026-09-20. Completed items were deleted
+Re-verified against the host on 2026-09-26. Completed items were deleted
 rather than left in place — an unchecked task list reads as authority while
 going stale.
 
 ### Queued (claim by editing this section)
-
-- **Rebuild `cmake-git` and `xorg-xwayland-git` — a recurrence of the
-  2026-09-16 PGO leak, on the two packages that fix did not cover (found
-  2026-09-19, gate landed 2026-09-20).** A full sweep of every installed file
-  owned by every PGO recipe for an absolute `.gcda` destination returns
-  **exactly five files in two packages**: `cmake`, `ccmake`, `cpack` and
-  `ctest` (431/432/438/482 baked paths) from `cmake-git` 4.4.3.936, and
-  `Xwayland` (348) from `xorg-xwayland-git` 24.1.13.r1181. Everything else is
-  clean — `glib2-git` and `cairo-git` both return 0, so the 2026-09-16 fix
-  held for the packages it touched. A plain `-Syu` will not fix it, because
-  both names are `IgnorePkg`-locked; it needs
-  `build-all.fish --no-deps --install` on each. Until then the two trees under
-  `~/Projects` are re-created in full (779 `.gcda` files) by one
-  `cmake --version` and one `Xwayland` call, so deleting them is futile and
-  their reappearance is not new debris.
-- **`cmake-git` is the exception to "not a broken recipe" (measured
-  2026-09-20):** its queued rebuild **cannot** succeed as written, so do not
-  re-run it expecting a fix. Phase 2 only re-exports the compiler variables and
-  runs `make clean; make`, but phase 1's `./bootstrap` wrote the phase-1
-  `-fprofile-generate` into `CMakeCache.txt`; CMake reads those variables only
-  while initialising that cache, `make clean` leaves it alone, and re-running
-  the configure step with the cache present still ignores the environment. The
-  final link line is therefore still instrumented and the recipe's own guard
-  aborts `package()` with "final package still contains profile
-  instrumentation". The fix is a rewrite of the flags inside the cache
-  (`sed` → `touch CMakeLists.txt` → `make clean` → `make`, the touched input
-  being what makes the generated `Makefile` regenerate) plus two tolerance
-  flags, because GCC refuses the profile in two different ways here:
-  `-Wno-missing-profile` (every fresh feature probe is untrained, and
-  `Source/Checks/cm_cxx_features.cmake` reads *any* probe warning as "feature
-  unavailable", so the configure otherwise aborts with "The C++ compiler does not
-  support C++11") and `-Wno-error=coverage-mismatch` (a few kwsys sources come
-  back with a different arc count, which GCC treats as an error by default).
-  Re-running `./bootstrap` instead fails the build on
-  `-Werror=coverage-mismatch` in `Bootstrap.cmk`. `xorg-xwayland-git` needs no
-  recipe change (`meson setup --reconfigure`). Done looks like
-  `strings -a /usr/bin/cmake | grep -c '\.gcda'` → 0 for
-  `cmake`/`ccmake`/`cpack`/`ctest` and for `Xwayland`.
-- **`xorg-xwayland-git` is 24.1.13, and its guard is `strings`-based.** The
-  recipe path is `packages/git/xorg-xwayland-git`, not `xorg-wayland-git`.
-  `ctest` carries **482** baked paths, not 481 (the number counts paths, so it
-  moves between builds; treat it as "hundreds", not a constant).
-- **`IgnorePkg` closure is complete again (audited 2026-09-19, fixed same
-  day).** The closure had drifted **32 names short**: `comm -23` of the
-  committed `.SRCINFO` pkgname set (218) against `pacman-conf IgnorePkg` left
-  the three `linux-cachyos-rt-bore-lto*` outputs, all 30 `texlive-*` splits,
-  `autofdo-git`, `bpftune-git`, `logseq-desktop-git`, `mkinitcpio`,
-  `openshadinglanguage` and `vscodium-insiders-git` unprotected — latent, but
-  the 2026-09-04 `hip-runtime` incident is exactly this failure mode. They were
-  added as three new one-line `IgnorePkg =` entries inside `[options]` after
-  backing the file up; `comm -23` is empty again (221 → 253 entries, all in
-  `[options]`). **The audit must read `.SRCINFO`, not `PKGBUILD`**: the kernel's
-  `pkgbase="linux-$_pkgsuffix"` makes a `PKGBUILD` grep report a literal
-  `linux-` and hide the real names. Also note `pacman -Sy` cannot be used to
-  validate this while a build holds the database lock — `pacman-conf IgnorePkg`
-  reads the file directly and needs no lock.
 
 - **ROCm is half-removed**: `hsa-rocr` 7.2.4-1.1, `rocm-llvm` 2:7.2.4-2.1 and
   `comgr` 2:7.2.4-2.1 are installed again (the 2026-09-06 collective removal was
@@ -546,37 +500,26 @@ going stale.
   `rm` line and never recorded what it targeted. The current trim already drops
   pre-amdgpu `radeon` and the unused vendor directories, and upstream has no
   `legacy/` tree, so the item is either redundant or needs re-specifying.
-- **Build freezes: root cause identified — CVE-2026-90432, carried by our own
-  kernel recipe (2026-09-19).** `scx_hardlockup()` deferred the sched_ext abort
-  to an `irq_work`; on a hard-locked CPU with IRQs off that work never runs, so
-  a scheduler stall wedged the machine instead of recovering. The handler also
-  returned `%true` whenever sched_ext was loaded, **suppressing the kernel's own
-  hardlockup report** — which is why no journal ever held a trace. Affected
-  7.1 ≤ v < 7.2.6; fixed in 7.2.6+ and 7.3-rc1+. Every crash kernel (7.2.2,
-  7.2.3-ck1, 7.2.4-ck1, 7.2.5) sits inside the affected range, and the one
-  kernel never booted during a crash (`linux-cachyos-lts` 6.18.52) is the one
-  outside it. The trigger is a fork/exec + I/O storm — i.e. any build — which is
-  why build weight never mattered; upstream's own analysis (`sched-ext/scx#3687`)
-  measured 1 freeze in 30 induced stall runs on a 12-CPU guest, and this host
-  has 24 threads. That also retires the 2026-09-18 texlive leads recorded here
-  before (NVMe ASPM, `ananicy-cpp`, zram, a 20 GB write burst): a texlive build
-  is the same fork/exec + I/O pattern, so those freezes were this fault. Fix:
-  `packages/misc/linux-cachyos` moved onto the CachyOS RC channel
-  (`cachyos-7.3-rc3-4`) — recipe done, **and as of 2026-09-19 the fix is built,
-  installed and running**: `linux-cachyos-cachyos-lto` 7.3.rc3-1, `uname -r` =
-  `7.3.0-rc3-1-cachyos-cachyos-lto`, i.e. **7.3-rc3 is outside the affected
-  7.1 ≤ v < 7.2.6 range**. The build used `_cpusched=cachyos` (the recipe's
-  default is still `rt-bore`), so the running kernel is `PREEMPT_DYNAMIC`,
-  `CONFIG_HZ=600`, ThinLTO Clang, with **no PREEMPT_RT and no `SCHED_BORE`** —
-  a deliberate flavour change, not a silent one, but worth re-reading before a
-  default rebuild swaps the machine onto rt-bore. `linux-cachyos-rt-bore-lto`
-  7.2.5-1 and `linux-cachyos-lts` 6.18.52-1 remain installed as fallbacks. **The
-  `efi_pstore.pstore_disable=N` and the panic parameters that were added to the
-  command line for the freeze diagnosis were removed again on 2026-09-20** (see
-  the stand-down entry below), so the running 7.3-rc3 boot still carries them
-  but the next reboot does not. The evidence is
-  upstream-documented plus circumstantial; the confirming A/B was skipped by
-  decision, so read "identified" as strong, not proven.
+- **Build freezes: root cause identified — CVE-2026-90432, carried by our
+  own kernel recipe (2026-09-19; fix built and running).** `scx_hardlockup()`
+  deferred the sched_ext abort to `irq_work` that never runs on a hard-locked
+  CPU, and returned `%true` whenever sched_ext was loaded, suppressing the
+  kernel's own hardlockup report — which is why no journal ever held a trace.
+  Affected 7.1 ≤ v < 7.2.6; fixed in 7.2.6+ and 7.3-rc1+. The trigger is a
+  fork/exec + I/O storm (i.e. any build), which is why build weight never
+  mattered (upstream `sched-ext/scx#3687`). The recipe moved to the CachyOS
+  RC channel (`cachyos-7.3-rc3-4`) and the running kernel is
+  `linux-cachyos-cachyos-lto` **7.3.0-rc4-1** (`uname -r` =
+  `7.3.0-rc4-1-cachyos-cachyos-lto`), built with `_cpusched=cachyos`:
+  `PREEMPT_DYNAMIC`, `CONFIG_HZ=600`, ThinLTO Clang, **no PREEMPT_RT and no
+  `SCHED_BORE`** — the recipe default is still `rt-bore`, so a default
+  rebuild deliberately swaps the machine back to rt-bore; re-read before
+  doing that. `linux-cachyos-rt-bore-lto` 7.2.5-1 and `linux-cachyos-lts`
+  6.18.52-1 remain installed as fallbacks. Evidence is upstream-documented
+  plus circumstantial (the confirming A/B was skipped by decision): read
+  "identified" as strong, not proven. The freeze-forensics rules that outlive
+  the incident (pstore, config-only knobs, the stood-down capture chain and
+  its re-arm backups) are in §6.
 - **Decision needed at the next `linux-cachyos` rebuild: AutoFDO + Propeller
   (2026-09-19).** The installed 7.2.5 kernel was built with `AUTOFDO_CLANG=y`
   and `PROPELLER_CLANG=y`; the recipe defaults `_autofdo` and `_propeller` to
@@ -586,42 +529,6 @@ going stale.
   set both knobs, or accept the plain kernel deliberately. `prepare()` asserts
   the off state either way, so the swap shows up in the log rather than passing
   unnoticed.
-- **Capture chain stood down (2026-09-20) — the freeze it was armed for is fixed;
-  what it taught is kept.** The chain armed on 2026-09-19 for the texlive
-  freezes was removed once the cause was fixed (CVE-2026-90432, above): the
-  heartbeat witness, the sysctl drop-in, the journald drop-in and the panic
-  parameters on the command line are gone, because a diagnostic left running
-  past its question is just unmeasured overhead. Removed: `gsa-heartbeat.service`
-  plus `/usr/local/bin/gsa-heartbeat.sh` (a 5 s timestamp to
-  `/var/log/heartbeat.log` that separated a dead kernel from a dead display),
-  `/etc/sysctl.d/99-diagnostic.conf` (`watchdog_thresh=30`, both lockup
-  detectors, `*_panic=1`, `panic=10`, `sysrq=1`), the journald drop-in
-  `/etc/systemd/journald.conf.d/10-diagnostic.conf` (`SyncIntervalSec=1s` —
-  every freeze lost its final seconds at the 5-minute default),
-  `hardlockup_panic`/`softlockup_panic`/`softlockup_all_cpu_backtrace`/
-  `hung_task_panic`/`hung_task_timeout_secs`/`panic_on_oops`/`panic=10`/
-  `efi_pstore.pstore_disable=N` from `/etc/default/limine`, and
-  `tools/texlive-split-probe.sh` with its fixture `tests/probe-watchdog.sh`.
-  All of it is backed up at `/root/freeze-diag-backup-20260920/` and the
-  pre-cleanup command line at `/etc/default/limine.bak-20260920-pre-diag-cleanup`
-  (the earlier, pre-diagnosis one is `/etc/default/limine.bak-20260919-freeze-diag`,
-  which still carries `nowatchdog`). `limine-update` regenerated all four boot
-  entries on 2026-09-20 09:35; the running boot keeps the old chain until the
-  next reboot. **Re-arming is one command each** — the backup directory is the
-  recipe. Two facts outlive the chain and are why it is worth re-arming *before*
-  investigating a freeze rather than after:
-  - `efi_pstore` is **disabled by default** (`pstore_disable=Y`), so
-    `/sys/fs/pstore` never receives anything until it is set to `N`. Validated
-    with a deliberate `Alt+SysRq+c`: the panic landed in pstore as 17 compressed
-    records and the machine self-rebooted in 27 s, and **never reached the
-    journal**. pstore is the channel for a hard crash, not journald; an empty
-    journal is not evidence that nothing happened.
-  - The two kernel options that matter are **config-only** — `WQ_WATCHDOG` and
-    `PSTORE_CONSOLE` cannot be set from a command line — so they need
-    `_capture_chain=yes` in the environment for that kernel build. The recipe's
-    `_capture_chain` knob survives this cleanup and still defaults to `no`, so a
-    default rebuild carries no chain (the override reaches the lane child;
-    verified 2026-09-19).
 - **Still open: the 2026-09-01 cluster.** `last -x` over the whole wtmp (machine
   installed 2026-08-31 15:20) shows ~23 unclean shutdowns, but the first four
   are a separate event: inside 27 minutes, the first ten minutes after
@@ -635,14 +542,16 @@ going stale.
   91 °C) passed with no freeze — with sched_ext unloaded, so it is not a control.
 - systemd is a separately coupled effort whenever its recipe changes.
 
-Deleted as done in this pass (each was verified, not assumed): the
-`-Rns hyperv intel-speed-select x86_energy_perf_policy` batch and
-`llvm-ocaml-git` (none remain installed); seatd-git's `libseat.so=1-64` provide
-(the installed `.PKGINFO` carries it); llvm-git's `X86;AMDGPU;BPF` rebuild and
-the dependent scx-scheds-git rebuild (installed llvm-git reports all three
-targets); the stale `gcc-*-snapshot` language splits (only fortran, libs and
-`lib*-snapshot` remain); mesa-git's PGO zero-gcda abort (implemented in the
-recipe).
+Queue items deleted as done in earlier passes (each verified, not assumed):
+the `-Rns hyperv intel-speed-select x86_energy_perf_policy` batch and
+`llvm-ocaml-git` (none remain installed); seatd-git's `libseat.so=1-64`
+provide (the installed `.PKGINFO` carries it); llvm-git's
+`X86;AMDGPU;BPF` rebuild and the dependent scx-scheds-git rebuild; the stale
+`gcc-*-snapshot` language splits; mesa-git's PGO zero-gcda abort; and the
+cmake-git / xorg-xwayland-git PGO-payload rebuilds (checked 2026-09-26:
+`strings -a` over the installed `cmake`/`ccmake`/`cpack`/`Xwayland` reports
+zero baked `.gcda` destinations — `ctest`'s single hit is the `/*.gcda` glob
+constant, not a baked path).
 
 ## 6. Pitfall digest (full details: NOTE.md sections of same dates)
 
@@ -867,6 +776,22 @@ recipe).
   detectable classes read-only; `tests/modcache-check.sh` pins it. Generally:
   after any hard power-off, verify the *consumer* of the file before blaming the
   recipe or the tool.
+- **Freeze forensics: pstore is the channel, not the journal** (2026-09-19
+  armed, 2026-09-20 stood down): `efi_pstore` is disabled by default
+  (`pstore_disable=Y`), so `/sys/fs/pstore` receives nothing until it is set
+  to `N` — validated with a deliberate `Alt+SysRq+c`, where the panic landed
+  in pstore (17 compressed records, self-reboot in 27 s) and **never reached
+  the journal**: an empty journal is not evidence that nothing happened.
+  `WQ_WATCHDOG` and `PSTORE_CONSOLE` are **config-only** — they need
+  `_capture_chain=yes` in the environment for that kernel build (the knob
+  survives, default `no`). The 2026-09-19 capture chain (heartbeat witness,
+  sysctl/journald drop-ins, panic parameters) was removed on 2026-09-20
+  because a diagnostic left running past its question is unmeasured
+  overhead. Everything needed to re-arm it is preserved:
+  `/root/freeze-diag-backup-20260920/` holds the backed-up files and is the
+  re-arm recipe; the pre-cleanup command lines are in
+  `/etc/default/limine.bak-20260920-pre-diag-cleanup` (the earlier
+  `/etc/default/limine.bak-20260919-freeze-diag` carries `nowatchdog`).
 - **A version bump must regenerate `.SRCINFO`** (2026-09-19, bettbox): it pins
   pkgver, provides, the source URL and sha256sums, so a stale copy makes anything
   consuming the recipe build the wrong sources against the wrong sums —
@@ -1017,8 +942,11 @@ recipe).
   `extern/…` = vendored copy compiled in; find who pulls the system copy via
   per-lib `readelf -d`/ldd (blender: libceres); prefer
   `-DWITH_SYSTEM_GLOG=ON -DWITH_SYSTEM_GFLAGS=ON`-style CMake options.
-- **IgnorePkg**: 62 names were once unprotected (audit method in golden rule
-  9); keep the closure diff empty after adding packages. Back up
+- **IgnorePkg**: 62 names were once unprotected (2026-09-06) and the closure
+  drifted **32 names short** again (2026-09-19: the three
+  `linux-cachyos-rt-bore-lto*` outputs, all 30 `texlive-*` splits, and more —
+  221 → 253 entries, fixed same day). Keep the closure diff empty after
+  adding any package (audit method in golden rule 9). Back up
   `/etc/pacman.conf` before editing it — the file accumulates repeated
   `IgnorePkg =` lines and a mistake is silent until `-Syu` replaces a house
   package.
