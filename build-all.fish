@@ -5206,9 +5206,17 @@ function main
         return 0
     end
 
+    # The resume set is selection minus SUCCEEDED, not minus succeeded+failed
+    # (2026-09-26, confirmed on cycle-1 libreoffice and cycle-10 qt5-base-git):
+    # dropping the FAILED package from this set meant the suggested resume
+    # command rebuilt only the not-yet-attempted packages and silently left the
+    # failed one stale — its dependents then compiled against the stale
+    # installed copy. A failed package must rebuild BEFORE its dependents, so
+    # it stays in both the "Remaining" count and the resume command (the note
+    # under the count says so).
     set -l remaining
     for pkg in $sorted
-        if not contains "$pkg" $succeeded; and not contains "$pkg" $failed
+        if not contains "$pkg" $succeeded
             set -a remaining $pkg
         end
     end
@@ -5237,6 +5245,9 @@ function main
     echo "Blocked:           $blocked"
     echo "Deferred:          "(count $deferred)
     echo "Remaining:         "(count $remaining)
+    if test (count $failed) -gt 0
+        echo "note: "(count $failed)" failed package(s) included — they must rebuild before their dependents"
+    end
     if test (count $deferred) -gt 0
         echo ""
         echo "Deferred recipes (not built — the log tail says why):"

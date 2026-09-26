@@ -159,4 +159,44 @@ if [[ "$RESUME_CMD" != *"p3"* ]]; then
     exit 1
 fi
 
+# ─── The FAILED package itself must be in the resume set (2026-09-26 bug) ───
+# The summary used to compute the resume set as selection minus
+# succeeded+failed, which DROPPED the failed package: a user copying the
+# suggested command rebuilt only the not-yet-attempted packages and silently
+# left the failed one stale, so its dependents then built against the stale
+# installed copy. Both the resume command and the "Remaining" count must
+# include the failed package, with a note saying it has to rebuild first.
+dir="$fixture/failed-included"
+make_workspace "$dir"
+run_expecting_failure "$dir" 'failed included' --no-deps --allow-broken-rustc --no-sync
+if ! grep -qw 'p2' <<<"$RESUME_CMD"; then
+    printf 'failed included: resume command drops the FAILED package:\n  %s\n' \
+        "$RESUME_CMD" >&2
+    exit 1
+fi
+if ! grep -qw 'p3' <<<"$RESUME_CMD"; then
+    printf 'failed included: resume command drops the unbuilt package:\n  %s\n' \
+        "$RESUME_CMD" >&2
+    exit 1
+fi
+pre_p2=${RESUME_CMD%%p2*}
+pre_p3=${RESUME_CMD%%p3*}
+if ((${#pre_p2} > ${#pre_p3})); then
+    printf 'failed included: resume command lists the failed package after the unbuilt one:\n  %s\n' \
+        "$RESUME_CMD" >&2
+    exit 1
+fi
+remaining_line=$(printf '%s\n' "$RESUME_OUTPUT" | grep '^Remaining:' | tail -1)
+remaining_count=$(printf '%s\n' "$remaining_line" | tr -dc '0-9')
+if [[ "$remaining_count" != 2 ]]; then
+    printf 'failed included: Remaining must count p2 (failed) + p3 (unbuilt) = 2, got: %s\n%s\n' \
+        "${remaining_count:-<none>}" "$RESUME_OUTPUT" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$RESUME_OUTPUT" | grep -q 'failed package(s) included'; then
+    printf 'failed included: no note saying the failed package must rebuild:\n%s\n' \
+        "$RESUME_OUTPUT" >&2
+    exit 1
+fi
+
 printf 'resume command fixture: PASS\n'
